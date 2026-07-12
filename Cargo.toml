@@ -1,0 +1,15 @@
+[package]
+name = "chainview"
+version = "0.0.1"
+edition = "2024"
+authors = ["Joaquin Bejar <jb@taunais.com>"]
+description = "Terminal UI for option chains, Greeks and volatility - real-time market data and backtest replay in your terminal."
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/joaquinbejar/ChainView"
+homepage = "https://github.com/joaquinbejar/ChainView"
+keywords = ["finance", "options", "tui", "terminal", "trading"]
+categories = ["finance", "command-line-utilities"]
+include = ["src/**/*", "Cargo.toml", "README.md", "LICENSE"]
+
+[dependencies]
