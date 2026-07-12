@@ -24,6 +24,13 @@ Part of a family of Rust crates for options trading infrastructure:
 [IronCondor](https://github.com/joaquinbejar/IronCondor) ·
 [Option-Chain-OrderBook](https://github.com/joaquinbejar/Option-Chain-OrderBook)
 
+## Documentation
+
+The full design documentation (PRD, roadmap, TUI architecture, data-provider
+design, replay mode, views/UX, and ADRs) is maintained locally during the
+design phase and will be published with the first implementation release
+(v0.1.0). No implementation code exists yet.
+
 ## License
 
 MIT — see [LICENSE](./LICENSE).
