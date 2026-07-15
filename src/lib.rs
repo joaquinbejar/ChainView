@@ -18,9 +18,18 @@ pub(crate) mod event;
 pub(crate) mod providers;
 pub(crate) mod ui;
 
-pub use chain::ProviderId;
+pub use chain::{
+    ContractSpecFingerprint, ExerciseStyle, Instrument, InstrumentKey, ProviderId,
+    RESERVED_PROVIDER_IDS, SettlementStyle,
+};
 pub use config::{CliOverrides, Config, ModeSelect, ProviderSettings, ThemeChoice};
 pub use error::{
     BundleError, ChainViewError, ConfigError, NormalizeKind, OverlayError, ProviderError, Redacted,
     RegistryError, TransportDetail, TransportKind,
 };
+// The domain speaks `optionstratlib`'s numeric vocabulary
+// (`docs/01-domain-model.md` §3–§4); re-export the two types that appear on the
+// public identity surface so downstream callers can name them without depending
+// on `optionstratlib` directly.
+pub use optionstratlib::OptionStyle;
+pub use optionstratlib::prelude::Positive;

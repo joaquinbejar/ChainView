@@ -14,6 +14,40 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- Normalized instrument identity (`src/chain/identity.rs`, issue #4): the
+  provider-agnostic `InstrumentKey` (`underlying`, absolute-UTC
+  `expiration_utc`, `strike`, `style`) with `Eq`/`Hash` over all four fields and
+  deliberately **no** `ProviderId` — so a REST snapshot row and a stream overlay
+  for the same option collapse to one map entry; the `ContractSpecFingerprint`
+  economic-equivalence spec (`contract_multiplier`, `settlement`, `exercise`,
+  `quote_currency`, `venue_product_code`) with the `SettlementStyle`/
+  `ExerciseStyle` (`#[repr(u8)]`) enums, deriving `Eq`/`Hash` so the
+  cross-provider overlay gate (issue #7) can compare it by value; and the
+  `Instrument` view (key + owning `ProviderId` + native/stream aliases + spec)
+  with **hand-written** `PartialEq`/`Eq`/`Hash` delegating to `key` only. The
+  open, validated `ProviderId` newtype is completed from its issue #2/#3
+  placeholder into the full form: a fallible `new()` → `ConfigError::InvalidValue`,
+  `as_str()`, `is_reserved()`, `serde` via `try_from = "String"` / `into =
+  "String"` (re-validates on the way in), `PartialOrd`/`Ord` retained for
+  `Config`'s `BTreeMap`, not `Copy`; plus `RESERVED_PROVIDER_IDS` (the five
+  built-in ids). `validate_provider_id` in `src/config.rs` now delegates to
+  `ProviderId::new`. The identity types, the style enums, and
+  `RESERVED_PROVIDER_IDS` are re-exported from the crate root, alongside
+  `optionstratlib`'s `Positive` and `OptionStyle` (the domain numeric
+  vocabulary on the public identity surface). Nothing may `match` on a
+  `ProviderId` (documented; arch test lands in issue #22).
+  Adds two runtime dependencies (audit notes):
+  - `optionstratlib` `0.18.0` — the chain model and options math; supplies
+    `Positive` (non-negative price/strike) and `OptionStyle` (call/put) on the
+    identity surface. Default features are empty (`default = []`), so no
+    tokio/reqwest/plotly is pulled; `RUSTSEC`-clean at this revision, first-party
+    ecosystem crate. Named by `CLAUDE.md` "Key Decisions" as the mandated chain/
+    math library.
+  - `chrono` `0.4` (`default-features = false`, `features = ["std"]`) —
+    `DateTime<Utc>` for the absolute-UTC expiry in `InstrumentKey`; the ecosystem
+    timestamp type (`rules/global_rules.md` "Type Safety"). Minimal features (no
+    `clock`/`serde`) requested; feature unification with `optionstratlib` adds no
+    obligation. `RUSTSEC`-clean.
 - Typed configuration surface (`src/config.rs`, issue #3): the immutable
   `Config` with `ProviderSettings`, `ThemeChoice`, and `ModeSelect`, assembled
   once at startup and validated into typed `ConfigError`s. A layered loader with
@@ -71,6 +105,20 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   and `.env.example`. No runtime dependency added.
 
 ### Changed
+
+- Tightened the `ProviderId` grammar from `^[a-z][a-z0-9_-]{1,31}$` to
+  `^[a-z][a-z0-9]*(?:[_-][a-z0-9]+)*$` (2–32 chars, `-`/`_` isolated between
+  alphanumerics — no leading/trailing/adjacent separator), a strict superset
+  check (issue #4, [ADR-0008](docs/adr/0008-provider-id-grammar-and-env-bijection.md)).
+  This resolves the issue #3 non-injectivity defect in the
+  `docs/07-configuration.md` §5.1 id ↔ env-segment transliteration
+  (`encode("a--") == encode("a_") == "A__"`): under the tightened grammar the
+  map is a **total bijection over the full valid-id space**, proved by property
+  test (round-trip + no-collision) in `tests/property.rs`, which replaces the
+  pinned-limitation test. All five built-ins and the documented examples
+  (`my-broker`, `my_broker`, `td-ameritrade`) stay valid; `encode_segment`/
+  `decode_segment` are unchanged and stay in `src/config.rs`. Pre-v0.1 narrowing
+  of an unshipped surface — no SemVer event.
 
 ### Deprecated
 

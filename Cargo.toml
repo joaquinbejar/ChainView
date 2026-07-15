@@ -28,6 +28,8 @@ toml = "1"
 humantime = "2"
 clap = { version = "4.5", features = ["derive"] }
 dotenvy = "0.15"
+optionstratlib = { version = "0.18.0", default-features = false }
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 proptest = "1"

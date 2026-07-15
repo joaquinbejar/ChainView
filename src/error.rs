@@ -344,8 +344,12 @@ impl fmt::Display for NormalizeKind {
 mod tests {
     use super::*;
 
+    #[track_caller]
     fn provider_id(id: &str) -> ProviderId {
-        ProviderId::new(id)
+        match ProviderId::new(id) {
+            Ok(p) => p,
+            Err(e) => panic!("expected a valid provider id `{id}`, got: {e}"),
+        }
     }
 
     #[test]
