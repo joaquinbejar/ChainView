@@ -14,6 +14,74 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- The synchronous render loop, the pure total draw dispatch, and the two-level
+  key input (`src/ui/mod.rs`, `src/ui/driver.rs`, `src/ui/{chain,depth,surface,payoff,replay}.rs`,
+  issue #13; `docs/02-tui-architecture.md` §7, §8, §9, §12,
+  `docs/05-views-and-ux.md` §2, §8). The terminal layer's render seam: a draw path
+  that is a pure function of app state, an event-driven loop that parks and redraws
+  only when dirty, and the tick/input task seams the supervisor (#11) owns. Key
+  behaviours:
+  - **`render(&App, &mut Frame)` is pure and the dispatch is total, wildcard-free.**
+    `render` takes `&App` (never `&mut`), so a draw cannot mutate state or perform
+    I/O — the purity guarantee is enforced by the signature. It lays out the root
+    (`layout_root`: status bar + body + hint line, via `Layout::areas` so there is
+    no unchecked index and a zero-size area yields empty regions, never a panic),
+    draws a minimal status placeholder, then the **mode-first, screen-exhaustive**
+    match with **no `_` arm** — `Mode::Live(s) => match s.screen { Chain | Depth |
+    Surface | Payoff }`, `Mode::Replay(s) => match s.screen { Replay | Payoff }` —
+    then the help overlay when open. Adding a screen variant forces the matching
+    mode arm to be revisited by the compiler.
+  - **Screen-shaped module boundary.** Each screen (`chain`/`depth`/`surface`/
+    `payoff`/`replay`) exposes a pure `draw(&State, &mut Frame, Rect)` and
+    `handle_key(&mut State, KeyEvent) -> Option<AppEvent>` with honest placeholder
+    bodies (a titled block — the real chain matrix is #18, the others v0.2/v0.3/
+    v0.5); no I/O, no `.await`, no `GraphData` build in `draw`. The replay screen's
+    `handle_key` demonstrates the seam: a scrub key returns `AppEvent::ReplaySeek`
+    the loop folds back, so the widget emits an event rather than seeking inline.
+  - **Event-driven render loop, redraw only when dirty.** `run_render_loop` runs on
+    a dedicated blocking thread and **parks** on the bounded `AppEvent` channel via
+    `blocking_recv` — no busy-poll. Per event it folds it (two-level key dispatch),
+    **pumps the #10 `EventBridge` between frames** (draining coalesced quotes/Greeks/
+    depth + the priority control channel and routing commands), and redraws **only
+    when `App::dirty`**, clearing `dirty` after the draw; it breaks on
+    `App::should_quit` and returns when the channel closes. The tick (default ~250 ms
+    from `config.tick_interval`) is the bridge's flush cadence, so market updates are
+    folded at least every tick with zero spinning.
+  - **Two-level key dispatch, closed sets wildcard-free.** `App::dispatch_key_global`
+    handles the globals (`q`/`Ctrl-C` quit, `?` help, `r` reconnect, `R` rediscover)
+    and the **modal-help intercept** (only `?`/`Esc` close it; every other key is
+    swallowed, never reaching the screen behind the overlay), returning a `KeyRoute`
+    (`Consumed`/`ToScreen`); a `ToScreen` key is forwarded to the active screen's
+    `handle_key`, whose follow-on `AppEvent` is folded back. Both the `AppEvent` fold
+    and the mode→screen forwarding are exhaustive with no `_` arm (crossterm
+    `KeyCode`/`Event` are the only open vocabularies). Extends `App::on_key` without
+    breaking #9's tests.
+  - **Tick + input tasks are supervisor-owned seams (§12).** `spawn_tick_task`
+    (`tokio::spawn` + `interval` with `MissedTickBehavior::Skip`, `select!` on its
+    child `CancellationToken`, non-blocking `try_send` so a full channel drops a
+    harmless tick and a closed one ends the task) and `spawn_input_reader`
+    (`spawn_blocking` polling with a bounded 100 ms timeout so cancellation is
+    observed, `blocking_send` so a slow render never drops a keystroke, ignoring
+    mouse/focus/paste per the v1 keyboard-only model) each return a `JoinHandle` the
+    composition wraps in `TokioTask` and registers with the `Supervisor` (ancillary
+    tasks; the render loop is the render task on `spawn_blocking`). The composition
+    recipe is documented in `src/ui/driver.rs`.
+  - **Tested with `TestBackend` and mocks; no socket, no real clock.** `render`,
+    `layout_root`, the loop `step`, the two-level dispatch, and the crossterm-event
+    normalization are unit-tested with a `ratatui::backend::TestBackend` and a
+    crate-internal `App` test-support builder; the tick task is asserted on a paused
+    virtual clock (zero real wait). `render`, `layout_root`, `RootLayout`,
+    `run_render_loop`, `event_channel`, `EVENT_CHANNEL_CAPACITY`, `spawn_tick_task`,
+    `spawn_input_reader`, and `KeyRoute` are re-exported from the crate root. **No new
+    dependency and no new `tokio`/`crossterm` feature** — the render loop uses the
+    `sync`/`rt`/`macros`/`time` features already present from #11 and crossterm's
+    default `events`. Tests: 19 in-module (`src/ui/mod.rs` layout/purity/reachable-
+    screen + `prop_render_never_panics` over both modes × every reachable screen ×
+    help × every live load state × terminal sizes from 1x1; `src/ui/driver.rs`
+    dirty-gated `step`, parked-loop drain/quit, two-level dispatch incl. modal-swallow
+    and replay-scrub forward, event normalization, and the two tick-task lifecycle
+    tests) plus 4 in `src/app.rs` (`dispatch_key_global` route/modal/non-press) —
+    23 new; 298 lib tests total.
 - The application-owned `ProviderRegistry` and the `ChainViewApp` builder
   (`src/app/registry.rs`, issue #12; `docs/02-tui-architecture.md` §11,
   `docs/03-data-providers.md` §9, ADR-0006). The open provider-extension entry
