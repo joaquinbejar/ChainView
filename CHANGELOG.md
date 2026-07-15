@@ -14,6 +14,54 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- The terminal lifecycle: the RAII `TerminalGuard` and the panic-hook restore
+  (`src/terminal.rs`, issue #8; `docs/02-tui-architecture.md` §6, ADR-0001). The
+  guard's constructor enables raw mode, enters the alternate screen, and hides the
+  cursor; its `Drop` runs the exact inverse, so the terminal is restored on
+  **every** exit path — a normal return, an early `?`, or a panic. Key behaviours:
+  - **Transactional setup, tolerant teardown.** Setup records each applied step;
+    a mid-sequence failure rolls back exactly the applied prefix and returns
+    `ChainViewError::Terminal`, so a rejected setup (e.g. no TTY) leaves the shell
+    clean. Teardown is best-effort, infallible, and idempotent — a
+    partially-initialized guard and a double teardown both restore without
+    panicking (a `restored` latch guarantees at-most-once).
+  - **Panic hook chains, never swallows.** `install_panic_hook` captures the
+    previously installed hook via `std::panic::take_hook`, restores the terminal
+    first (show cursor, leave alternate screen, disable raw mode — synchronous,
+    allocation-light, errors ignored), then invokes the captured hook, so the
+    backtrace prints on a normal (non-raw) screen and is never lost.
+  - **TTY-less testability.** The low-level operations are abstracted over a
+    crate-internal `TerminalOps` trait; unit tests drive a recording fake to
+    assert the setup order, the inverse teardown order, idempotent double-restore,
+    partial-setup tolerance, setup-failure rollback, and teardown error tolerance
+    — all deterministic, with no real terminal. The restore-before-chain ordering
+    is proved by a small `restore_then_chain` primitive tested with fakes (no
+    process-global hook). The concrete `crossterm` path (`CrosstermOps`) is
+    exercised end to end by a `harness = false` subprocess in
+    `tests/terminal_restore.rs`: the child installs the real hook and panics; the
+    parent asserts the leave-alternate-screen + show-cursor escapes reach the
+    child's stdout (restore ran) and the panic marker reaches stderr (chained hook
+    not swallowed), and that the child exits non-zero without hanging.
+  - **`main.rs` wiring.** Startup installs the panic hook, then enters the guard,
+    so the render loop (#13) will be wrapped by a guaranteed restore. `main`
+    returns the typed `ChainViewError` (`ConfigError` folds in via `#[from]`), so
+    the `main.rs`-only `anyhow` deviation gate (`clippy.toml`) is left untouched.
+    No `std::process::exit` bypasses `Drop`; the supervised, ordered teardown that
+    sequences the guard last lands in #11. `TerminalGuard` and `install_panic_hook`
+    are re-exported from the crate root so an external thin binary (ADR-0006) can
+    drive the same restore.
+  - Tests: 8 unit (`src/terminal.rs`) plus the subprocess integration harness.
+  Adds the first two TUI dependencies (audit notes):
+  - `ratatui` `0.29` (`features = ["crossterm"]`) — the widget/layout library
+    (ADR-0001), first TUI pull approved by this issue. `ratatui` `0.30` requires
+    rustc 1.88, above the crate's 1.85 MSRV, so the resolver pins `0.29`, which
+    re-exports `crossterm` `0.28.1`. `RUSTSEC`-clean at this revision; the
+    de-facto standard Rust TUI toolkit.
+  - `crossterm` `0.28` — the terminal backend (raw mode, alternate screen, cursor
+    control) named by ADR-0001; cross-platform including Windows. Pinned to the
+    same `0.28` line `ratatui` `0.29` drives, so cargo unifies to a **single**
+    `crossterm` instance — the one ChainView calls is exactly the one `ratatui`
+    drives, with no two-version mismatch. `RUSTSEC`-clean.
 - The live `ChainStore` (`src/chain/store.rs`, issue #7): the deterministic
   poll -> stream merge over the `optionstratlib` chain
   (`docs/01-domain-model.md` §5.1, §6, `docs/03-data-providers.md` §3, §4).

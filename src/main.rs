@@ -4,16 +4,21 @@
 //! [`Config`](chainview::Config). Replay mode is entered by the
 //! `chainview replay <dir>` **subcommand** (§4.1), never a `--replay` flag.
 //!
-//! This is deliberately minimal: parse the CLI, load `.env` into the
-//! environment, assemble the config. The terminal setup with guaranteed
-//! restore, the tokio runtime, and the render loop land in later issues.
+//! Startup order (`docs/02-tui-architecture.md` §6): parse the CLI, load `.env`,
+//! assemble the config, install the panic hook, then enter the terminal under an
+//! RAII [`TerminalGuard`](chainview::TerminalGuard) whose `Drop` restores the
+//! shell on every exit path. The tokio runtime, event loop, and render loop land
+//! in later issues (#9/#11/#13); this entry point returns the typed
+//! [`ChainViewError`](chainview::ChainViewError), so `anyhow` is not needed here
+//! and the `main.rs` `anyhow` deviation (CLAUDE.md "Governance precedence") is
+//! left untouched.
 
 #![forbid(unsafe_code)]
 
 use std::path::PathBuf;
 
-use chainview::ConfigError;
 use chainview::config::{CliOverrides, Config, ModeSelect};
+use chainview::{ChainViewError, TerminalGuard, install_panic_hook};
 use clap::{Args, Parser, Subcommand};
 
 /// `chainview` — a terminal UI for option chains, Greeks, and volatility.
@@ -95,16 +100,33 @@ impl Cli {
     }
 }
 
-fn main() -> Result<(), ConfigError> {
+fn main() -> Result<(), ChainViewError> {
     // Load `.env` from the working directory into the process environment before
     // reading config (startup glue, `docs/07-configuration.md` §2). Absence is
     // not an error.
     let _ = dotenvy::dotenv();
 
     let overrides = Cli::parse().into_overrides();
+    // `ConfigError` folds into `ChainViewError::Config` via `#[from]`, so an
+    // early `?` here returns before any terminal setup — stderr is safe.
     let _config = Config::load(overrides)?;
 
-    // No runtime behavior yet — the terminal and render loop land in later
-    // issues. `_config` is assembled and validated, then dropped.
+    // Install the panic hook BEFORE entering the alternate screen so a panic at
+    // any later point restores the terminal before the backtrace prints
+    // (`docs/02-tui-architecture.md` §6). The TUI-safe tracing file/pane sink
+    // (CLAUDE.md "Governance precedence" item 3) is wired in #3/#11; until then
+    // nothing competes with the TUI for stdout.
+    install_panic_hook();
+
+    // Enter raw mode + the alternate screen under an RAII guard. Its `Drop`
+    // restores the terminal on EVERY exit path from here on — a normal return,
+    // an early `?`, or a panic. No `std::process::exit` runs while the guard is
+    // held, so `Drop` is never bypassed; the supervised, ordered teardown that
+    // sequences this last lands in #11.
+    let _guard = TerminalGuard::new()?;
+
+    // The event fan-in, provider tasks, and render loop land in #9/#11/#13. Today
+    // the assembled config and the guard prove the lifecycle end to end: on
+    // return `_guard` drops and restores the terminal.
     Ok(())
 }

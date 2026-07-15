@@ -16,6 +16,7 @@ pub mod config;
 pub(crate) mod error;
 pub(crate) mod event;
 pub(crate) mod providers;
+pub(crate) mod terminal;
 pub(crate) mod ui;
 
 pub use chain::{
@@ -41,6 +42,13 @@ pub use providers::{
     Provider, ProviderCapabilities, ProviderCapabilitiesBuilder, SubscriptionHandle,
     SubscriptionRequest, UnderlyingRef,
 };
+// The terminal lifecycle surface (`docs/02-tui-architecture.md` §6, ADR-0001):
+// the RAII restore guard and the panic-hook restore installer. Public so an
+// external thin binary (ADR-0006) can drive the same guaranteed restore. These
+// stay the stable restore entrypoints for hand-rolled external binaries and are
+// intentionally NOT narrowed to `pub(crate)` once `ChainViewApp::builder().run()`
+// (issue #11) owns the guard internally.
+pub use terminal::{TerminalGuard, install_panic_hook};
 // The domain speaks `optionstratlib`'s numeric vocabulary
 // (`docs/01-domain-model.md` §3–§4); re-export the two types that appear on the
 // public identity surface so downstream callers can name them without depending
