@@ -53,6 +53,10 @@ use crate::config::ThemeChoice;
 use crate::event::{AppEvent, Command, SeekTo};
 use crate::providers::{ChainCapability, GreeksCapability, ProviderCapabilities};
 
+mod bridge;
+
+pub use bridge::{BridgeSenders, COMMAND_CHANNEL_CAPACITY, CONTROL_CHANNEL_CAPACITY, EventBridge};
+
 // ---------------------------------------------------------------------------
 // App: the top-level state the render loop reads (§3).
 // ---------------------------------------------------------------------------
