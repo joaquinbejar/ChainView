@@ -14,6 +14,79 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- The single task supervisor, cancellation-token tree, and ordered teardown
+  (`src/app/supervisor.rs`, issue #11; `docs/02-tui-architecture.md` §12,
+  ADR-0005). One `Supervisor`, owned by the application layer, owns **all** task
+  handles and a root `tokio_util::sync::CancellationToken` so the invariant
+  "every spawned task has a shutdown path" is enforceable process-wide. Key
+  behaviours:
+  - **Cancellation-token tree.** A root token has one `child_token` per task
+    (`Supervisor::child_token`); cancelling the root cascades to every child,
+    and `cancel_provider(id)` cancels a **single** provider's child without
+    touching the others or the root (used on `Unsubscribe`/`Rediscover`). The
+    supervisor coordinates by tokens + join handles, **never a lock across an
+    `.await`** (`rules/global_rules.md` — Concurrency).
+  - **All triggers converge on one teardown.** A clean quit (`request_quit`,
+    wired from `App::should_quit`), a startup / provider-past-budget / channel
+    close failure (`fail`), and a **panic in any task** (reported through the
+    `ExitReporter` seam as `TaskExit::Panicked`, detected via a `JoinHandle`
+    join result whose `JoinError::is_panic()` is true — `TokioTask::join`) all
+    trip the root token. The panic path is a task-level fatal signal the
+    supervisor records itself; it does **not** rely on the process panic hook
+    alone (that only restores the terminal). No trigger leaves an orphan.
+  - **Deterministic join order, terminal restored LAST.** Teardown (1) cancels +
+    joins the **provider** tasks, then (2) the **input/tick/replay** tasks, then
+    (3) lets the **render** task exit, and only then (4) runs the `FinalTeardown`
+    that restores the terminal (`GuardTeardown` drops the #8 `TerminalGuard`) —
+    the strictly-last step on every path, including panic.
+  - **Bounded join, then abort.** Each join has a `DEFAULT_JOIN_BUDGET` (2 s)
+    `tokio::time::timeout`; a task that ignores cancellation past the budget is
+    `abort()`ed so a wedged upstream socket can never hang exit. The budget is
+    asserted with a **controllable virtual clock** (`#[tokio::test(start_paused
+    = true)]`), so the 2 s window is honored in virtual time with **zero real
+    wall-clock wait**.
+  - **Error propagation seam.** `run()` returns the first fatal `ExitCause`
+    (`Clean` / `TaskPanicked` / `Failed(ChainViewError)`, first-fatal-wins), with
+    `exit_code()` (0 clean, 1 failure) and a redaction-safe `failure_message()`.
+    The supervisor **never** calls `std::process::exit` (that would bypass the
+    guard `Drop`); `main` maps the returned cause to an exit code and prints the
+    message on `stderr` **after** the terminal is restored (CLAUDE.md governance
+    item 3).
+  - **Testable with mocks, no socket / no real clock.** The `SupervisedTask`
+    trait (real `TokioTask` vs. a recording mock) and the `FinalTeardown` trait
+    (real `GuardTeardown` vs. a recorder) make the join-order and
+    bounded-join-then-abort deterministic. `Supervisor`, `ExitCause`,
+    `ExitReporter`, `FinalTeardown`, `GuardTeardown`, `SupervisedTask`,
+    `TaskExit`, `TokioTask`, and `DEFAULT_JOIN_BUDGET` are re-exported from the
+    crate root for the builder (#12) / render loop (#13) / `main.rs` to wire.
+    Sequencing the guard last (#8), the channels (#10), the render loop (#13),
+    and the provider reconnect internals (#16) are left as clean seams.
+    Tests: 13 in-module (exit-code/message, request-quit cascade,
+    cancel-provider isolation, bounded-join wedged-abort + cooperative-in-budget
+    on a paused clock, a **real-`TokioTask`** wedged regression proving the
+    timeout-then-abort truly cancels rather than detaching an orphan — it fails
+    against a `take()`-based join, ordered provider→ancillary→render→restore,
+    normal-quit all-join, reported-panic non-zero + restore-last + no-orphan,
+    panic-at-join-over-clean-trigger, first-fatal-only, wedged-run
+    abort-still-clean) plus 2 integration (`tests/supervisor_shutdown.rs`,
+    real tokio tasks: normal-quit every-task-joined + terminal-restored, and an
+    injected real provider panic → non-zero `TaskPanicked` exit, terminal
+    restored, no orphan). Adds one dependency and extends `tokio` (audit notes):
+  - `tokio-util` `0.7` (`default-features = false`) — only
+    `tokio_util::sync::CancellationToken` for the root + per-task child-token
+    tree (no codec/io features). RUSTSEC-clean; MSRV 1.71 (below our 1.85).
+    Explicit-approval addition (CLAUDE.md "Coding Rules").
+  - `tokio` gains `rt` / `macros` / `time` on top of the existing `sync`. This
+    **supersedes** the two earlier notes that pinned tokio to `["sync"]`-only —
+    the #6 provider-port entry ("no runtime / macros / net yet — the full runtime
+    features land with the adapters and app loop in later issues") and the #10
+    bridge entry ("no new `tokio` features … no `rt`/`macros`/`time` are pulled");
+    #11 is that "later issue". `rt` for `JoinHandle`/`abort`/`JoinError::is_panic`,
+    `macros` for the supervise `tokio::select!`, `time` for the bounded-join
+    `tokio::time::timeout`. Still no `net`/`fs`/`rt-multi-thread` — the render loop
+    (#13) picks the runtime flavor. A **dev-only** `test-util` feature (in
+    `[dev-dependencies]`, never in the release binary) enables the paused virtual
+    clock for the no-wall-clock budget tests. RUSTSEC-clean.
 - The two-class bounded, coalescing provider -> app bridge (`src/app/bridge.rs`,
   issue #10; `docs/02-tui-architecture.md` §5, `docs/06-performance.md` §3.2,
   `docs/03-data-providers.md` §5). `EventBridge` is the seam that joins the async

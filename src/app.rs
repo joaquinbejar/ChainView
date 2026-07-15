@@ -54,8 +54,13 @@ use crate::event::{AppEvent, Command, SeekTo};
 use crate::providers::{ChainCapability, GreeksCapability, ProviderCapabilities};
 
 mod bridge;
+mod supervisor;
 
 pub use bridge::{BridgeSenders, COMMAND_CHANNEL_CAPACITY, CONTROL_CHANNEL_CAPACITY, EventBridge};
+pub use supervisor::{
+    DEFAULT_JOIN_BUDGET, ExitCause, ExitReporter, FinalTeardown, GuardTeardown, SupervisedTask,
+    Supervisor, TaskExit, TokioTask,
+};
 
 // ---------------------------------------------------------------------------
 // App: the top-level state the render loop reads (§3).
