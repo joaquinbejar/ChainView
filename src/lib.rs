@@ -19,8 +19,10 @@ pub(crate) mod providers;
 pub(crate) mod ui;
 
 pub use chain::{
-    ContractSpecFingerprint, ExerciseStyle, Instrument, InstrumentKey, ProviderId,
-    RESERVED_PROVIDER_IDS, SettlementStyle,
+    CHAIN_STALE_SLACK, ChainSnapshot, ContractSpecFingerprint, DIRECTION_DECAY, DepthLadder,
+    DepthLevel, ExerciseStyle, FEED_DELAY_WARN, GREEKS_STALE_AFTER, GreeksOrigin, GreeksRow,
+    Instrument, InstrumentKey, MarketUpdate, ProviderId, QUOTE_STALE_AFTER, QuoteUpdate,
+    RESERVED_PROVIDER_IDS, SettlementStyle, StreamHealth, chain_stale_after,
 };
 pub use config::{CliOverrides, Config, ModeSelect, ProviderSettings, ThemeChoice};
 pub use error::{
