@@ -19,6 +19,20 @@ pub(crate) mod providers;
 pub(crate) mod terminal;
 pub(crate) mod ui;
 
+// The application state machine + fan-in (`docs/02-tui-architecture.md` §3, §4):
+// the `App`, the `Live | Replay` `Mode`, the mode-scoped `LiveScreen`/
+// `ReplayScreen`, the composite source/overlay bindings and per-screen state, and
+// the capability-read reachability helper. Public so the app builder (#12) and
+// the render loop (#13) can name and drive them.
+pub use app::{
+    App, BundleLoad, LiveScreen, LiveState, LoadedReplay, Mode, OverlayBinding, PayoffBuilder,
+    Playback, ReplayScreen, ReplayState, ScreenLoad, Selection, SourceBinding, StatusLine,
+    is_screen_reachable,
+};
+// The closed event set folded by the state machine and the render -> data
+// command channel (`docs/02-tui-architecture.md` §4).
+pub use event::{AppEvent, Command, SeekTo};
+
 pub use chain::{
     AliasCatalog, CHAIN_STALE_SLACK, ChainFetch, ChainSnapshot, ChainSource, ChainStore,
     ContractSpecFingerprint, DIRECTION_DECAY, DepthLadder, DepthLevel, ExerciseStyle, ExpirySource,
