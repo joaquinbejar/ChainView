@@ -14,6 +14,18 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- Boundary error types (`src/error.rs`): `ChainViewError` and its per-boundary
+  source enums — `ProviderError`, `BundleError`, `ConfigError`, `RegistryError`,
+  and `OverlayError` — via `thiserror`, plus the `Redacted` trait and
+  `TransportDetail`/`TransportKind` and the closed `NormalizeKind`. Redaction-safe
+  by construction: no upstream error type reaches a widget and no secret can be
+  interpolated into any `Display` (transport detail is a category + status only;
+  normalize failures name a field, never a value). `ProviderError` converts into
+  `ChainViewError` only through the explicit `ChainViewError::provider(id, source)`
+  helper (the `Provider` variant carries the `ProviderId`); the other
+  sub-boundaries convert via `#[from]`. A minimal `ProviderId` placeholder lands
+  in `src/chain/mod.rs`, completed by #4. Re-exported from the crate root. Adds
+  `thiserror` as the first runtime dependency.
 - Bootstrap the single-crate (binary + lib) skeleton for v0.1: MSRV Rust 1.85
   on the 2024 edition, `#![forbid(unsafe_code)]` at both crate roots, the
   `[lints]` table (deny warnings, deny `unsafe_code`, clippy restriction
