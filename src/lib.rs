@@ -19,11 +19,12 @@ pub(crate) mod providers;
 pub(crate) mod ui;
 
 pub use chain::{
-    AliasCatalog, CHAIN_STALE_SLACK, ChainFetch, ChainSnapshot, ChainSource,
+    AliasCatalog, CHAIN_STALE_SLACK, ChainFetch, ChainSnapshot, ChainSource, ChainStore,
     ContractSpecFingerprint, DIRECTION_DECAY, DepthLadder, DepthLevel, ExerciseStyle, ExpirySource,
-    FEED_DELAY_WARN, GREEKS_STALE_AFTER, GreeksOrigin, GreeksRow, Instrument, InstrumentKey,
-    MarketUpdate, ProviderId, QUOTE_STALE_AFTER, QuoteUpdate, RESERVED_PROVIDER_IDS,
-    SettlementStyle, StreamHealth, chain_stale_after,
+    FEED_DELAY_WARN, Freshness, GREEKS_STALE_AFTER, GreeksOrigin, GreeksRow, Instrument,
+    InstrumentKey, MAX_PENDING, MarketUpdate, MergeOutcome, ProviderId, QUOTE_STALE_AFTER,
+    QuoteUpdate, RESERVED_PROVIDER_IDS, SettlementStyle, StreamHealth, TickDir, chain_stale_after,
+    pending_ttl,
 };
 pub use config::{CliOverrides, Config, ModeSelect, ProviderSettings, ThemeChoice};
 pub use error::{
