@@ -12,13 +12,14 @@
 
 pub(crate) mod app;
 pub(crate) mod chain;
-pub(crate) mod config;
+pub mod config;
 pub(crate) mod error;
 pub(crate) mod event;
 pub(crate) mod providers;
 pub(crate) mod ui;
 
 pub use chain::ProviderId;
+pub use config::{CliOverrides, Config, ModeSelect, ProviderSettings, ThemeChoice};
 pub use error::{
     BundleError, ChainViewError, ConfigError, NormalizeKind, OverlayError, ProviderError, Redacted,
     RegistryError, TransportDetail, TransportKind,
