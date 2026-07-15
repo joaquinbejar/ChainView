@@ -83,6 +83,18 @@ pub enum RegistryError {
     /// Two registrations share the same id.
     #[error("provider id `{0}` is already registered")]
     DuplicateId(ProviderId),
+    /// A security-**gated** built-in adapter was requested via
+    /// `with_gated_builtin` while its upstream credential-logging gate still
+    /// holds (`docs/SECURITY.md` §2.3–§2.4). A gated adapter can never be enabled
+    /// silently — this is a typed startup failure, never a panic — and names only
+    /// the public provider id, never a credential. This is the concrete typed
+    /// error `docs/02-tui-architecture.md` §11 refers to (superseding the earlier
+    /// unattached `ProviderGated` sketch): the whole registry family surfaces as
+    /// [`ChainViewError::Registry`].
+    #[error(
+        "provider id `{0}` is a gated built-in and cannot be enabled while its security gate holds"
+    )]
+    Gated(ProviderId),
     /// No providers were registered before startup.
     #[error("no providers registered")]
     Empty,
@@ -489,6 +501,15 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "provider id `mybroker` is already registered"
+        );
+    }
+
+    #[test]
+    fn test_registry_error_gated_display_names_id() {
+        let err = RegistryError::Gated(provider_id("tastytrade"));
+        assert_eq!(
+            err.to_string(),
+            "provider id `tastytrade` is a gated built-in and cannot be enabled while its security gate holds"
         );
     }
 

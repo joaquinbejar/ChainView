@@ -54,9 +54,14 @@ use crate::event::{AppEvent, Command, SeekTo};
 use crate::providers::{ChainCapability, GreeksCapability, ProviderCapabilities};
 
 mod bridge;
+mod registry;
 mod supervisor;
 
 pub use bridge::{BridgeSenders, COMMAND_CHANNEL_CAPACITY, CONTROL_CHANNEL_CAPACITY, EventBridge};
+// `ProviderRegistry` stays crate-internal to `registry` (the UI never receives
+// it, and external code composes through the builder), so only the builder entry
+// points are re-exported here.
+pub use registry::{ChainViewApp, ChainViewAppBuilder};
 pub use supervisor::{
     DEFAULT_JOIN_BUDGET, ExitCause, ExitReporter, FinalTeardown, GuardTeardown, SupervisedTask,
     Supervisor, TaskExit, TokioTask,
