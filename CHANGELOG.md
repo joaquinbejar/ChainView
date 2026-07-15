@@ -14,6 +14,93 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- The single-source keybinding map, the modal help overlay, the auto/dark/light
+  theme, the truthful status bar / keybar, and the `NO_COLOR` fallback
+  (`src/app/keymap.rs` + `src/ui/theme.rs`, issue #14; `docs/05-views-and-ux.md`
+  §3, §7, §8). The terminal layer's interaction + accessibility seam. Key
+  behaviours:
+  - **One map both dispatch and the overlay read, so they cannot drift.** `KEYMAP`
+    is a single declarative `(key, context, action)` table living in the
+    **application** layer (`src/app/keymap.rs`, pure data + resolution, no
+    `ratatui`). The key dispatch reads it — `App::dispatch_key_global` resolves
+    globals through `keymap::resolve_global` (a `GlobalCommand`), and
+    `ui::replay::handle_key` resolves scrub keys through `keymap::resolve_replay` —
+    and the ui help overlay (`src/ui/theme.rs`) is **generated from the same table**
+    via `keymap::help_sections` (`ui → application`, the mandated direction), so a
+    key that does something appears in the overlay by construction. A cross-check
+    test proves every dispatched global/replay chord is documented (a key not in the
+    overlay is a 🔴). The full v0.1 table lands: `q`/`Ctrl-C`, `?`, `1`–`4`,
+    `Tab`/`S-Tab`, `r`, `R`, the chain/depth/surface/payoff/replay keys — keys whose
+    bodies land later (chain #18, surface/payoff v0.2, depth v0.5, replay
+    playback/speed/fill v0.3) are declared now with their context and resolve to a
+    documented no-op placeholder. No key is handled outside the map.
+  - **Modal help precedence, ordered correctly.** While the overlay is open the
+    dispatch honors only `?`/`Esc` (both close it); every other key is swallowed —
+    including keys **outside** the keymap vocabulary (F-keys, PageUp/Down,
+    Insert/Delete), because the modal intercept runs **before** the vocabulary check,
+    so no key can reach the hidden screen behind the overlay. `Ctrl-C` is the one
+    documented carve-out: it stays a hard terminal-interrupt quit even behind the
+    modal.
+  - **Two-column help overlay, readable on 80x24.** The overlay is laid out in two
+    height-balanced columns (globals + a screen group per side) generated from the
+    map, so every documented key — including the last (Payoff) section — is visible
+    on a standard trader terminal instead of clipping off the bottom; help text is
+    terse so nothing truncates mid-phrase. Every screen is listed even when it has no
+    bindings yet: the v0.5 replay Payoff screen appears as a titled section with a
+    "not available yet" note rather than being dropped.
+  - **Reachability skip / one-line hint, capability-driven, never a `ProviderId`
+    match.** `Tab`/`S-Tab` cycle only the reachable screens for the active
+    mode+provider (reading `is_screen_reachable` / `is_replay_screen_reachable`), so
+    they never land on an unavailable body; an unavailable number key flashes a
+    transient keybar hint ("Depth not available on deribit" / "Payoff is v0.5") and
+    does **not** switch, so `App.screen` stays reachable and `render` (#13) stays
+    total. The hint decays on the next key or after `HINT_TICKS` ticks (~2 s), so it
+    is never a near-zero flash.
+  - **`ThemeChoice` (Auto/Dark/Light) resolution + `NO_COLOR` fallback; color is
+    never the only signal.** `Theme::resolve` maps the choice to a variant painted
+    from the 16 ANSI-named colors (legible on both dark and light terminals, zero
+    config). Every color-encoded state pairs color with a color-independent
+    marker — `◀ATM` at-spot, `+`/`−` P&L sign, `▲`/`▼`/`·` tick direction, glyph +
+    text health badges — and when `NO_COLOR` is set the `Theme` drops every
+    foreground/background color and keeps only intensity + the markers (asserted by
+    tests that the rendered span carries no `fg`/`bg` but the glyph survives).
+  - **Truthful one-line status bar + generated keybar, tick-driven animation.** The
+    status bar shows provider / health badge / mode plus a braille spinner in motion
+    states (loading / reconnecting / playing), driven by an `App.tick_count`
+    advanced on every tick and read **purely in `draw`** — never a wall-clock read.
+    A tick sets `dirty` **iff** the app is in a motion state (`App::is_in_motion`) or
+    a hint decayed, so the spinner actually animates during the initial connect /
+    reconnect / playback while a truly idle, non-motion app still parks and never
+    redraws on a tick. Venue/user strings on the status line are stripped of
+    control/escape characters at the render edge.
+  - **Responsive chain column-drop order + cross-screen too-small guard.**
+    `greek_columns_for_slots` fixes the drop **order** `Γ → ν → Θ` (Θ retained
+    first, Γ dropped first) for the chain matrix (the columns themselves land in
+    #18); below the minimum size (`MIN_WIDTH`×`MIN_HEIGHT`), `render` shows the
+    cross-screen "widen the terminal" state instead of a corrupt layout, on any
+    screen.
+  - **Layering respected: keymap in the application layer, rendering in ui.** The
+    ratatui-free keymap data + resolution (`KeyChord`/`Context`/`Action`/`Binding`/
+    `KEYMAP`, `GlobalCommand`/`resolve_global`/`resolve_replay`/`help_bindings`)
+    lives in `src/app/keymap.rs`; the `ratatui`-dependent rendering (`Theme`,
+    `StrikeRelation` + its marker spans, `GreekColumn`/`greek_columns_for_slots`,
+    the markers/spans, `MIN_WIDTH`/`MIN_HEIGHT`/`is_too_small`, and the status/keybar/
+    overlay renderers) stays in `src/ui/theme.rs`. So `ui → application` holds and no
+    application/domain/provider module imports `ui` — the single-source-of-truth
+    guarantee is preserved with dispatch and overlay reading one table. Both surfaces
+    are re-exported from the crate root (keymap from `app::keymap`, theme from
+    `ui::theme`) for the chain matrix (#18) and the render goldens (#19). `App` gains
+    `no_color`, `tick_count`, a transient `status_hint` with a `hint_ttl`, and an
+    `is_in_motion` predicate; `App::dispatch_key_global` is refactored to read the map
+    without breaking #9's / #13's tests. **No new dependency.** Tests: 5 in
+    `src/app/keymap.rs` (map↔overlay cross-check for globals and replay, screen-switch
+    slot binding, unmapped-key, chord normalization) + 19 in `src/ui/theme.rs`
+    (`NO_COLOR` strips color but keeps every marker, theme resolution, `StrikeRelation`
+    K/S bucketing, the `Γ→ν→Θ` drop order, the too-small guard + the widen state
+    through `render`, the number-key hint / `Tab` skip, modal precedence, the overlay
+    fitting 80x24 with every section, and the deferred replay-Payoff listing) + the
+    dispatch/tick regressions in `src/app.rs` (out-of-vocab modal swallow, motion-tick
+    animates while idle-tick parks, hint decays after N ticks) — 325 lib tests total.
 - The synchronous render loop, the pure total draw dispatch, and the two-level
   key input (`src/ui/mod.rs`, `src/ui/driver.rs`, `src/ui/{chain,depth,surface,payoff,replay}.rs`,
   issue #13; `docs/02-tui-architecture.md` §7, §8, §9, §12,

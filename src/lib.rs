@@ -34,7 +34,8 @@ pub use app::{
     ChainViewApp, ChainViewAppBuilder, DEFAULT_JOIN_BUDGET, EventBridge, ExitCause, ExitReporter,
     FinalTeardown, GuardTeardown, LiveScreen, LiveState, LoadedReplay, Mode, OverlayBinding,
     PayoffBuilder, Playback, ReplayScreen, ReplayState, ScreenLoad, Selection, SourceBinding,
-    StatusLine, SupervisedTask, Supervisor, TaskExit, TokioTask, is_screen_reachable,
+    StatusLine, SupervisedTask, Supervisor, TaskExit, TokioTask, is_replay_screen_reachable,
+    is_screen_reachable,
 };
 // The closed event set folded by the state machine and the render -> data
 // command channel (`docs/02-tui-architecture.md` §4).
@@ -53,6 +54,28 @@ pub use ui::driver::{
     EVENT_CHANNEL_CAPACITY, event_channel, run_render_loop, spawn_input_reader, spawn_tick_task,
 };
 pub use ui::{RootLayout, layout_root, render};
+// The theme + render surface: the `NO_COLOR`-aware `Theme`, the
+// help-overlay/status/keybar renderers, the `StrikeRelation` K/S bucket and its
+// markers/spans, the responsive chain column-drop policy, and the too-small guard
+// (`docs/05-views-and-ux.md` §7, §8, issue #14). Public so the chain matrix (#18)
+// and the render goldens (#19) can name and reuse the markers, styles, and column
+// policy.
+pub use ui::theme::{
+    AT_SPOT_MARKER, ATM_BAND_PERMILLE, GREEK_DROP_ORDER, GreekColumn, GreekColumns, MIN_HEIGHT,
+    MIN_WIDTH, StrikeRelation, Theme, ThemeVariant, greek_columns_for_slots, health_span,
+    is_too_small, pnl_sign_char, pnl_sign_span, strike_relation_marker,
+    strike_relation_marker_span, tick_dir_glyph, tick_dir_span,
+};
+// The single-source keybinding map — pure data + resolution in the **application**
+// layer (`src/app/keymap.rs`, `docs/05-views-and-ux.md` §3, issue #14). Both
+// `App::dispatch_key_global` and the help overlay (`src/ui/theme.rs`) read this one
+// table, so dispatch and documentation cannot drift. Public so the chain matrix
+// (#18) and the render goldens (#19) can name and reuse the keymap.
+pub use app::keymap::{
+    Action, Binding, ChainAction, Context, DepthAction, GlobalAction, GlobalCommand, KEYMAP,
+    KeyChord, PayoffAction, ReplayAction, SurfaceAction, help_bindings, resolve_global,
+    resolve_replay,
+};
 
 pub use chain::{
     AliasCatalog, CHAIN_STALE_SLACK, ChainFetch, ChainSnapshot, ChainSource, ChainStore,

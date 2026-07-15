@@ -45,6 +45,7 @@ use std::path::PathBuf;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use tokio::sync::mpsc;
 
+use crate::app::keymap::{GlobalCommand, KeyChord, resolve_global};
 use crate::chain::{
     ChainFetch, ChainSnapshot, ChainStore, ExpirySource, MarketUpdate, MergeOutcome, ProviderId,
     StreamHealth,
@@ -54,6 +55,7 @@ use crate::event::{AppEvent, Command, SeekTo};
 use crate::providers::{ChainCapability, GreeksCapability, ProviderCapabilities};
 
 mod bridge;
+pub(crate) mod keymap;
 mod registry;
 mod supervisor;
 
@@ -71,6 +73,12 @@ pub use supervisor::{
 // App: the top-level state the render loop reads (§3).
 // ---------------------------------------------------------------------------
 
+/// How many [`AppEvent::Tick`]s a transient keybar hint stays visible before it
+/// auto-decays (`docs/05-views-and-ux.md` §2). At the default 250 ms tick this is
+/// ~2 s — a readable minimum so a hint never flashes for near-zero time; a key
+/// press still clears it sooner.
+pub const HINT_TICKS: u8 = 8;
+
 /// All state the render loop reads, as a `Live | Replay` [`Mode`] state machine
 /// (`docs/02-tui-architecture.md` §3).
 ///
@@ -80,14 +88,35 @@ pub use supervisor::{
 pub struct App {
     /// The active mode, which owns the mode-scoped active screen.
     pub mode: Mode,
-    /// The color-theme selection. The **resolved** palette (auto-detection,
-    /// `NO_COLOR` fallback) is computed by the theme layer (#14); this stores the
-    /// user's selection so that resolution has an input.
+    /// The color-theme selection. The **resolved** palette (variant + `NO_COLOR`
+    /// fallback) is computed by the theme layer
+    /// ([`Theme::resolve`](crate::ui::theme::Theme::resolve)) each frame from this
+    /// selection and [`no_color`](App::no_color).
     pub theme: ThemeChoice,
+    /// Whether color output is disabled (`NO_COLOR` / `--no-color` / config). Read
+    /// by the theme layer so every color-encoded state falls back to markers +
+    /// intensity only (`docs/05-views-and-ux.md` §7). Set by startup from
+    /// [`Config::no_color`](crate::Config); defaults `false`.
+    pub no_color: bool,
     /// The status-bar model (provider health, clock, mode). Its fields are
     /// populated by the render loop / status line (#13/#14); a documented stub
     /// here so [`App`] is constructible now.
     pub status: StatusLine,
+    /// A monotonic tick counter, advanced on every [`AppEvent::Tick`], that drives
+    /// the status-bar spinner/clock animation (`docs/05-views-and-ux.md` §7). Read
+    /// purely in `draw` so the animation never reads a wall clock there; an idle
+    /// tick advances it but does **not** set [`dirty`](App::dirty) (§8).
+    pub tick_count: u64,
+    /// A transient one-line keybar hint (e.g. "Depth not available on deribit"),
+    /// flashed when an unavailable number key is pressed (`docs/05-views-and-ux.md`
+    /// §2). It decays either on the next key or after `HINT_TICKS` ticks
+    /// ([`hint_ttl`](App::hint_ttl)), so it is visible for a readable minimum
+    /// duration. `None` when nothing is flashed.
+    pub status_hint: Option<String>,
+    /// Ticks remaining before [`status_hint`](App::status_hint) auto-decays. `0`
+    /// when no hint is showing; set to `HINT_TICKS` when a hint is flashed and
+    /// counted down each [`AppEvent::Tick`].
+    pub hint_ttl: u8,
     /// Whether the modal help overlay is open (§9).
     pub help_open: bool,
     /// Whether the loop should exit after this event.
@@ -121,13 +150,26 @@ impl App {
         Self {
             mode,
             theme,
+            no_color: false,
             status: StatusLine::default(),
+            tick_count: 0,
+            status_hint: None,
+            hint_ttl: 0,
             help_open: false,
             should_quit: false,
             dirty: true,
             tx_command,
             commands_dropped: 0,
         }
+    }
+
+    /// Set whether color output is disabled, builder-style, at startup
+    /// (`docs/05-views-and-ux.md` §7). Wired from
+    /// [`Config::no_color`](crate::Config) by the app builder / `main`.
+    #[must_use]
+    pub fn with_no_color(mut self, no_color: bool) -> Self {
+        self.no_color = no_color;
+        self
     }
 
     /// Fold one event into the app in a **single exhaustive match with no
@@ -172,9 +214,15 @@ impl App {
     /// overlay is open it is modal: it intercepts **every** key, honoring only `?`
     /// and `Esc` (both close it) and swallowing the rest — no background screen
     /// action fires behind the overlay, so a keystroke can never mutate hidden
-    /// state. Screen-switch keys (`1`–`4` / `Tab`) are the keymap's concern (#14)
-    /// and are not bound here; until then an unbound global key is forwarded to the
-    /// active screen.
+    /// state.
+    ///
+    /// The globals resolve **through the single keybinding map**
+    /// ([`resolve_global`], `src/ui/theme.rs`), so the running dispatch and the
+    /// help overlay read one table and cannot drift (§3). `Ctrl-C` is the terminal
+    /// interrupt and hard-quits even behind the overlay; every other global (quit,
+    /// help, screen switch `1`–`4`, `Tab`/`S-Tab` cycle, reconnect, reload) is a
+    /// map [`GlobalCommand`]. An unmapped key is forwarded to the active screen (the
+    /// two-level dispatch).
     #[must_use = "the route decides whether the active screen also handles the key"]
     pub(crate) fn dispatch_key_global(&mut self, key: KeyEvent) -> KeyRoute {
         // On some platforms crossterm reports `Release`/`Repeat` in addition to
@@ -184,31 +232,58 @@ impl App {
             return KeyRoute::Consumed;
         }
         // `Ctrl-C` is a hard quit regardless of the character key mapping or the
-        // overlay state.
+        // overlay state (the terminal-interrupt convention): it is the ONE key that
+        // acts behind the modal help overlay. The map lists `q`/`Ctrl-C` as one
+        // Quit action, but `q` is swallowed while the overlay is modal and `Ctrl-C`
+        // is not — an intentional carve-out for the terminal interrupt.
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             self.request_quit();
             return KeyRoute::Consumed;
         }
-        // Modal help: intercept every key. `?`/`Esc` close it; everything else is
-        // swallowed (never forwarded to the screen behind the overlay). `KeyCode`
-        // is crossterm's OPEN key vocabulary, so a catch-all is correct — the
-        // ChainView closed sets stay wildcard-free.
+        // Modal help: intercept EVERY key — before the keymap-vocabulary check — so
+        // an out-of-vocabulary key (F-keys, PageUp/Down, Insert/Delete, media) can
+        // never reach the hidden screen behind the overlay. Only `?`/`Esc` act (both
+        // close it); everything else is swallowed.
         if self.help_open {
-            if matches!(key.code, KeyCode::Char('?') | KeyCode::Esc) {
+            if matches!(
+                KeyChord::from_event(key),
+                Some(KeyChord::Char('?') | KeyChord::Esc)
+            ) {
                 self.toggle_help();
             }
             return KeyRoute::Consumed;
         }
-        // The bound globals. An unbound key is forwarded to the active screen (the
-        // two-level dispatch); the ChainView closed sets stay wildcard-free.
-        match key.code {
-            KeyCode::Char('q') => self.request_quit(),
-            KeyCode::Char('?') => self.toggle_help(),
-            KeyCode::Char('r') => self.request_reconnect(),
-            KeyCode::Char('R') => self.request_rediscover(),
-            _ => return KeyRoute::ToScreen,
+        let Some(chord) = KeyChord::from_event(key) else {
+            // Outside the keymap vocabulary — forward to the active screen.
+            return KeyRoute::ToScreen;
+        };
+        // Any live key decays a stale transient hint (`docs/05-views-and-ux.md`
+        // §2); a command below may set a fresh one.
+        self.clear_status_hint();
+        // Resolve the global command from the single map. An unmapped key routes to
+        // the active screen.
+        match resolve_global(chord) {
+            Some(command) => {
+                self.apply_global_command(command);
+                KeyRoute::Consumed
+            }
+            None => KeyRoute::ToScreen,
         }
-        KeyRoute::Consumed
+    }
+
+    /// Execute a resolved global command from the keymap
+    /// (`docs/05-views-and-ux.md` §3). Matched exhaustively over the
+    /// [`GlobalCommand`] closed set with no wildcard arm.
+    fn apply_global_command(&mut self, command: GlobalCommand) {
+        match command {
+            GlobalCommand::Quit => self.request_quit(),
+            GlobalCommand::ToggleHelp => self.toggle_help(),
+            GlobalCommand::Reconnect => self.request_reconnect(),
+            GlobalCommand::Rediscover => self.request_rediscover(),
+            GlobalCommand::SwitchScreen(slot) => self.request_switch_screen(slot),
+            GlobalCommand::NextScreen => self.cycle_screen(true),
+            GlobalCommand::PrevScreen => self.cycle_screen(false),
+        }
     }
 
     fn on_resize(&mut self, _width: u16, _height: u16) {
@@ -218,11 +293,69 @@ impl App {
     }
 
     fn on_tick(&mut self) {
-        // A tick sets `dirty` only when something time-dependent changed — a
-        // fading `stale` badge, the status clock, a replay play-head advancing.
-        // Those animated surfaces land with the render loop / status line
-        // (#13/#14); until then a tick is a no-op and does not force a redraw
-        // (§8), so an idle app parks on `rx_events.recv()`.
+        // Advance the spinner/clock counter the status bar reads purely in `draw`
+        // (`docs/05-views-and-ux.md` §7). `checked_add` avoids the banned
+        // `wrapping_add`; the counter resets on the (practically unreachable) u64
+        // overflow, harmless for a spinner index.
+        self.tick_count = self.tick_count.checked_add(1).unwrap_or(0);
+        let mut needs_redraw = false;
+        // Decay a transient keybar hint after its readable minimum lifetime (§2).
+        // Counting down does not redraw; only the final clear does, so an idle app
+        // does not spin on the intermediate ticks.
+        if self.tick_hint() {
+            needs_redraw = true;
+        }
+        // Advance the loading/reconnecting/playback spinner: redraw ONLY in a motion
+        // state, so the spinner animates during the initial connect / reconnect /
+        // playback (§7) while a truly idle, non-motion app still parks and never
+        // redraws on a tick (§8).
+        if self.is_in_motion() {
+            needs_redraw = true;
+        }
+        if needs_redraw {
+            self.dirty = true;
+        }
+    }
+
+    /// Count down a live transient hint, clearing it when its lifetime expires.
+    /// Returns whether a redraw is needed (only when the hint is actually cleared,
+    /// so the intermediate countdown ticks set no `dirty`).
+    fn tick_hint(&mut self) -> bool {
+        if self.status_hint.is_none() {
+            return false;
+        }
+        // `saturating_*`/`wrapping_*` are banned, so decrement with a checked step
+        // and treat "reached zero" as "clear the hint".
+        match self.hint_ttl.checked_sub(1) {
+            Some(remaining) if remaining > 0 => {
+                self.hint_ttl = remaining;
+                false
+            }
+            _ => {
+                self.status_hint = None;
+                self.hint_ttl = 0;
+                true
+            }
+        }
+    }
+
+    /// Whether the app is in a **motion** state whose spinner/play-head advances on
+    /// each tick (`docs/05-views-and-ux.md` §7): a live view still loading or
+    /// reconnecting, or a replay bundle still loading or playing. A non-motion app
+    /// (a ready chain on a live feed, a paused replay) parks and does not redraw on
+    /// an idle tick (§8). Mirrors the theme's status-bar motion predicate.
+    #[must_use]
+    fn is_in_motion(&self) -> bool {
+        match &self.mode {
+            Mode::Live(live) => {
+                matches!(live.load, ScreenLoad::Loading)
+                    || matches!(live.source.health, StreamHealth::Reconnecting { .. })
+            }
+            Mode::Replay(replay) => {
+                matches!(replay.bundle, BundleLoad::Loading)
+                    || matches!(replay.play, Playback::Playing { .. })
+            }
+        }
     }
 
     fn on_market(&mut self, update: MarketUpdate) {
@@ -296,6 +429,114 @@ impl App {
             }
         }
     }
+
+    // --- Screen navigation (reachable-only, capability-driven) ----------------
+
+    /// Switch to the screen a number key selects (`docs/05-views-and-ux.md` §2).
+    /// A **reachable** target switches; an **unavailable** one flashes a one-line
+    /// keybar hint and leaves the current screen in place — so `screen` is only
+    /// ever set to a reachable value and the render dispatch (#13) stays total.
+    /// Reachability reads declared [`ProviderCapabilities`], **never** a
+    /// [`ProviderId`] match.
+    fn request_switch_screen(&mut self, slot: u8) {
+        let outcome = match &mut self.mode {
+            Mode::Live(live) => match live_screen_for_slot(slot) {
+                Some(screen) if live.screen == screen => SwitchOutcome::NoChange,
+                Some(screen) if live.screen_reachable(screen) => {
+                    live.screen = screen;
+                    SwitchOutcome::Switched
+                }
+                Some(screen) => SwitchOutcome::Unavailable(format!(
+                    "{} not available on {}",
+                    live_screen_name(screen),
+                    live.source.provider.as_str()
+                )),
+                None => SwitchOutcome::Unavailable(format!("no screen bound to {slot}")),
+            },
+            Mode::Replay(replay) => match replay_screen_for_slot(slot) {
+                Some(screen) if replay.screen == screen => SwitchOutcome::NoChange,
+                Some(screen) if is_replay_screen_reachable(screen) => {
+                    replay.screen = screen;
+                    SwitchOutcome::Switched
+                }
+                Some(screen) => SwitchOutcome::Unavailable(replay_unavailable_hint(screen)),
+                None => SwitchOutcome::Unavailable(format!("no screen bound to {slot}")),
+            },
+        };
+        match outcome {
+            SwitchOutcome::Switched => self.dirty = true,
+            SwitchOutcome::NoChange => {}
+            SwitchOutcome::Unavailable(hint) => self.set_status_hint(hint),
+        }
+    }
+
+    /// Cycle to the next (`forward`) or previous **reachable** screen for the
+    /// active mode+provider (`docs/05-views-and-ux.md` §2), skipping unavailable
+    /// screens so `Tab`/`S-Tab` never land on a not-supported body.
+    fn cycle_screen(&mut self, forward: bool) {
+        let changed = match &mut self.mode {
+            Mode::Live(live) => {
+                let reachable: Vec<LiveScreen> = LIVE_SCREEN_ORDER
+                    .into_iter()
+                    .filter(|screen| live.screen_reachable(*screen))
+                    .collect();
+                match next_in_cycle(&reachable, live.screen, forward) {
+                    Some(next) if next != live.screen => {
+                        live.screen = next;
+                        true
+                    }
+                    _ => false,
+                }
+            }
+            Mode::Replay(replay) => {
+                let reachable: Vec<ReplayScreen> = REPLAY_SCREEN_ORDER
+                    .into_iter()
+                    .filter(|screen| is_replay_screen_reachable(*screen))
+                    .collect();
+                match next_in_cycle(&reachable, replay.screen, forward) {
+                    Some(next) if next != replay.screen => {
+                        replay.screen = next;
+                        true
+                    }
+                    _ => false,
+                }
+            }
+        };
+        if changed {
+            self.dirty = true;
+        }
+    }
+
+    /// Flash a transient one-line keybar hint (`docs/05-views-and-ux.md` §2). It
+    /// decays on the next key or after [`HINT_TICKS`] ticks, so it stays visible for
+    /// a readable minimum duration.
+    fn set_status_hint(&mut self, hint: String) {
+        self.status_hint = Some(hint);
+        self.hint_ttl = HINT_TICKS;
+        self.dirty = true;
+    }
+
+    /// Clear a transient keybar hint if one is showing, marking the frame dirty
+    /// only when a hint was actually cleared (so an idle key with no hint sets no
+    /// dirty).
+    fn clear_status_hint(&mut self) {
+        if self.status_hint.take().is_some() {
+            self.hint_ttl = 0;
+            self.dirty = true;
+        }
+    }
+}
+
+/// The outcome of a number-key screen switch (`docs/05-views-and-ux.md` §2),
+/// computed under the mode borrow and applied to [`App`] afterwards to avoid an
+/// overlapping mutable borrow.
+enum SwitchOutcome {
+    /// The switch was applied — the screen changed.
+    Switched,
+    /// The requested screen is already active — nothing to do.
+    NoChange,
+    /// The requested screen is unavailable — flash this keybar hint, no switch.
+    Unavailable(String),
 }
 
 /// The outcome of the **global** key-dispatch level
@@ -833,6 +1074,111 @@ fn merged(outcome: MergeOutcome) -> bool {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Screen navigation policy (number-key slots, cycle order, reachability, names).
+// ---------------------------------------------------------------------------
+
+/// The live screens in number-key / cycle order (`docs/05-views-and-ux.md` §2).
+const LIVE_SCREEN_ORDER: [LiveScreen; 4] = [
+    LiveScreen::Chain,
+    LiveScreen::Depth,
+    LiveScreen::Surface,
+    LiveScreen::Payoff,
+];
+
+/// The replay screens in number-key / cycle order (`docs/05-views-and-ux.md` §2).
+const REPLAY_SCREEN_ORDER: [ReplayScreen; 2] = [ReplayScreen::Replay, ReplayScreen::Payoff];
+
+/// The live screen a number-key slot selects (`docs/05-views-and-ux.md` §2):
+/// `1`=Chain, `2`=Depth, `3`=Surface, `4`=Payoff; any other slot is unbound.
+#[must_use]
+fn live_screen_for_slot(slot: u8) -> Option<LiveScreen> {
+    match slot {
+        1 => Some(LiveScreen::Chain),
+        2 => Some(LiveScreen::Depth),
+        3 => Some(LiveScreen::Surface),
+        4 => Some(LiveScreen::Payoff),
+        _ => None,
+    }
+}
+
+/// The replay screen a number-key slot selects (`docs/05-views-and-ux.md` §2):
+/// `1`=Replay, `2`=Payoff (v0.5); any other slot is unbound.
+#[must_use]
+fn replay_screen_for_slot(slot: u8) -> Option<ReplayScreen> {
+    match slot {
+        1 => Some(ReplayScreen::Replay),
+        2 => Some(ReplayScreen::Payoff),
+        _ => None,
+    }
+}
+
+/// Whether a [`ReplayScreen`] is reachable in the current build
+/// (`docs/05-views-and-ux.md` §2.1). Replay is always reachable; the replay Payoff
+/// screen is a **v0.5** feature and is not reachable yet — its number key flashes
+/// the "Payoff is v0.5" hint rather than switching. This is a build/version gate,
+/// not a capability or [`ProviderId`] gate (replay has no live provider).
+#[must_use]
+pub fn is_replay_screen_reachable(screen: ReplayScreen) -> bool {
+    match screen {
+        ReplayScreen::Replay => true,
+        ReplayScreen::Payoff => false,
+    }
+}
+
+/// The display name of a live screen for the keybar and hints
+/// (`docs/05-views-and-ux.md` §8).
+#[must_use]
+pub(crate) fn live_screen_name(screen: LiveScreen) -> &'static str {
+    match screen {
+        LiveScreen::Chain => "Chain",
+        LiveScreen::Depth => "Depth",
+        LiveScreen::Surface => "Surface",
+        LiveScreen::Payoff => "Payoff",
+    }
+}
+
+/// The display name of a replay screen for the keybar and hints
+/// (`docs/05-views-and-ux.md` §8).
+#[must_use]
+pub(crate) fn replay_screen_name(screen: ReplayScreen) -> &'static str {
+    match screen {
+        ReplayScreen::Replay => "Replay",
+        ReplayScreen::Payoff => "Payoff",
+    }
+}
+
+/// The keybar hint for an unavailable replay screen (`docs/05-views-and-ux.md`
+/// §2.1). The replay Payoff screen is deferred to v0.5.
+#[must_use]
+fn replay_unavailable_hint(screen: ReplayScreen) -> String {
+    match screen {
+        ReplayScreen::Payoff => "Payoff is v0.5".to_owned(),
+        // Replay is always reachable, so this arm is defensive; keep the exhaustive
+        // match wildcard-free.
+        ReplayScreen::Replay => "screen not available".to_owned(),
+    }
+}
+
+/// The next element after `current` in `items`, wrapping, moving `forward` or
+/// backward (`docs/05-views-and-ux.md` §2). Returns `None` when `items` is empty
+/// or `current` is absent. Uses `.get()` + modular indexing — no unchecked index
+/// and no `saturating_*`/`wrapping_*` arithmetic.
+#[must_use]
+fn next_in_cycle<T: PartialEq + Copy>(items: &[T], current: T, forward: bool) -> Option<T> {
+    let idx = items.iter().position(|item| *item == current)?;
+    let len = items.len();
+    if len == 0 {
+        return None;
+    }
+    let next = if forward {
+        (idx + 1) % len
+    } else {
+        (idx + len - 1) % len
+    };
+    items.get(next).copied()
+}
+
 /// Shared, crate-internal test constructors for a fully-formed [`App`] in any
 /// reachable state, used by both this module's tests and the `src/ui` render-loop
 /// tests (#13). Kept minimal and self-contained so a render test can enumerate
@@ -976,6 +1322,22 @@ pub(crate) mod tests_support {
         live_app(screen, load, help).0
     }
 
+    /// A live [`App`] on the default [`LiveScreen::Chain`] screen bound to a source
+    /// with the given `capabilities`, dropping the command receiver — for the
+    /// reachability-skip / number-key-hint tests, which need a provider that lacks
+    /// a capability (e.g. depth).
+    #[must_use]
+    pub(crate) fn live_app_caps(capabilities: ProviderCapabilities) -> App {
+        let (tx, _rx) = mpsc::channel::<Command>(8);
+        let live = LiveState::new(
+            SourceBinding::new(pid("deribit"), capabilities, StreamHealth::Live),
+            store(),
+        );
+        let mut app = App::new(Mode::Live(live), ThemeChoice::Auto, tx);
+        app.mark_drawn();
+        app
+    }
+
     /// A replay [`App`] in a given state, dropping the command receiver.
     #[must_use]
     pub(crate) fn replay_app_on(screen: ReplayScreen, help: bool) -> App {
@@ -995,8 +1357,8 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::{
-        App, BundleLoad, KeyRoute, LiveScreen, LiveState, Mode, OverlayBinding, Playback,
-        ReplayScreen, ReplayState, ScreenLoad, SourceBinding, is_screen_reachable,
+        App, BundleLoad, HINT_TICKS, KeyRoute, LiveScreen, LiveState, Mode, OverlayBinding,
+        Playback, ReplayScreen, ReplayState, ScreenLoad, SourceBinding, is_screen_reachable,
     };
     use crate::chain::{
         AliasCatalog, ChainFetch, ChainSnapshot, ChainSource, ChainStore, ExpirySource, Instrument,
@@ -1215,8 +1577,66 @@ mod tests {
     #[test]
     fn test_on_event_tick_idle_does_not_set_dirty() {
         let (mut app, _rx) = live_app(full_caps());
+        // A ready chain on a live feed is a non-motion (idle) state; a tick must not
+        // force a redraw so the render loop parks.
+        match &mut app.mode {
+            Mode::Live(live) => live.load = ScreenLoad::Ready,
+            Mode::Replay(_) => panic!("expected a live app"),
+        }
         app.on_event(AppEvent::Tick);
-        assert!(!app.dirty, "an idle tick must not force a redraw");
+        assert!(
+            !app.dirty,
+            "an idle non-motion tick must not force a redraw"
+        );
+    }
+
+    #[test]
+    fn test_on_event_tick_in_motion_sets_dirty_to_animate_spinner() {
+        // The default live state is `Loading` (a motion state, the initial connect),
+        // so a tick must set `dirty` to advance the spinner — otherwise it freezes
+        // and reads as a hang (`docs/05-views-and-ux.md` §7).
+        let (mut app, _rx) = live_app(full_caps());
+        assert!(matches!(
+            &app.mode,
+            Mode::Live(live) if matches!(live.load, ScreenLoad::Loading)
+        ));
+        app.on_event(AppEvent::Tick);
+        assert!(app.dirty, "a motion-state tick must redraw the spinner");
+    }
+
+    #[test]
+    fn test_status_hint_decays_after_n_ticks_not_immediately() {
+        // A flashed hint stays visible for a readable minimum: it survives the next
+        // tick (no near-zero flash) and clears only once its lifetime elapses.
+        let (mut app, _rx) = live_app(full_caps());
+        // Put the app in a non-motion state so only the hint drives redraws here.
+        match &mut app.mode {
+            Mode::Live(live) => live.load = ScreenLoad::Ready,
+            Mode::Replay(_) => panic!("expected a live app"),
+        }
+        app.set_status_hint("Depth not available on deribit".to_owned());
+        // One tick: the hint is still showing and an intermediate countdown tick does
+        // not force a redraw.
+        app.mark_drawn();
+        app.on_event(AppEvent::Tick);
+        assert!(
+            app.status_hint.is_some(),
+            "the hint must survive at least one tick, not flash near-zero"
+        );
+        assert!(!app.dirty, "an intermediate countdown tick does not redraw");
+        // Keep ticking (clearing dirty each time) until the hint decays; the tick that
+        // clears it dirties the frame so the keybar redraws without the hint.
+        let mut cleared = false;
+        for _ in 0..u32::from(HINT_TICKS) + 2 {
+            app.mark_drawn();
+            app.on_event(AppEvent::Tick);
+            if app.status_hint.is_none() {
+                assert!(app.dirty, "the decaying tick that clears the hint redraws");
+                cleared = true;
+                break;
+            }
+        }
+        assert!(cleared, "the hint decays within its lifetime");
     }
 
     #[test]
@@ -1572,6 +1992,34 @@ mod tests {
             KeyEventKind::Release,
         );
         assert_eq!(app.dispatch_key_global(release), KeyRoute::Consumed);
+    }
+
+    #[test]
+    fn test_dispatch_key_global_modal_swallows_out_of_vocab_key() {
+        // A key OUTSIDE the keymap vocabulary (an F-key, PageUp, …) must be swallowed
+        // while the overlay is modal — it must never reach the hidden screen behind
+        // it (the intercept runs before the vocabulary check).
+        let (mut app, _rx) = live_app(full_caps());
+        assert_eq!(
+            app.dispatch_key_global(key_event(KeyCode::Char('?'))),
+            KeyRoute::Consumed
+        );
+        assert!(app.help_open);
+        app.mark_drawn();
+        for code in [
+            KeyCode::F(5),
+            KeyCode::PageUp,
+            KeyCode::Insert,
+            KeyCode::Delete,
+        ] {
+            assert_eq!(
+                app.dispatch_key_global(key_event(code)),
+                KeyRoute::Consumed,
+                "an out-of-vocab key must be swallowed while modal, not forwarded"
+            );
+            assert!(app.help_open, "the overlay stays open");
+            assert!(!app.dirty, "a swallowed key mutates no state");
+        }
     }
 
     // --- Capability-driven reachability (no ProviderId match) ----------------

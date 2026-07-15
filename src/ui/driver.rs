@@ -406,7 +406,10 @@ mod tests {
 
     #[test]
     fn test_step_idle_tick_does_not_redraw() {
-        let (mut app, _rx) = live_app(LiveScreen::Chain, ScreenLoad::Loading, false);
+        // A `Ready` chain on a live feed is a non-motion (idle) state, so a tick sets
+        // no dirty and the loop does not redraw (a motion state animates the spinner
+        // instead, covered in `src/app.rs`).
+        let (mut app, _rx) = live_app(LiveScreen::Chain, ScreenLoad::Ready, false);
         assert!(!app.dirty, "the app is clean after the initial frame");
         let (mut bridge, _senders) = EventBridge::new(64);
         let mut terminal = test_terminal();
@@ -427,7 +430,7 @@ mod tests {
                 redrawn: false,
                 quit: false
             },
-            "an idle tick sets no dirty, so no redraw and no quit"
+            "an idle non-motion tick sets no dirty, so no redraw and no quit"
         );
         assert!(!app.dirty);
     }
