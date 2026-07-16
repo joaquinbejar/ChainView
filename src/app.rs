@@ -828,11 +828,11 @@ impl LiveState {
             self.store.apply_health(health.clone());
             changed = true;
         }
-        if let Some(overlay) = &mut self.overlay {
-            if *provider == overlay.provider {
-                overlay.health = health;
-                changed = true;
-            }
+        if let Some(overlay) = &mut self.overlay
+            && *provider == overlay.provider
+        {
+            overlay.health = health;
+            changed = true;
         }
         changed
     }

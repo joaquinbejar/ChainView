@@ -1,0 +1,116 @@
+# cargo-deny configuration — ChainView supply-chain gate (issue #20).
+#
+# Runs in CI from v0.1 alongside `cargo audit` and the four non-negotiable
+# commands (docs/SECURITY.md §7, docs/TESTING.md §13.5). `cargo deny check`
+# enforces four gates on the ACTUAL dependency tree:
+#
+#   advisories — every RUSTSEC advisory fails the build, except the documented
+#                `ignore` entries below (each transitive-only, each with a
+#                reason and a re-evaluation trigger — mechanism in SECURITY.md §7).
+#   licenses   — an explicit permissive allow-list; a copyleft/unknown license
+#                fails the build.
+#   bans       — duplicate versions are `warn` (not `deny`): the mandated
+#                upstream clients pull disjoint dependency-tree epochs, so a
+#                hard `deny` would break CI on crates ChainView does not control.
+#   sources    — crates.io only; a git or alternate-registry substitution fails.
+#
+# Policy provenance is recorded beside the pin table in
+# docs/specs/providers.md §0. This file is CI tooling, NOT a crate dependency —
+# `cargo-deny` is never added to Cargo.toml [dependencies].
+
+[graph]
+# Match the four non-negotiables and `make pre-push`, which run --all-features,
+# so the gate sees every feature-gated dependency the build can pull.
+all-features = true
+
+# ---------------------------------------------------------------------------
+# advisories — `cargo deny check advisories`
+# ---------------------------------------------------------------------------
+# Every ignore is TRANSITIVE-ONLY (never a direct ChainView dependency), pulled
+# by a mandated upstream client or compute crate, and carries a re-evaluation
+# trigger. The same set is mirrored in the CI `cargo audit --ignore` flags so
+# both tools agree. Adding an ignore requires a written reason here AND in
+# docs/SECURITY.md §7 — never a broad suppression.
+[advisories]
+# NOTE: the RUSTSEC-2026-0009 `time` DoS is NOT ignored — it was PATCHED. The
+# MSRV was raised 1.85 -> 1.88 (docs/SEMVER.md) and `time` bumped 0.3.45 ->
+# 0.3.53 (past the fixed 0.3.47), so the vulnerability is gone from the tree. A
+# reachable/vulnerability advisory with an adoptable fix is patched, never
+# ignored — the three entries below are all unmaintained/unsound with no
+# in-MSRV fix.
+ignore = [
+    { id = "RUSTSEC-2021-0141", reason = "dotenv 0.15.0 unmaintained. Transitive via deribit-http 0.7.1 and deribit-websocket 0.3.1. ChainView uses the MAINTAINED `dotenvy` directly; `dotenv` is pulled only by the upstream Deribit clients and no env-file load runs on the public no-auth Deribit zero-config path. Re-evaluate when deribit-http/deribit-websocket drop dotenv upstream." },
+    { id = "RUSTSEC-2024-0436", reason = "paste 1.0.15 unmaintained (archived). Build-time proc-macro only, transitive via simba->nalgebra->statrs->optionstratlib 0.18.0 and via ratatui 0.29.0. No known vulnerability and no maintained drop-in at the pinned upstream versions. Re-evaluate when optionstratlib and ratatui drop the paste dependency." },
+    { id = "RUSTSEC-2026-0002", reason = "lru 0.12.5 unsound (IterMut violates Stacked Borrows). Transitive via ratatui 0.29.0 only, which pins `lru = ^0.12`; 0.12.5 is the newest 0.12.x, and the fixed line (lru >= 0.16.3) is only reachable by upgrading to ratatui 0.30 — a separate breaking migration, not an in-place patch. The unsound `IterMut` path is never invoked (ChainView renders through ratatui's public draw API). This is audit-gated (cargo-deny's default config does not gate `unsound` informational advisories, so this ignore is a forward-defense no-op there); re-evaluate when ratatui is upgraded to 0.30." },
+]
+
+# ---------------------------------------------------------------------------
+# licenses — `cargo deny check licenses`
+# ---------------------------------------------------------------------------
+# Explicit permissive allow-list. Anything NOT listed (GPL/AGPL/LGPL-only,
+# MPL, an unknown license, or a missing one) fails the build. The list is the
+# UNION of every license expression actually present in the current tree: the
+# common OR expressions resolve against MIT/Apache-2.0, and the remaining
+# entries are REQUIRED — either the sole license of a crate or an AND-term:
+#   BSD-3-Clause        — AND-term of aws-lc-sys 0.42.0 and other crates
+#   ISC                 — AND-term of aws-lc-sys and ISC-only crates
+#   Unicode-3.0         — AND-term / sole license of the ICU + unicode-ident set
+#   Zlib                — sole license of two crates
+#   CC0-1.0             — the only allowed half of `CC0-1.0 OR MIT-0` (ppmd-rust)
+#   BSD-2-Clause        — present via zerocopy et al. (OR-resolvable, listed for honesty)
+#   Unicode-DFS-2016    — (historical unicode data crates, if pulled)
+#   CDLA-Permissive-2.0 — sole license of webpki-root-certs 1.0.8 (root-cert data)
+#   bzip2-1.0.6         — sole license of libbz2-rs-sys 0.2.5 (via zip->optionstratlib)
+# All are OSI-permissive or permissive-data licenses; none is copyleft.
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "bzip2-1.0.6",
+]
+confidence-threshold = 0.8
+
+# ---------------------------------------------------------------------------
+# bans — `cargo deny check bans`
+# ---------------------------------------------------------------------------
+[bans]
+# Duplicate versions are WARN, not DENY: the mandated upstream clients pull
+# disjoint dependency-tree epochs, so many crates legitimately appear at two or
+# three versions. Naming a hard-coded skip list of every pair would be brittle
+# and hide the churn; `warn` keeps the duplicates visible in the CI log without
+# failing the mandated tree. Notable duplicate families in the current tree
+# (visible with `cargo tree -d`): rand (0.8/0.9/0.10), rand_core (0.6/0.9/0.10),
+# getrandom (0.2/0.3/0.4), hmac (0.12/0.13), sha2 (0.10/0.11), digest
+# (0.10/0.11), block-buffer, crypto-common, cpufeatures, darling (0.20/0.21),
+# hashbrown, itertools, unicode-width, core-foundation — pulled by the split
+# between deribit-http/deribit-websocket (reqwest/rustls/aws-lc/tungstenite),
+# optionstratlib (statrs/nalgebra/zip), and ratatui.
+multiple-versions = "warn"
+wildcards = "allow"
+# No crate is force-allowed or force-banned today. The `deny` capability is the
+# gate the acceptance criterion exercises: adding an entry here fails the build
+# on a banned crate (e.g. a known-bad or unwanted transitive dependency).
+allow = []
+deny = []
+
+# ---------------------------------------------------------------------------
+# sources — `cargo deny check sources`
+# ---------------------------------------------------------------------------
+# Tight source allow-list: crates.io ONLY. Every dependency in the current tree
+# resolves from the crates.io registry (no git, no alternate registry), so a
+# supply-chain substitution — swapping a crate for a git fork or a private
+# registry — fails the build. If a pinned `joaquinbejar/*` git source is ever
+# adopted (SECURITY.md §7, specs/providers.md §0), add its exact URL to
+# `allow-git` and record the pin; until then the git allow-list stays empty.
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

@@ -72,13 +72,13 @@ fn golden_path(category: &str, name: &str) -> PathBuf {
 pub(crate) fn assert_golden(category: &str, name: &str, actual: &str) {
     let path = golden_path(category, name);
     if std::env::var_os("UPDATE_GOLDENS").is_some() {
-        if let Some(parent) = path.parent() {
-            if let Err(e) = fs::create_dir_all(parent) {
-                panic!(
-                    "failed to create golden directory {}: {e}",
-                    parent.display()
-                );
-            }
+        if let Some(parent) = path.parent()
+            && let Err(e) = fs::create_dir_all(parent)
+        {
+            panic!(
+                "failed to create golden directory {}: {e}",
+                parent.display()
+            );
         }
         if let Err(e) = fs::write(&path, actual) {
             panic!("failed to write golden {}: {e}", path.display());

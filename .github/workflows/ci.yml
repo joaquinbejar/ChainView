@@ -1,0 +1,187 @@
+# ChainView CI pipeline (issue #20).
+#
+# Gates, from v0.1:
+#   * check    — the FOUR NON-NEGOTIABLES on stable, mirroring `make pre-push`
+#                exactly (docs/TESTING.md §10), plus the `cargo doc` warning gate
+#                and the Spanish-text guard.
+#   * msrv     — a pinned Rust 1.88 build + test on the declared MSRV floor.
+#   * coverage — non-blocking coverage (cargo-llvm-cov), informational only.
+#   * audit    — `cargo audit` fails on any RUSTSEC advisory (docs/SECURITY.md §7).
+#   * deny     — `cargo deny check` (advisories + licenses + bans + sources).
+#
+# CI NEVER touches a real venue — fixtures only. The future live smoke (#22)
+# is `#[ignore]`-by-default, so `cargo test` skips it, and no `SMOKE_*` env var
+# is ever set here (docs/TESTING.md §8).
+#
+# `cargo audit` / `cargo deny` are CI TOOLING, installed here — never added to
+# Cargo.toml [dependencies].
+#
+# Action pins: third-party actions are pinned to a major release tag. Hardening
+# to full commit-SHA pins is a follow-up (workflow supply-chain, tracked with
+# #54); the toolchain action (`dtolnay/rust-toolchain`) is used at its supported
+# `@stable` / `@1.88` refs.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Weekly re-run so a NEW advisory published against the unchanged tree still
+    # fails audit/deny even when no commit lands (docs/SECURITY.md §7).
+    - cron: "0 6 * * 1"
+
+# Least privilege: the pipeline only reads the repo.
+permissions:
+  contents: read
+
+# A newer push to the same ref cancels the in-flight run.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # --------------------------------------------------------------------------
+  # The four non-negotiables (stable) — identical commands to `make pre-push`
+  # so local and CI agree (docs/TESTING.md §10). Any warning fails the build.
+  # --------------------------------------------------------------------------
+  check:
+    name: check (stable — four non-negotiables + doc)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      # 1/4 — formatting
+      - name: fmt --all --check
+        run: cargo fmt --all --check
+      # 2/4 — lints (deny all warnings)
+      - name: clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      # 3/4 — tests (fixtures only; the #[ignore] live smoke never runs here)
+      - name: test --all-features
+        run: cargo test --all-features
+      # 4/4 — release build
+      - name: build --release
+        run: cargo build --release
+      # doc warning gate (RUSTDOCFLAGS=-D warnings), as in `make doc`
+      - name: doc (deny warnings)
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
+      # Spanish-text guard, mirroring `make check-spanish`
+      - name: check-spanish
+        run: |
+          if grep -rnE --include='*.rs' '[áéíóúÁÉÍÓÚñÑ¿¡]' src tests benches 2>/dev/null; then
+            echo 'error: Spanish text found in code or comments'; exit 1
+          else
+            echo 'check-spanish: OK'
+          fi
+
+  # --------------------------------------------------------------------------
+  # Pinned MSRV job. The toolchain version MUST equal `rust-version` in
+  # Cargo.toml (currently 1.88). A change that needs a newer compiler fails
+  # here, surfacing an MSRV bump per docs/SEMVER.md (a minor bump with a
+  # release-note callout).
+  #
+  # MSRV history (#20): raised 1.85 -> 1.88. The `optionstratlib 0.18` -> `zip`
+  # -> `deflate64` path uses `unbounded_shr` (stabilized in Rust 1.87), and
+  # adopting `time >=0.3.47` to patch RUSTSEC-2026-0009 (the DoS) requires 1.88;
+  # both are satisfied at the 1.88 floor. Keep this pin in lockstep with
+  # Cargo.toml `rust-version`.
+  # --------------------------------------------------------------------------
+  msrv:
+    name: msrv (Rust 1.88 — declared floor)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned MSRV toolchain
+        uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: build --all-features (MSRV)
+        run: cargo build --all-features
+      - name: test --all-features (MSRV)
+        run: cargo test --all-features
+
+  # --------------------------------------------------------------------------
+  # Coverage — non-blocking / informational (docs/TESTING.md). cargo-llvm-cov
+  # is the ecosystem-convention tool. It never gates a PR.
+  # --------------------------------------------------------------------------
+  coverage:
+    name: coverage (non-blocking)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - name: Coverage (lcov)
+        run: cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lcov
+          path: lcov.info
+          if-no-files-found: warn
+
+  # --------------------------------------------------------------------------
+  # cargo audit — fails on a RUSTSEC advisory. `--deny warnings` promotes
+  # unmaintained/unsound/yanked notices to errors so the gate matches
+  # `cargo deny check advisories`. The three `--ignore`d advisories are ALL
+  # transitive-only unmaintained/unsound notices with no in-MSRV fix; each
+  # carries a documented reason + re-evaluation trigger in deny.toml
+  # [advisories].ignore and docs/SECURITY.md §7.1 — this list mirrors deny.toml
+  # so both tools agree. The RUSTSEC-2026-0009 `time` DoS is NOT here: it was
+  # PATCHED (time 0.3.45 -> 0.3.53) via the MSRV 1.85 -> 1.88 bump, not ignored.
+  # --------------------------------------------------------------------------
+  audit:
+    name: audit (cargo audit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - name: cargo audit
+        # RUSTSEC-2021-0141 dotenv (unmaintained), RUSTSEC-2024-0436 paste
+        # (unmaintained), RUSTSEC-2026-0002 lru (unsound). Reasons: deny.toml +
+        # docs/SECURITY.md §7.1.
+        run: >
+          cargo audit --deny warnings
+          --ignore RUSTSEC-2021-0141
+          --ignore RUSTSEC-2024-0436
+          --ignore RUSTSEC-2026-0002
+
+  # --------------------------------------------------------------------------
+  # cargo deny — advisories + licenses (permissive allow-list) + bans
+  # (duplicate versions warn) + sources (crates.io only). Policy in deny.toml.
+  # --------------------------------------------------------------------------
+  deny:
+    name: deny (cargo deny check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - name: cargo deny check
+        run: cargo deny check
