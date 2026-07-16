@@ -14,6 +14,86 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- The chain-matrix screen with honest empty/loading/error states
+  (`src/ui/chain.rs`, issue #18; `docs/05-views-and-ux.md` §2.1, §6, §8,
+  `docs/01-domain-model.md` §8, `docs/02-tui-architecture.md` §7). The first real
+  screen body — strikes × call/put (bid/ask/mark/IV/Greeks) — replacing the #13
+  placeholder. Key behaviours:
+  - **States before the happy path.** `chain::draw` renders the **loading**
+    (centered tick-driven spinner + "connecting to `<provider>`…"), **empty** ("no
+    data for `<underlying> <expiry>`" + hint), and provider-**error** (actionable
+    message + the `r` reconnect affordance) states first, driven off
+    `LiveState.load` (`ScreenLoad`) and the store's emptiness/health per the §2.1
+    prerequisite/recovery matrix — a screen that only knows how to render data is
+    incomplete. On a dropped stream the last chain renders **dimmed** with a
+    `◐ stale` / `↻ reconnecting (n)` badge (`health_span`); the render loop never
+    blanks.
+  - **`ChainRow`/`LegView` projected at draw time, borrowed, never owned.** The
+    view models (`docs/01-domain-model.md` §8) are projected from the store's
+    `OptionChain` inside `draw` — no computation, no pricing, no `GraphData`, no
+    I/O, no mutation. A `LegView` field is `None` **iff** the underlying
+    `OptionData` field is `None`; a missing value renders `—` (an em dash), never a
+    fabricated `0`. `theta`/`vega` are v0.2 (no `OptionData` field yet); `bid_dir`/
+    `ask_dir` read the store's decayed direction baseline as of the last-poll instant
+    (the pure-draw reference — `draw` reads no wall clock); `greeks_origin` drives an
+    origin glyph for locally-computed Greeks (v0.2). Display formatting never panics
+    at the render edge: `fmt_iv` uses **checked** `× 100` (a finite-but-absurd IV can
+    survive the adapter seam, which rejects NaN/Inf/negative but not magnitude, and
+    `Decimal`'s `Mul` panics on overflow), rendering `—` on overflow (ADR-0007
+    untrusted-input hardening).
+  - **Absent-IV vs 0% IV decision (from the #15 review).** Upstream
+    `OptionChain::add_option` takes a **non-`Option`** `Positive` IV, so the Deribit
+    adapter defaults an absent IV to `Positive::ZERO` and a row cannot distinguish
+    "venue sent no IV" from "IV = 0". `project_iv` projects an **exactly-zero** IV to
+    `None` — a listed, quoted option always carries a strictly positive IV, so a bare
+    `0` is the absent-sentinel, not a live quote — so the matrix renders `—`, never a
+    fabricated-looking `0.00%`. Documented and unit-tested (`project_iv(ZERO) ==
+    None`, and the populated matrix renders the em dash with **no** `0.00%`).
+  - **ATM anchoring + the shaded strike column, color never the only signal.** The
+    nearest listed strike to spot carries the `◀ATM` marker; the shared strike
+    column shades by the `K/S` `StrikeRelation` bucket (BelowSpot/AtSpot/AboveSpot —
+    **not** an ITM/OTM label); bid/ask cells carry a `▲`/`▼`/`·` tick glyph — all
+    legible under `NO_COLOR`. The v0.1 greek column set is only the columns that can
+    carry data — **Δ** (always) and **Γ** (from `OptionData`), Γ shown once one slot
+    fits — so a common 120-col terminal shows Γ rather than the always-empty Θ/ν
+    columns hiding it; the #14 `Γ → ν → Θ` drop-order primitive stays intact for when
+    v0.2 populates Θ/ν and they join the set. Per-frame work is O(visible rows) via
+    manual windowing around the cursor/ATM anchor, never O(full chain).
+  - **Keyboard navigation resolved through the one keymap.** `chain::handle_key`
+    resolves chords through a new `keymap::resolve_chain` (mirroring
+    `resolve_replay`) — no parallel key table. Strike nav (`↑↓`/`kj`) moves the
+    cursor (first move reveals it at the ATM anchor, then steps clamped) and leg
+    focus (`c`/`p`) toggles the emphasized leg — both local `Selection` mutations the
+    render loop detects (a `Selection` diff) to request a redraw. Expiry/underlying
+    switch, drill-in, and add-leg resolve through the map but are documented no-ops
+    pending their data plumbing (multi-expiry subscribe, underlying list, drill
+    view, the v0.2 payoff builder); no screen ever performs I/O inline. `Selection`
+    gains a `focused_leg` (new `LegFocus` enum, `Call`/`Put`).
+  - **The help overlay advertises deferred keys honestly.** A `Binding` gains a
+    `deferred: Option<&'static str>` marker (still single-source in the keymap, so it
+    cannot drift): a key that **resolves and is documented but is not yet wired** (its
+    `handle_key` is a no-op) renders a dim `(<version>)` suffix in `?` — so the four
+    deferred chain keys (and the same cross-screen pattern on the deferred replay
+    playback/speed/fill/end-jump keys and the not-yet-wired surface/depth/payoff-live
+    keys) are no longer presented as live features. The resolution logic is
+    unchanged; the marker only annotates + renders.
+  - **Draw purity is proven.** `chain::draw(&LiveState, &mut Frame, Rect, Theme,
+    u64)` takes `&LiveState` (plus the `Copy` resolved theme, for `NO_COLOR`, and
+    tick, for the spinner), so it cannot mutate; a test asserts the store, poll
+    clock, selection, and health are unchanged across a draw, and
+    `prop_render_never_panics` (#13) plus a chain-local size sweep cover the
+    populated/empty/loading/error/stale states.
+  - `ChainRow`/`LegView`/`LegFocus`/`resolve_chain` are re-exported from the crate
+    root for the render goldens (#19) and downstream screens (#25). **No new
+    dependency.** Tests: 31 in `src/ui/chain.rs` (projection None-iff-None,
+    `StrikeRelation` bucketing, direction projection, the absent-IV `—` rule, the
+    `fmt_iv` overflow-renders-`—` edge, the v0.1 `{Δ, Γ}` column set + Γ-at-120,
+    the windowing/anchoring helpers, the five reachable states across sizes, draw
+    purity, and the keymap-resolved navigation) + 5 in `src/app/keymap.rs`
+    (chain-chord map↔overlay cross-check, non-chain-chord ignore, deferred-marker on
+    chain/replay keys, deferred-keys-still-resolve) + 1 in `src/ui/theme.rs` (the
+    overlay renders the deferred `(vX)` suffix) + the driver dirty-on-local-nav
+    regression.
 - The Deribit `ticker`/`book` streaming overlay and the adapter-owned
   reconnect/resubscribe loop (`src/providers/deribit.rs`, issue #16;
   `docs/03-data-providers.md` §7.1, §5, `docs/01-domain-model.md` §5, §7,

@@ -32,10 +32,10 @@ pub(crate) mod ui;
 pub use app::{
     App, BridgeSenders, BundleLoad, COMMAND_CHANNEL_CAPACITY, CONTROL_CHANNEL_CAPACITY,
     ChainViewApp, ChainViewAppBuilder, DEFAULT_JOIN_BUDGET, EventBridge, ExitCause, ExitReporter,
-    FinalTeardown, GuardTeardown, LiveScreen, LiveState, LoadedReplay, Mode, OverlayBinding,
-    PayoffBuilder, Playback, ReplayScreen, ReplayState, ScreenLoad, Selection, SourceBinding,
-    StatusLine, SupervisedTask, Supervisor, TaskExit, TokioTask, is_replay_screen_reachable,
-    is_screen_reachable,
+    FinalTeardown, GuardTeardown, LegFocus, LiveScreen, LiveState, LoadedReplay, Mode,
+    OverlayBinding, PayoffBuilder, Playback, ReplayScreen, ReplayState, ScreenLoad, Selection,
+    SourceBinding, StatusLine, SupervisedTask, Supervisor, TaskExit, TokioTask,
+    is_replay_screen_reachable, is_screen_reachable,
 };
 // The closed event set folded by the state machine and the render -> data
 // command channel (`docs/02-tui-architecture.md` §4).
@@ -54,6 +54,11 @@ pub use ui::driver::{
     EVENT_CHANNEL_CAPACITY, event_channel, run_render_loop, spawn_input_reader, spawn_tick_task,
 };
 pub use ui::{RootLayout, layout_root, render};
+// The chain-matrix view models (`src/ui/chain.rs`, issue #18,
+// `docs/01-domain-model.md` §8): `ChainRow`/`LegView`, projected from the domain
+// `OptionChain` at draw time and borrowed, never owned. Public so the render
+// goldens (#19) and downstream screens (#25) can name the projected shapes.
+pub use ui::chain::{ChainRow, LegView};
 // The theme + render surface: the `NO_COLOR`-aware `Theme`, the
 // help-overlay/status/keybar renderers, the `StrikeRelation` K/S bucket and its
 // markers/spans, the responsive chain column-drop policy, and the too-small guard
@@ -73,8 +78,8 @@ pub use ui::theme::{
 // (#18) and the render goldens (#19) can name and reuse the keymap.
 pub use app::keymap::{
     Action, Binding, ChainAction, Context, DepthAction, GlobalAction, GlobalCommand, KEYMAP,
-    KeyChord, PayoffAction, ReplayAction, SurfaceAction, help_bindings, resolve_global,
-    resolve_replay,
+    KeyChord, PayoffAction, ReplayAction, SurfaceAction, help_bindings, resolve_chain,
+    resolve_global, resolve_replay,
 };
 
 pub use chain::{

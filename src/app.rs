@@ -854,15 +854,39 @@ impl OverlayBinding {
     }
 }
 
+/// Which option leg (call or put) is focused on the selected strike row
+/// (`docs/05-views-and-ux.md` §3), toggled by `c` / `p` on the chain matrix
+/// (#18).
+///
+/// A ChainView UI-selection enum, fieldless, so `#[repr(u8)]` per the ruleset;
+/// it defaults to [`Call`](LegFocus::Call). The chain matrix emphasizes the
+/// focused leg on the selected row; a future leg-detail view derives that leg's
+/// own ITM/OTM from its style, never off the shared row relation
+/// (`docs/01-domain-model.md` §8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum LegFocus {
+    /// The call leg is focused.
+    #[default]
+    Call,
+    /// The put leg is focused.
+    Put,
+}
+
 /// The focused underlying/expiry/strike selection (`docs/02-tui-architecture.md`
-/// §3). A minimal, typed anchor for #9; row/expiry navigation and scroll land
-/// with the chain screen (#018).
+/// §3). The typed cursor the chain matrix (#18) drives: the focused strike row
+/// and the focused leg on it. Expiry/underlying navigation emits a [`Command`]
+/// rather than living here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Selection {
     /// The focused strike-row index within the visible chain, or `None` before
     /// any row is focused. Draw reads it with `.get()` + a fallback — never an
-    /// unchecked index.
+    /// unchecked index — and clamps it to the current strike count, so a poll
+    /// that shrank the chain never yields an out-of-range cursor.
     pub focused_row: Option<usize>,
+    /// The focused option leg on the selected strike row, toggled by `c` / `p`
+    /// (`docs/05-views-and-ux.md` §3). Defaults to the call leg.
+    pub focused_leg: LegFocus,
 }
 
 /// The multi-leg payoff-builder state (`docs/05-views-and-ux.md` §3). A

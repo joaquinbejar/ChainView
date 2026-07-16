@@ -401,9 +401,10 @@ pub fn draw_too_small(frame: &mut Frame, area: Rect, theme: Theme) {
 const SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 /// The spinner frame for a tick count — a pure projection of [`App::tick_count`],
-/// never a wall-clock read.
+/// never a wall-clock read. Shared with the chain screen's loading state (#18),
+/// so the body spinner and the status-bar spinner advance in lock-step.
 #[must_use]
-fn spinner_frame(tick: u64) -> char {
+pub(crate) fn spinner_frame(tick: u64) -> char {
     let len = SPINNER_FRAMES.len() as u64;
     let idx = (tick % len) as usize;
     SPINNER_FRAMES.get(idx).copied().unwrap_or(' ')
@@ -610,13 +611,20 @@ fn render_section(
         return;
     }
     for binding in bindings {
-        lines.push(Line::from(vec![
+        let mut spans = vec![
             Span::styled(
                 format!(" {:<HELP_LABEL_WIDTH$} ", binding.keys_label),
                 theme.accent(),
             ),
             Span::raw(binding.help.to_owned()),
-        ]));
+        ];
+        // A deferred key resolves and is documented, but its body is not wired yet:
+        // append a dim `(<version>)` suffix so `?` honestly shows it is not live.
+        // The parenthesized text carries the signal without relying on color.
+        if let Some(version) = binding.deferred {
+            spans.push(Span::styled(format!(" ({version})"), theme.dim()));
+        }
+        lines.push(Line::from(spans));
     }
 }
 
@@ -938,6 +946,19 @@ mod tests {
         assert!(
             text.contains("Commit strategy"),
             "a Payoff key (the last section) is visible on 80x24, not clipped",
+        );
+    }
+
+    #[test]
+    fn test_help_overlay_marks_deferred_keys_with_version_suffix() {
+        // A key that resolves and is documented but is not yet wired shows a dim
+        // "(vX)" suffix in the overlay, so `?` honestly signals it is not live yet
+        // (the reviewed dead-key-trap fix). The Depth scroll key defers to v0.5.
+        let app = live_app_on(LiveScreen::Chain, ScreenLoad::Ready, true);
+        let text = rendered_frame(&app, 100, 40);
+        assert!(
+            text.contains("(v0.5)"),
+            "a deferred key shows its version marker in the overlay",
         );
     }
 
