@@ -2794,6 +2794,40 @@ mod tests {
     }
 
     #[test]
+    fn test_populated_matrix_shows_greeks_row_and_computed_origin_glyph() {
+        // Issue #28 (the v0.2 #25 acceptance): the populated matrix — assembled from
+        // the recorded Deribit fixture through the real adapter seam — renders the
+        // full responsive Greeks row with the `~` origin glyph on the locally-computed
+        // fields. At the fixed 120x40 golden width the responsive set is Δ + Θ (the
+        // `Γ → ν → Θ` drop order keeps Δ always and adds Θ first; Γ/ν need a wider
+        // terminal than the golden's fixed 120), so this asserts the semantic content
+        // the committed `deribit_btc_atm.txt` golden pins.
+        let fetch = crate::providers::deribit::fixture_btc_chain_fetch_named("BTC");
+        let live = live_from_fetch(fetch, ScreenLoad::Ready);
+        let text = render_chain_golden(&live);
+        assert!(
+            text.contains('Δ'),
+            "the delta greek column header is present"
+        );
+        assert!(
+            text.contains('Θ'),
+            "the theta greek column header is present"
+        );
+        assert!(text.contains("IV"), "the IV column header is present");
+        // The origin glyph badges the locally-computed Θ (venue theta is discarded, so
+        // theta is always ComputedLocally) — proving the #25 origin badge renders.
+        assert!(
+            text.contains('~'),
+            "the `~` origin glyph badges a ComputedLocally field (local theta)",
+        );
+        // The badged value renders as a real number with the glyph, never a bare `~`.
+        assert!(
+            text.contains("0.0000~") || text.contains("-0.0003~"),
+            "a computed theta renders as a number followed by the origin glyph",
+        );
+    }
+
+    #[test]
     fn test_chain_loading_render_golden() {
         // The pre-first-frame LOADING state: the vertically-centered spinner +
         // "connecting to deribit". tick 0 fixes the spinner frame, so it is stable.
