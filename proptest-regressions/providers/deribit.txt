@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 34faa77f7453d9f8e5e3160277bc75a518d2b504fe50b0b9156e5fca529165b9 # shrinks to name = "BTC-27JUN25-60000-C", strike = Some(4.007499350694669e-116), option_type = None, expiry_ms = None, bid = None, ask = None, iv = None

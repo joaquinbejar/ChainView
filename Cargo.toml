@@ -32,10 +32,12 @@ optionstratlib = { version = "0.18.0", default-features = false }
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 async-trait = "0.1"
 # `rt`/`macros`/`time` join the existing `sync` for the task supervisor (issue
-# #11): `rt` for `JoinHandle`/`abort`/`JoinError::is_panic`, `macros` for the
+# #11): `rt` for `JoinHandle`/`abort`/`JoinError::is_panic` (and the Deribit
+# adapter's bounded `JoinSet` ticker hydration, #15), `macros` for the
 # `tokio::select!` in the supervise loop, `time` for the 2 s bounded-join
-# `tokio::time::timeout`. Still no `net`/`fs`/`rt-multi-thread` — the render loop
-# (#13) picks the runtime flavor.
+# `tokio::time::timeout`. The `net`/`fs`/`rt-multi-thread` features are not
+# requested here, but `deribit-http` (#15) feature-unifies `tokio` toward `full`
+# transitively; the render loop (#13) still picks the runtime flavor.
 tokio = { version = "1", default-features = false, features = [
     "sync",
     "rt",
@@ -55,6 +57,20 @@ tokio-util = { version = "0.7", default-features = false }
 # ratatui drives (no two-version mismatch).
 ratatui = { version = "0.29", features = ["crossterm"] }
 crossterm = "0.28"
+# The Deribit REST client (issue #15, the zero-config poll leg — ADR-0003). Wraps
+# the venue's JSON-RPC-over-HTTP; ChainView never reimplements the protocol
+# (CLAUDE.md "Key Decisions"). Explicit-approval addition (CLAUDE.md "Coding
+# Rules") — audit note in CHANGELOG. Public data needs NO credentials: the
+# adapter drives `HttpConfig::production()` and never requires or logs a
+# credential; the public endpoints send none.
+# Supply-chain: pulls `reqwest` (+ its default TLS), `tokio` (feature-unified to
+# `full`), `serde_json`, `hmac`/`sha2`/`base64` (request signing, unused on the
+# public path), `url`, `serde_with`, `rand`, and `dotenv`. `deribit-websocket`
+# (streaming) is a SEPARATE addition deferred to #16. No rustls crypto-provider
+# install is needed here — the HTTP client relies on `reqwest`'s default TLS and
+# exposes no `install_default_crypto_provider`; any provider install belongs to
+# the websocket path (#16), and no live TLS handshake runs in the test suite.
+deribit-http = "0.7.1"
 
 [dev-dependencies]
 proptest = "1"

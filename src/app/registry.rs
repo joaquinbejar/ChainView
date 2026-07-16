@@ -42,11 +42,11 @@
 //!
 //! This lands the registry, the builder, the startup validation, the
 //! `--provider` resolution against the registry, and the capability-driven
-//! composite-source guard. It does **not** spin the event loop: the Deribit
-//! adapter [`with_builtins`](ChainViewAppBuilder::with_builtins) will register
-//! is #15/#16 (so `with_builtins` is an honest no-op today — no fake provider is
-//! fabricated), the seeded [`ChainStore`](crate::chain::ChainStore) comes from
-//! the provider's first fetch (#15), and the tokio runtime, the
+//! composite-source guard. [`with_builtins`](ChainViewAppBuilder::with_builtins)
+//! registers the real Deribit adapter (#15) — the zero-config poll leg — but this
+//! module still does **not** spin the event loop: the seeded
+//! [`ChainStore`](crate::chain::ChainStore) comes from the provider's first fetch
+//! (#15), the streaming overlay is #16, and the tokio runtime, the
 //! [`Supervisor`](super::Supervisor), the bounded channels (#10), and the render
 //! loop (#13) are assembled at the documented seam inside
 //! [`run`](ChainViewAppBuilder::run).
@@ -61,6 +61,7 @@ use crate::chain::{ProviderId, StreamHealth};
 use crate::config::{CliOverrides, Config, ModeSelect};
 use crate::error::{ChainViewError, ConfigError, RegistryError};
 use crate::providers::Provider;
+use crate::providers::deribit::DeribitAdapter;
 
 use super::{SourceBinding, chain_present};
 
@@ -212,21 +213,16 @@ impl ChainViewAppBuilder {
     /// implicitly; they require the explicit [`with_gated_builtin`](Self::with_gated_builtin)
     /// opt-in.
     ///
-    /// # v0.1: an honest no-op
+    /// # v0.1: the Deribit adapter
     ///
-    /// The only gate-clear built-in is **Deribit** (public, no auth), whose
-    /// adapter lands in #15/#16. No built-in adapter exists to register yet, so
-    /// this is a documented **no-op** in v0.1 — **no fake provider is
-    /// fabricated** (`docs/03-data-providers.md` §9). Consequently
-    /// `builder().with_builtins().run()` reports [`RegistryError::Empty`] until
-    /// the Deribit adapter lands and is registered here; the external
-    /// [`register`](Self::register) path is fully exercised today.
+    /// The only gate-clear built-in is **Deribit** (public, no auth) — the
+    /// zero-config default (ADR-0003). Its adapter (issue #15) is registered here
+    /// under the reserved `deribit` id, so `builder().with_builtins().run()`
+    /// resolves the Deribit live source. Gated built-ins stay out of this call by
+    /// construction (`docs/SECURITY.md` §2).
     #[must_use]
     pub fn with_builtins(self) -> Self {
-        // #15/#16: register the real Deribit adapter here once it exists, e.g.
-        //   self.register_builtin(DeribitProvider::new())
-        // Gated built-ins stay out of this call by construction (SECURITY.md §2).
-        self
+        self.register_builtin(DeribitAdapter::new())
     }
 
     /// Opt in to a security-**gated** bundled adapter explicitly. Fails at
@@ -341,6 +337,21 @@ impl ChainViewAppBuilder {
     }
 
     // --- Internal helpers -----------------------------------------------------
+
+    /// Register a bundled built-in adapter under its reserved id. Unlike the
+    /// external [`register`](Self::register) path, a reserved id is **expected**
+    /// here (built-ins own the reserved namespace), so only a duplicate is an
+    /// error (recorded first-error-wins) — a built-in registered twice.
+    fn register_builtin(mut self, provider: impl Provider + 'static) -> Self {
+        let arc: Arc<dyn Provider> = Arc::new(provider);
+        let id = arc.id();
+        if self.registry.contains(&id) {
+            self.record(RegistryError::DuplicateId(id).into());
+        } else {
+            self.registry.insert(id, arc);
+        }
+        self
+    }
 
     /// Register an already-boxed adapter, rejecting a reserved id and a
     /// collision (both recorded first-error-wins).
@@ -627,16 +638,31 @@ mod tests {
 
     #[test]
     fn test_run_empty_registry_is_empty_error() {
-        // `with_builtins` is an honest no-op in v0.1 (Deribit lands in #15), so a
-        // stock live startup finds an empty registry.
+        // A live startup with NO providers registered (no `with_builtins`, no
+        // external `register`) finds an empty registry.
         let result = ChainViewApp::builder()
-            .with_builtins()
             .with_config(live_config("deribit"))
             .run();
         assert!(matches!(
             result,
             Err(ChainViewError::Registry(RegistryError::Empty))
         ));
+    }
+
+    #[test]
+    fn test_with_builtins_registers_deribit_and_resolves_source() {
+        // `with_builtins` now registers the real Deribit adapter (issue #15), so a
+        // stock live startup selecting `deribit` resolves its chain source. `run`
+        // stops after resolving the live source (the loop lands later), so a
+        // successful resolution returns `Ok(())` without any network I/O.
+        let result = ChainViewApp::builder()
+            .with_builtins()
+            .with_config(live_config("deribit"))
+            .run();
+        assert!(
+            result.is_ok(),
+            "expected deribit to resolve, got {result:?}"
+        );
     }
 
     // === --provider resolution ================================================
