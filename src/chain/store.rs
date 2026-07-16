@@ -58,6 +58,7 @@ use super::events::{
     QUOTE_STALE_AFTER, QuoteUpdate, StreamHealth, chain_stale_after,
 };
 use super::fetch::{AliasCatalog, ChainFetch};
+use super::greeks::{GreeksSidecar, LegGreeks, PricingInputs, compute_leg_greeks};
 use super::identity::{InstrumentKey, ProviderId};
 
 // --- Bounded-merge tuning constants (`docs/03-data-providers.md` §4) ----------
@@ -259,6 +260,19 @@ pub struct ChainStore {
     instruments: HashMap<InstrumentKey, InstrumentState>,
     /// Legs whose latest cross-provider overlay was refused on a spec mismatch.
     overlay_refused: HashSet<InstrumentKey>,
+    /// The style-keyed local Greeks/IV analytics sidecar (`docs/01` §7). Filled on
+    /// the market/tick event (never in `draw`) by [`compute_leg_greeks`], preserving
+    /// venue iv/gamma per style and computing theta/vega/rho locally. `draw` only
+    /// reads it through [`leg_greeks`](ChainStore::leg_greeks).
+    sidecar: GreeksSidecar,
+    /// The pricing-input cache key: bumped whenever an applied fold changes option
+    /// data (a poll, an applied quote, or an applied Greeks row), so a recompute
+    /// fires only when an input actually changed and is a cache no-op otherwise.
+    input_generation: u64,
+    /// The deterministic analytics reference instant — the last data-changing fold's
+    /// timestamp — the sidecar prices time-to-expiry from. Never `Utc::now()`, so
+    /// the local analytics stay reproducible (`docs/01` §7, issue #24).
+    analytics_as_of: DateTime<Utc>,
 }
 
 impl ChainStore {
@@ -289,7 +303,7 @@ impl ChainStore {
             expiry_source.underlying,
             expiry_source.expiration_utc,
         );
-        Self {
+        let mut store = Self {
             chain_key,
             chain,
             aliases,
@@ -303,7 +317,14 @@ impl ChainStore {
             dropped_overflow: 0,
             instruments: HashMap::with_capacity(instrument_cap),
             overlay_refused: HashSet::new(),
-        }
+            sidecar: GreeksSidecar::new(),
+            input_generation: 1,
+            analytics_as_of: now,
+        };
+        // Fill the local analytics for the seeded chain so the first frame renders
+        // Greeks/IV before any stream update arrives (the initial poll is data).
+        store.recompute_sidecar();
+        store
     }
 
     /// Reconcile structure against a fresh poll: bump the generation, tombstone
@@ -355,6 +376,9 @@ impl ChainStore {
         self.last_full_poll = Some(now);
 
         self.drain_pending(now);
+        // A fresh structure (and any drained venue Greeks) is a data change: refresh
+        // the local analytics once, deterministically, from the poll instant.
+        self.on_option_data_changed(now);
     }
 
     /// Fold a [`QuoteUpdate`] into its row: gate a cross-provider overlay, drop an
@@ -373,6 +397,8 @@ impl ChainStore {
         if self.contains_strike(strike) {
             if self.apply_quote_to_row(update) {
                 let _ = self.overlay_refused.remove(key);
+                // A new premium re-drives the local IV inversion / Greeks.
+                self.on_option_data_changed(update.received_time);
                 MergeOutcome::Applied
             } else {
                 MergeOutcome::DroppedCrossed
@@ -396,9 +422,10 @@ impl ChainStore {
     /// out-of-order update, then either patch the present row (an absent field
     /// keeps the prior value), buffer an unknown strike, or drop a tombstoned one.
     ///
-    /// `theta`/`vega`/`rho` have no [`OptionData`] field and are intentionally not
-    /// folded here — the analytics sidecar that holds them lands in v0.2
-    /// (`docs/01-domain-model.md` §7).
+    /// The venue `iv`/`gamma` are additionally folded **per style** into the
+    /// [`GreeksSidecar`], and the local `theta`/`vega`/`rho` — which have no
+    /// [`OptionData`] field — are filled by the recompute the applied fold triggers
+    /// (`docs/01-domain-model.md` §7, issue #24/#25).
     pub fn apply_greeks(&mut self, update: &GreeksRow) -> MergeOutcome {
         let key = &update.instrument.key;
         if let Some(outcome) = self.gate_overlay(key, &update.instrument.provider) {
@@ -412,6 +439,8 @@ impl ChainStore {
         if self.contains_strike(strike) {
             self.apply_greeks_to_row(update);
             let _ = self.overlay_refused.remove(key);
+            // New venue iv/gamma + a refreshed local theta/vega/rho fill.
+            self.on_option_data_changed(update.received_time);
             MergeOutcome::Applied
         } else if self.tombstones.contains(&strike) {
             MergeOutcome::DroppedTombstoned
@@ -447,6 +476,18 @@ impl ChainStore {
     #[must_use]
     pub fn chain(&self) -> &OptionChain {
         &self.chain
+    }
+
+    /// The style-keyed local analytics for one leg, or `None` when no entry exists
+    /// (`docs/01-domain-model.md` §7). The read-only accessor the chain-matrix
+    /// projection uses at draw time — it borrows the cached sidecar, mutates
+    /// nothing, and triggers no pricing. The sidecar is refreshed only on a
+    /// data-changing fold ([`apply_quote`](ChainStore::apply_quote) /
+    /// [`apply_greeks`](ChainStore::apply_greeks) /
+    /// [`apply_poll`](ChainStore::apply_poll)), never here.
+    #[must_use]
+    pub fn leg_greeks(&self, key: &InstrumentKey) -> Option<&LegGreeks> {
+        self.sidecar.get(key)
     }
 
     /// The per-leg alias catalog carried forward from the poll.
@@ -721,9 +762,11 @@ impl ChainStore {
 
     /// The clone / patch / re-insert for a Greeks row. A rejected (absent) field
     /// keeps the prior value; the opposite leg's delta and untouched fields are
-    /// preserved. `implied_volatility` and `gamma` are shared per strike upstream,
-    /// so the last style to arrive wins them (the per-style sidecar in v0.2 fixes
-    /// this, `docs/01-domain-model.md` §7).
+    /// preserved. The shared upstream `implied_volatility`/`gamma` fields are still
+    /// patched (the last style to arrive wins those single slots), but the
+    /// **authoritative** per-leg iv/gamma are folded losslessly **per style** into
+    /// the [`GreeksSidecar`] — so unequal call/put iv/gamma never collide, and the
+    /// projection reads the sidecar, not the shared field (`docs/01` §7).
     fn apply_greeks_to_row(&mut self, update: &GreeksRow) {
         let key = &update.instrument.key;
         let Some(existing) = self.chain.options.get(&probe_row(key.strike)) else {
@@ -749,6 +792,9 @@ impl ChainStore {
             row.implied_volatility = iv;
         }
         let _ = self.chain.options.replace(row);
+        // Preserve the venue iv/gamma per style (the recompute keeps them and fills
+        // the local theta/vega/rho around them); venue theta/vega/rho are discarded.
+        self.sidecar.apply_venue_greeks(update);
         self.record_greeks(key, update);
     }
 
@@ -798,6 +844,37 @@ impl ChainStore {
         if update.event_time.is_some() {
             state.greeks_event_time = update.event_time;
         }
+    }
+
+    /// Mark that an applied fold changed the option data (spot/premium/venue
+    /// Greeks): advance the analytics reference instant to the fold's timestamp,
+    /// bump the pricing-input cache key, and refresh the local analytics once. The
+    /// timestamp is a store instant (a poll or update's own time), never the wall
+    /// clock, so the fill stays deterministic (`docs/01` §7).
+    fn on_option_data_changed(&mut self, as_of: DateTime<Utc>) {
+        self.analytics_as_of = as_of;
+        // Checked increment with a self fallback (not `u64::MAX`), so it is a checked
+        // op rather than a banned saturating call.
+        self.input_generation = self
+            .input_generation
+            .checked_add(1)
+            .unwrap_or(self.input_generation);
+        self.recompute_sidecar();
+    }
+
+    /// Recompute the style-keyed local analytics for the whole chain via the #24
+    /// engine, cached by the pricing `input_generation`. `compute_leg_greeks` records every
+    /// per-leg outcome in the leg's status and returns `Ok(())` (a malformed,
+    /// non-absolute chain expiry degrades to "no local analytics" internally), so
+    /// the fallible result is deliberately discarded — there is no error to surface
+    /// and no credential/panic path here.
+    fn recompute_sidecar(&mut self) {
+        let ctx = PricingInputs::new(
+            self.chain.underlying_price,
+            self.analytics_as_of,
+            self.input_generation,
+        );
+        let _ = compute_leg_greeks(&self.chain, &ctx, &mut self.sidecar);
     }
 
     /// Buffer an unknown-strike update, dropping the oldest entry (counted) when
@@ -1113,6 +1190,65 @@ mod tests {
             theta: None,
             vega: None,
             rho: None,
+            origin: GreeksOrigin::Provider,
+            event_time: None,
+            received_time: utc(EXP + 100),
+        }
+    }
+
+    /// The absolute expiry the seeded chain resolves to — the instant the local
+    /// analytics sidecar keys on (via `OptionChain::get_expiration`). The synthetic
+    /// `InstrumentKey`s elsewhere in this module use `utc(EXP)`, but the sidecar
+    /// keys on the chain's own resolved expiry, so a sidecar read (and a venue
+    /// Greeks fold meant to survive the recompute) must use this instant.
+    #[track_caller]
+    fn resolved_exp(store: &ChainStore) -> chrono::DateTime<chrono::Utc> {
+        match store.chain().get_expiration() {
+            Some(optionstratlib::ExpirationDate::DateTime(dt)) => dt,
+            other => panic!("expected an absolute-UTC chain expiry, got {other:?}"),
+        }
+    }
+
+    /// A sidecar read key for `(strike, style)` at the store's resolved expiry.
+    fn leg_key(store: &ChainStore, strike: f64, style: OptionStyle) -> InstrumentKey {
+        InstrumentKey {
+            underlying: "BTC".to_owned(),
+            expiration_utc: resolved_exp(store),
+            strike: pos(strike),
+            style,
+        }
+    }
+
+    /// A venue Greeks row at an explicit expiry (so its key matches the sidecar's
+    /// compute key). Carries venue theta/vega/rho that the sidecar deliberately
+    /// discards.
+    fn greeks_exp(
+        exp: chrono::DateTime<chrono::Utc>,
+        strike: f64,
+        style: OptionStyle,
+        iv: Option<f64>,
+        delta: Option<Decimal>,
+        gamma: Option<Decimal>,
+    ) -> GreeksRow {
+        GreeksRow {
+            instrument: Instrument {
+                key: InstrumentKey {
+                    underlying: "BTC".to_owned(),
+                    expiration_utc: exp,
+                    strike: pos(strike),
+                    style,
+                },
+                provider: pid("deribit"),
+                native_symbol: format!("BTC-{strike}-{}", style.as_str()),
+                stream_symbol: None,
+                spec: spec(1),
+            },
+            iv: iv.map(pos),
+            delta,
+            gamma,
+            theta: Some(dec(-9, 1)),
+            vega: Some(dec(8, 1)),
+            rho: Some(dec(7, 1)),
             origin: GreeksOrigin::Provider,
             event_time: None,
             received_time: utc(EXP + 100),
@@ -1444,6 +1580,119 @@ mod tests {
         assert_eq!(after.delta_call, Some(dec(-5, 1)));
         assert_eq!(after.gamma, Some(dec(2, 2))); // absent field kept prior
         assert_eq!(after.implied_volatility, pos(0.5)); // absent iv kept prior
+    }
+
+    // --- Local analytics sidecar: seeded, folded, and generation-cached ------
+
+    #[test]
+    fn test_sidecar_seeded_fills_local_theta_vega_rho() {
+        // The seed poll is data: `compute_leg_greeks` fills local theta/vega/rho and
+        // inverts IV locally for the seeded strike, before any stream update.
+        let store = seed_single();
+        let leg = match store.leg_greeks(&leg_key(&store, 60_000.0, OptionStyle::Call)) {
+            Some(g) => *g,
+            None => panic!("expected a seeded sidecar entry"),
+        };
+        assert!(leg.theta.is_some());
+        assert!(leg.vega.is_some());
+        assert!(leg.rho.is_some());
+        assert_eq!(leg.theta_origin, GreeksOrigin::ComputedLocally);
+        assert_eq!(leg.vega_origin, GreeksOrigin::ComputedLocally);
+        // No venue Greeks yet, so IV/gamma were inverted/computed locally.
+        assert_eq!(leg.iv_origin, GreeksOrigin::ComputedLocally);
+        assert_eq!(leg.gamma_origin, GreeksOrigin::ComputedLocally);
+    }
+
+    #[test]
+    fn test_apply_greeks_folds_venue_iv_gamma_into_sidecar_per_style() {
+        let mut store = seed_single();
+        let exp = resolved_exp(&store);
+        let outcome = store.apply_greeks(&greeks_exp(
+            exp,
+            60_000.0,
+            OptionStyle::Call,
+            Some(0.42),
+            Some(dec(-6, 1)),
+            Some(dec(1, 2)),
+        ));
+        assert_eq!(outcome, MergeOutcome::Applied);
+        let call = match store.leg_greeks(&leg_key(&store, 60_000.0, OptionStyle::Call)) {
+            Some(g) => *g,
+            None => panic!("expected a call sidecar entry"),
+        };
+        // Venue iv/gamma preserved with Provider origin; venue theta/vega/rho are
+        // discarded and refilled locally around them.
+        assert_eq!(call.iv, Some(pos(0.42)));
+        assert_eq!(call.iv_origin, GreeksOrigin::Provider);
+        assert_eq!(call.gamma, Some(dec(1, 2)));
+        assert_eq!(call.gamma_origin, GreeksOrigin::Provider);
+        assert!(call.theta.is_some());
+        assert_eq!(call.theta_origin, GreeksOrigin::ComputedLocally);
+        // The put leg keeps its own independent (locally computed) entry — no
+        // call/put collision on the shared upstream iv/gamma slots.
+        let put = match store.leg_greeks(&leg_key(&store, 60_000.0, OptionStyle::Put)) {
+            Some(g) => *g,
+            None => panic!("expected a put sidecar entry"),
+        };
+        assert_eq!(put.gamma_origin, GreeksOrigin::ComputedLocally);
+    }
+
+    #[test]
+    fn test_input_generation_bumps_only_on_applied_data_change() {
+        let mut store = seed_single();
+        let gen_seed = store.input_generation;
+        // The seed recompute already ran and cached this generation.
+        assert_eq!(store.sidecar.computed_generation(), Some(gen_seed));
+        let before = match store.leg_greeks(&leg_key(&store, 60_000.0, OptionStyle::Call)) {
+            Some(g) => *g,
+            None => panic!("expected a seed entry"),
+        };
+
+        // A crossed quote is dropped: no data change, no generation bump, no
+        // recompute — the cached analytics are untouched (the cache no-op).
+        assert_eq!(
+            store.apply_quote(&quote(
+                "deribit",
+                60_000.0,
+                OptionStyle::Call,
+                Some(2.0),
+                Some(1.5),
+                None,
+                EXP + 100
+            )),
+            MergeOutcome::DroppedCrossed
+        );
+        assert_eq!(
+            store.input_generation, gen_seed,
+            "a dropped update does not bump the pricing generation"
+        );
+        let after = match store.leg_greeks(&leg_key(&store, 60_000.0, OptionStyle::Call)) {
+            Some(g) => *g,
+            None => panic!("expected a seed entry"),
+        };
+        assert_eq!(
+            before, after,
+            "a no-op fold leaves the cached analytics intact"
+        );
+
+        // An applied quote bumps the generation and re-fills the cache to match.
+        assert_eq!(
+            store.apply_quote(&quote(
+                "deribit",
+                60_000.0,
+                OptionStyle::Call,
+                Some(1.4),
+                Some(1.6),
+                None,
+                EXP + 101
+            )),
+            MergeOutcome::Applied
+        );
+        assert!(store.input_generation > gen_seed);
+        assert_eq!(
+            store.sidecar.computed_generation(),
+            Some(store.input_generation)
+        );
     }
 
     // --- Freshness / staleness threshold crossings ---------------------------

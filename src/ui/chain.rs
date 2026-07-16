@@ -28,16 +28,36 @@
 //! View models are the only place display formatting happens; the domain stays
 //! numeric (`docs/01-domain-model.md` §8).
 //!
-//! # Projection is honest: `None` iff `None`, `—` never a fabricated `0`
+//! # Projection is honest: per-field precedence, `—` never a fabricated `0`
 //!
-//! A [`LegView`] field is `None` **iff** the underlying [`OptionData`] field is
-//! `None` — projection never invents a value, and a missing value renders `—` (an
-//! em dash), never a fabricated `0` (`docs/01-domain-model.md` §5, §8). One
-//! deliberate exception the venue seam forces, documented at [`project_iv`]: an
-//! [`OptionData::implied_volatility`] of **exactly zero** is the Deribit adapter's
-//! absent-IV sentinel (the upstream `OptionChain::add_option` takes a
-//! **non-`Option`** IV, so an absent IV defaults to `Positive::ZERO`), so a bare
-//! `0` IV projects to `None` and renders `—`, never a fabricated-looking `0.00%`.
+//! Each Greek is resolved by the per-field precedence of `docs/01-domain-model.md`
+//! §7 ([`resolve_leg`]): `delta` prefers the venue per-leg value and falls back to
+//! the local sidecar; `gamma` comes from the style-keyed [`LegGreeks`]
+//! (venue-or-local per its origin); `theta`/`vega` are always locally computed.
+//! `iv` has a three-level precedence ([`resolve_iv`]): a per-style **venue** IV from
+//! the sidecar, then — for the **call leg only** — the shared
+//! [`OptionData::implied_volatility`] (§7 documents this shared field as the
+//! call-side value, so the **put leg gets no shared fallback**, avoiding a call/put
+//! IV collision), then a **locally computed** sidecar IV. A field is `Some` only
+//! when a real value resolved — projection never invents one, and a missing value
+//! renders `—` (an em dash), never a fabricated `0` (`docs/01-domain-model.md` §5,
+//! §7, §8).
+//!
+//! Two honesty guards on IV (both documented at [`project_iv`]/[`project_local_iv`]):
+//! an IV of **exactly zero** is the venue's absent-IV sentinel (the upstream
+//! `OptionChain::add_option` takes a **non-`Option`** IV, so an absent IV defaults
+//! to `Positive::ZERO`), so a bare `0` IV projects to `None` and renders `—`; and a
+//! **locally computed** IV below [`MIN_PLAUSIBLE_LOCAL_IV`] (0.5%) is economically
+//! implausible for a live quote — the same reasoning as the exact-zero sentinel — so
+//! it is cleared to `—` rather than painting a fabricated-looking near-zero
+//! percentage. A **venue** (`Provider`) IV is trusted and never floored.
+//!
+//! The origin glyph (`~`) badges the **actual computed cell** — an `iv`/`gamma`/
+//! `theta`/`vega`/`delta` value whose resolved origin is
+//! [`GreeksOrigin::ComputedLocally`] — never the trustworthy venue field beside it,
+//! so a mixed-origin row (venue delta + local theta) badges the local theta, not the
+//! delta. The row-level [`greeks_origin`](LegView::greeks_origin) still rolls up to
+//! [`GreeksOrigin::ComputedLocally`] whenever any present field is local.
 //!
 //! # Color is never the only signal
 //!
@@ -61,11 +81,11 @@ use ratatui::widgets::{Block, Cell, Paragraph, Row, Table};
 
 use crate::app::keymap::{ChainAction, KeyChord, resolve_chain};
 use crate::app::{LegFocus, LiveState, ScreenLoad};
-use crate::chain::{ChainStore, GreeksOrigin, InstrumentKey, StreamHealth, TickDir};
+use crate::chain::{ChainStore, GreeksOrigin, InstrumentKey, LegGreeks, StreamHealth, TickDir};
 use crate::event::AppEvent;
 use crate::ui::theme::{
-    GreekColumn, StrikeRelation, Theme, health_span, sanitize, spinner_frame,
-    strike_relation_marker_span, tick_dir_span,
+    GreekColumn, GreekColumns, StrikeRelation, Theme, greek_columns_for_slots, health_span,
+    sanitize, spinner_frame, strike_relation_marker_span, tick_dir_span,
 };
 
 // ===========================================================================
@@ -73,12 +93,22 @@ use crate::ui::theme::{
 // ===========================================================================
 
 /// One option leg (a call or a put) at one strike, projected from an
-/// [`OptionData`] at draw time (`docs/01-domain-model.md` §8).
+/// [`OptionData`] and the store's style-keyed analytics sidecar at draw time
+/// (`docs/01-domain-model.md` §7, §8).
 ///
-/// Every optional field is `Some` **iff** the underlying [`OptionData`] field is
-/// `Some` — projection never invents a value (see the `project_call` / `project_put`
-/// and `project_iv` seam). `theta`/`vega` are v0.2 (upstream [`OptionData`] holds no
-/// theta/vega yet), so they are always `None` and render `—` for now.
+/// Each analytic field is resolved by the per-field precedence of §7 (`resolve_leg`):
+/// `delta` prefers the venue value (`OptionData::delta_call` / `delta_put`) and
+/// falls back to the local sidecar; `gamma` comes from the style-keyed [`LegGreeks`]
+/// (venue-or-local per its origin); `iv` follows the three-level `resolve_iv`
+/// precedence (per-style venue → the call-only shared `OptionData::implied_volatility`
+/// → locally computed); `theta`/`vega` are always locally computed. A field is `Some`
+/// only when a real value resolved — projection never invents one, and a `None` field
+/// renders `—`, never a fabricated `0` (`project_iv`/`project_local_iv` also clear the
+/// venue's absent-IV zero sentinel and a sub-plausibility local IV to `None`).
+///
+/// Each resolvable-from-venue-or-local field carries its resolved [`GreeksOrigin`]
+/// so the origin glyph badges the **actual computed cell**, not a trustworthy venue
+/// cell beside it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LegView {
     /// Best bid, or `None` when the feed omits it (renders `—`).
@@ -87,27 +117,76 @@ pub struct LegView {
     pub ask: Option<Positive>,
     /// Mid/mark price, or `None` when a side is missing (renders `—`).
     pub mark: Option<Positive>,
-    /// Implied volatility, or `None` when unavailable **or** the venue's
-    /// absent-IV zero sentinel (`project_iv`) — renders `—`, never `0.00%`.
+    /// Implied volatility resolved by `resolve_iv`, or `None` when unavailable, the
+    /// venue's absent-IV zero sentinel (`project_iv`), **or** a sub-plausibility
+    /// locally-computed value (`project_local_iv`) — renders `—`, never `0.00%`.
     pub iv: Option<Positive>,
-    /// Delta, or `None` when unavailable (renders `—`).
+    /// Where the resolved `iv` came from: [`GreeksOrigin::Provider`] for a per-style
+    /// venue IV or the shared call-side field, [`GreeksOrigin::ComputedLocally`] for a
+    /// local inversion. Drives the origin glyph on the IV cell (only when `iv` is
+    /// `Some` and local).
+    pub iv_origin: GreeksOrigin,
+    /// Delta — the venue per-leg value when present, else the local sidecar
+    /// fallback; `None` when neither resolved (renders `—`).
     pub delta: Option<Decimal>,
-    /// Gamma, or `None` when unavailable (renders `—`).
+    /// Where the resolved `delta` came from: [`GreeksOrigin::Provider`] for the venue
+    /// per-leg value, [`GreeksOrigin::ComputedLocally`] for the local fallback. Drives
+    /// the origin glyph on the delta cell (only when `delta` is `Some` and local).
+    pub delta_origin: GreeksOrigin,
+    /// Gamma from the style-keyed sidecar (venue-or-local), or `None` (renders `—`).
     pub gamma: Option<Decimal>,
-    /// Theta — v0.2 (no [`OptionData`] field yet), so always `None` for now.
+    /// Where the resolved `gamma` came from (venue-or-local per its sidecar origin).
+    /// Drives the origin glyph on the gamma cell (only when `gamma` is `Some` and
+    /// local).
+    pub gamma_origin: GreeksOrigin,
+    /// Theta from the style-keyed sidecar — always locally computed; `None` until
+    /// the local fill runs (renders `—`). Badged with the origin glyph whenever
+    /// present.
     pub theta: Option<Decimal>,
-    /// Vega — v0.2 (no [`OptionData`] field yet), so always `None` for now.
+    /// Vega from the style-keyed sidecar — always locally computed; `None` until
+    /// the local fill runs (renders `—`). Badged with the origin glyph whenever
+    /// present.
     pub vega: Option<Decimal>,
-    /// Where this leg's Greeks came from — drives an origin glyph for locally
-    /// computed Greeks. v0.1 sources Greeks from the venue, so this is
-    /// [`GreeksOrigin::Provider`]; the [`GreeksOrigin::ComputedLocally`] badge
-    /// wires in with the local fill-in and the per-style analytics sidecar (v0.2).
+    /// Where this leg's rendered Greeks came from, rolled up across the resolved
+    /// fields: [`GreeksOrigin::ComputedLocally`] when **any** present field is
+    /// locally computed (so a mixed-origin row — venue delta + local vega — is
+    /// honestly labelled), else [`GreeksOrigin::Provider`]. The per-cell origin
+    /// glyph is driven by the per-field origins above, not by this rollup.
     pub greeks_origin: GreeksOrigin,
     /// The decayed last-tick direction of the bid, read from the store's retained
     /// baseline (`▲`/`▼`/`·`), cleared to `Flat` when the feed goes stale.
     pub bid_dir: TickDir,
     /// The decayed last-tick direction of the ask.
     pub ask_dir: TickDir,
+}
+
+impl LegView {
+    /// Whether the given greek column's **present** resolved value is a
+    /// locally-computed one — the per-cell origin-glyph predicate. `theta`/`vega`
+    /// are always [`GreeksOrigin::ComputedLocally`], so they badge whenever present;
+    /// `delta`/`gamma` badge only when their resolved origin is local. A `None` field
+    /// is never local (an em dash is never badged).
+    #[must_use]
+    fn greek_is_local(&self, greek: GreekColumn) -> bool {
+        match greek {
+            GreekColumn::Delta => {
+                self.delta.is_some() && matches!(self.delta_origin, GreeksOrigin::ComputedLocally)
+            }
+            GreekColumn::Gamma => {
+                self.gamma.is_some() && matches!(self.gamma_origin, GreeksOrigin::ComputedLocally)
+            }
+            GreekColumn::Theta => self.theta.is_some(),
+            GreekColumn::Vega => self.vega.is_some(),
+        }
+    }
+
+    /// Whether the **present** resolved `iv` is locally computed — the IV cell's
+    /// origin-glyph predicate. A venue/shared (`Provider`) IV and a `None` IV are
+    /// never badged.
+    #[must_use]
+    fn iv_is_local(&self) -> bool {
+        self.iv.is_some() && matches!(self.iv_origin, GreeksOrigin::ComputedLocally)
+    }
 }
 
 /// One strike row of the chain matrix — the call and put legs plus the shared,
@@ -129,45 +208,192 @@ pub struct ChainRow {
     pub strike_relation: StrikeRelation,
 }
 
-/// Project the **call** leg from an [`OptionData`], reading the call-side fields
-/// and the pre-decayed direction indicators. `None` iff the source field is
-/// `None`; `theta`/`vega` are v0.2 and always `None`.
+/// Project the **call** leg from an [`OptionData`] and its style-keyed
+/// [`LegGreeks`], resolving each Greek by the §7 precedence ([`resolve_leg`]). The
+/// venue delta is [`OptionData::delta_call`]; `gamma`/`theta`/`vega` come from the
+/// sidecar. The shared [`OptionData::implied_volatility`] is threaded in as the
+/// call-leg IV fallback (§7 documents the shared field as the **call-side** value),
+/// so a seed-only snapshot with no per-style venue IV yet still shows the honest
+/// venue IV rather than a locally-computed near-zero.
 #[must_use]
-fn project_call(od: &OptionData, bid_dir: TickDir, ask_dir: TickDir) -> LegView {
+fn project_call(
+    od: &OptionData,
+    leg: Option<&LegGreeks>,
+    bid_dir: TickDir,
+    ask_dir: TickDir,
+) -> LegView {
+    resolve_leg(
+        od.call_bid,
+        od.call_ask,
+        od.call_middle,
+        od.delta_call,
+        Some(od.implied_volatility),
+        leg,
+        (bid_dir, ask_dir),
+    )
+}
+
+/// Project the **put** leg from an [`OptionData`] and its style-keyed
+/// [`LegGreeks`]. The venue delta is [`OptionData::delta_put`]; `iv`/`gamma` are the
+/// **put** sidecar entry — split per style, so an unequal call/put iv/gamma both
+/// survive (`docs/01-domain-model.md` §7), unlike the shared upstream fields.
+///
+/// The put passes **no** shared-IV fallback: the shared [`OptionData::implied_volatility`]
+/// is the call-side value (§7), so handing it to the put would reintroduce the exact
+/// call/put IV collision the style-keyed sidecar exists to prevent.
+#[must_use]
+fn project_put(
+    od: &OptionData,
+    leg: Option<&LegGreeks>,
+    bid_dir: TickDir,
+    ask_dir: TickDir,
+) -> LegView {
+    resolve_leg(
+        od.put_bid,
+        od.put_ask,
+        od.put_middle,
+        od.delta_put,
+        None,
+        leg,
+        (bid_dir, ask_dir),
+    )
+}
+
+/// Resolve one leg's [`LegView`] by the per-field §7 precedence — a **pure** read
+/// over the venue row fields and the style-keyed sidecar [`LegGreeks`], inventing
+/// nothing and pricing nothing:
+///
+/// - **delta**: the venue per-leg value (origin `Provider`) when present, else the
+///   local sidecar `delta` (origin `ComputedLocally`).
+/// - **iv**: the three-level [`resolve_iv`] precedence — a per-style venue sidecar
+///   IV, then the call-only `shared_iv` fallback, then a floored local inversion.
+/// - **gamma**: the sidecar `gamma` with its origin (venue-or-local per style).
+/// - **theta/vega**: the sidecar values — always locally computed.
+///
+/// `shared_iv` is the shared [`OptionData::implied_volatility`] for the **call** leg
+/// and `None` for the put (`project_call`/`project_put`), because that shared field
+/// is the call-side value (§7).
+///
+/// [`greeks_origin`](LegView::greeks_origin) rolls up to
+/// [`GreeksOrigin::ComputedLocally`] when any resolved, present field is local. Each
+/// field also carries its own resolved [`GreeksOrigin`], so the per-cell origin glyph
+/// badges the actual computed cell. A field that resolves to `None` renders `—`.
+#[must_use]
+fn resolve_leg(
+    bid: Option<Positive>,
+    ask: Option<Positive>,
+    mark: Option<Positive>,
+    venue_delta: Option<Decimal>,
+    shared_iv: Option<Positive>,
+    leg: Option<&LegGreeks>,
+    dirs: (TickDir, TickDir),
+) -> LegView {
+    let (bid_dir, ask_dir) = dirs;
+    // delta: venue first, else the local sidecar fallback.
+    let (delta, delta_origin) = match venue_delta {
+        Some(value) => (Some(value), GreeksOrigin::Provider),
+        None => match leg.and_then(|g| g.delta) {
+            Some(value) => (Some(value), GreeksOrigin::ComputedLocally),
+            None => (None, GreeksOrigin::Provider),
+        },
+    };
+    // iv: the three-level precedence (sidecar-venue → call-only shared → local floored).
+    let (iv, iv_origin) = resolve_iv(shared_iv, leg);
+    // gamma: the style-keyed sidecar, venue-or-local per its origin.
+    let (gamma, gamma_origin) = match leg.and_then(|g| g.gamma.map(|value| (value, g.gamma_origin)))
+    {
+        Some((value, origin)) => (Some(value), origin),
+        None => (None, GreeksOrigin::Provider),
+    };
+    // theta / vega: always locally computed when present.
+    let theta = leg.and_then(|g| g.theta);
+    let vega = leg.and_then(|g| g.vega);
+    // Roll the origin up: any present, locally-computed field labels the row local.
+    let delta_local = delta.is_some() && matches!(delta_origin, GreeksOrigin::ComputedLocally);
+    let iv_local = iv.is_some() && matches!(iv_origin, GreeksOrigin::ComputedLocally);
+    let gamma_local = gamma.is_some() && matches!(gamma_origin, GreeksOrigin::ComputedLocally);
+    let any_local = delta_local || iv_local || gamma_local || theta.is_some() || vega.is_some();
+    let greeks_origin = if any_local {
+        GreeksOrigin::ComputedLocally
+    } else {
+        GreeksOrigin::Provider
+    };
     LegView {
-        bid: od.call_bid,
-        ask: od.call_ask,
-        mark: od.call_middle,
-        iv: project_iv(od.implied_volatility),
-        delta: od.delta_call,
-        gamma: od.gamma,
-        theta: None,
-        vega: None,
-        greeks_origin: GreeksOrigin::Provider,
+        bid,
+        ask,
+        mark,
+        iv,
+        iv_origin,
+        delta,
+        delta_origin,
+        gamma,
+        gamma_origin,
+        theta,
+        vega,
+        greeks_origin,
         bid_dir,
         ask_dir,
     }
 }
 
-/// Project the **put** leg from an [`OptionData`]. `gamma` and `iv` are shared per
-/// strike upstream, so both legs read the same value (`docs/01-domain-model.md`
-/// §7); the per-style analytics sidecar in v0.2 splits them.
+/// Resolve one leg's IV by the three-level §7 precedence, returning the value and its
+/// resolved [`GreeksOrigin`] (a **pure** read — no pricing):
+///
+/// 1. **per-style venue IV** from the sidecar ([`LegGreeks::iv`] with origin
+///    `Provider`), routed through [`project_iv`] (only the exact-zero absent sentinel
+///    clears a venue IV — it is never floored);
+/// 2. **`shared_iv`** — the shared [`OptionData::implied_volatility`] the **call** leg
+///    passes and the put passes `None` (§7 call-side field), origin `Provider`;
+/// 3. **locally computed** sidecar IV ([`LegGreeks::iv`] with origin
+///    `ComputedLocally`), routed through [`project_local_iv`] so a sub-plausibility
+///    near-zero degrades to `None`, origin `ComputedLocally`.
+///
+/// The sidecar IV carries exactly one origin, so levels 1 and 3 are mutually
+/// exclusive; the shared fallback sits between them, above the floored local value.
 #[must_use]
-fn project_put(od: &OptionData, bid_dir: TickDir, ask_dir: TickDir) -> LegView {
-    LegView {
-        bid: od.put_bid,
-        ask: od.put_ask,
-        mark: od.put_middle,
-        iv: project_iv(od.implied_volatility),
-        delta: od.delta_put,
-        gamma: od.gamma,
-        theta: None,
-        vega: None,
-        greeks_origin: GreeksOrigin::Provider,
-        bid_dir,
-        ask_dir,
+fn resolve_iv(
+    shared_iv: Option<Positive>,
+    leg: Option<&LegGreeks>,
+) -> (Option<Positive>, GreeksOrigin) {
+    if let Some((value, origin)) = leg.and_then(|g| g.iv.map(|v| (v, g.iv_origin))) {
+        match origin {
+            // A per-style VENUE IV wins outright (only the absent-zero sentinel clears).
+            GreeksOrigin::Provider => {
+                if let Some(iv) = project_iv(value) {
+                    return (Some(iv), GreeksOrigin::Provider);
+                }
+                // exact-zero venue sentinel: fall through to the shared field.
+            }
+            // A LOCAL sidecar IV ranks below the shared venue fallback (call only) and
+            // is subject to the plausibility floor.
+            GreeksOrigin::ComputedLocally => {
+                if let Some(iv) = shared_iv.and_then(project_iv) {
+                    return (Some(iv), GreeksOrigin::Provider);
+                }
+                return (project_local_iv(value), GreeksOrigin::ComputedLocally);
+            }
+        }
     }
+    // No usable sidecar IV: the call-only shared field (the put passes `None`).
+    if let Some(iv) = shared_iv.and_then(project_iv) {
+        return (Some(iv), GreeksOrigin::Provider);
+    }
+    (None, GreeksOrigin::Provider)
 }
+
+/// The smallest implied volatility, **as a fraction** (`0.005` = 0.5%; IV is stored
+/// as a fraction, so `0.4922` renders `49.22%`), that a **locally computed** IV must
+/// reach to be plausible enough to display.
+///
+/// A live listed option quoting real premium with a sub-0.5% IV is economically
+/// implausible — the same reasoning as the exact-zero absent-IV sentinel
+/// ([`project_iv`]): such a near-zero value is almost always a mispriced/garbage
+/// local inversion (e.g. a Deribit inverse, BTC-settled contract whose premium is
+/// priced as USD), not a real quote. A locally-computed IV below this floor is
+/// cleared to `—` rather than painted as a fabricated-looking near-zero percentage.
+/// A **venue** (`Provider`) IV is trusted and never floored — the exact-zero
+/// sentinel already handles a venue absent-zero.
+const MIN_PLAUSIBLE_LOCAL_IV: Decimal = Decimal::from_parts(5, 0, 0, false, 3);
 
 /// Project the non-`Option` [`OptionData::implied_volatility`] into a
 /// `LegView.iv` **honestly** (the "Absent-IV vs 0% IV" decision from #15).
@@ -181,9 +407,27 @@ fn project_put(od: &OptionData, bid_dir: TickDir, ask_dir: TickDir) -> LegView {
 /// projects it to `None` — the matrix renders `—`, exactly the honesty the Greeks
 /// columns use — so a fabricated-looking `0.00%` never renders as a live IV. A
 /// strictly positive IV projects to `Some(iv)`.
+///
+/// This guard clears the exact-zero **venue** sentinel; [`project_local_iv`] adds the
+/// stronger sub-plausibility floor that applies to **locally computed** IVs only.
 #[must_use]
 fn project_iv(iv: Positive) -> Option<Positive> {
     if iv.is_zero() { None } else { Some(iv) }
+}
+
+/// Project a **locally computed** IV honestly: clear both the venue absent-zero
+/// sentinel ([`project_iv`]) **and** any value below the plausibility floor
+/// [`MIN_PLAUSIBLE_LOCAL_IV`] to `None`, so a mispriced near-zero local inversion
+/// degrades to `—` instead of painting a fake percentage. A value at or above the
+/// floor (e.g. a legitimate IG-equities local IV, always ≫ 0.5%) projects to
+/// `Some(iv)`. This applies to `ComputedLocally`-origin IVs only — a venue IV is
+/// trusted via [`project_iv`] and never floored.
+#[must_use]
+fn project_local_iv(iv: Positive) -> Option<Positive> {
+    match project_iv(iv) {
+        Some(value) if value.to_dec() >= MIN_PLAUSIBLE_LOCAL_IV => Some(value),
+        _ => None,
+    }
 }
 
 /// Project one strike row: both legs plus the shared `K/S` relation.
@@ -191,9 +435,10 @@ fn project_iv(iv: Positive) -> Option<Positive> {
 /// The direction indicators are read from the store's retained/decayed baseline as
 /// of `as_of` — the tick-stamped wall clock threaded in from [`App::now`], so a
 /// marker decays on wall-time while `draw` itself reads no wall clock; `None` (no
-/// reference instant) yields `Flat`. Building the per-leg [`InstrumentKey`] clones
-/// the (short) underlying ticker, which is why projection runs for the **visible**
-/// rows only.
+/// reference instant) yields `Flat`. The per-leg Greeks come from the store's
+/// cached style-keyed sidecar ([`ChainStore::leg_greeks`]) — a read, never a
+/// recompute. Building the per-leg [`InstrumentKey`] clones the (short)
+/// underlying ticker, which is why projection runs for the **visible** rows only.
 ///
 /// [`App::now`]: crate::app::App::now
 #[must_use]
@@ -206,27 +451,32 @@ fn project_row(
     as_of: Option<DateTime<Utc>>,
 ) -> ChainRow {
     let strike = od.strike_price;
-    let (call_bid_dir, call_ask_dir) = leg_dirs(
-        store,
-        underlying,
-        expiration,
-        strike,
-        OptionStyle::Call,
-        as_of,
-    );
-    let (put_bid_dir, put_ask_dir) = leg_dirs(
-        store,
-        underlying,
-        expiration,
-        strike,
-        OptionStyle::Put,
-        as_of,
-    );
+    let call_key = leg_key(underlying, expiration, strike, OptionStyle::Call);
+    let put_key = leg_key(underlying, expiration, strike, OptionStyle::Put);
+    let (call_bid_dir, call_ask_dir) = leg_dirs(store, &call_key, as_of);
+    let (put_bid_dir, put_ask_dir) = leg_dirs(store, &put_key, as_of);
     ChainRow {
         strike,
-        call: project_call(od, call_bid_dir, call_ask_dir),
-        put: project_put(od, put_bid_dir, put_ask_dir),
+        call: project_call(od, store.leg_greeks(&call_key), call_bid_dir, call_ask_dir),
+        put: project_put(od, store.leg_greeks(&put_key), put_bid_dir, put_ask_dir),
         strike_relation: StrikeRelation::classify(strike, spot),
+    }
+}
+
+/// The store key for one `(underlying, expiry, strike, style)` leg — the read key
+/// for both the direction baseline and the analytics sidecar.
+#[must_use]
+fn leg_key(
+    underlying: &str,
+    expiration: DateTime<Utc>,
+    strike: Positive,
+    style: OptionStyle,
+) -> InstrumentKey {
+    InstrumentKey {
+        underlying: underlying.to_owned(),
+        expiration_utc: expiration,
+        strike,
+        style,
     }
 }
 
@@ -235,22 +485,13 @@ fn project_row(
 #[must_use]
 fn leg_dirs(
     store: &ChainStore,
-    underlying: &str,
-    expiration: DateTime<Utc>,
-    strike: Positive,
-    style: OptionStyle,
+    key: &InstrumentKey,
     as_of: Option<DateTime<Utc>>,
 ) -> (TickDir, TickDir) {
     let Some(now) = as_of else {
         return (TickDir::Flat, TickDir::Flat);
     };
-    let key = InstrumentKey {
-        underlying: underlying.to_owned(),
-        expiration_utc: expiration,
-        strike,
-        style,
-    };
-    (store.bid_dir(&key, now), store.ask_dir(&key, now))
+    (store.bid_dir(key, now), store.ask_dir(key, now))
 }
 
 // ===========================================================================
@@ -418,13 +659,12 @@ fn draw_matrix(state: &LiveState, frame: &mut Frame, area: Rect, theme: Theme, n
         return;
     }
 
-    // v0.1 column set: Δ (always) and Γ (from `OptionData`). Θ/ν are always empty
-    // until the v0.2 analytics sidecar, so they are NOT shown — the responsive drop
-    // operates on {Δ, Γ}: Γ appears once one optional slot fits. The #14
-    // `greek_columns_for_slots` `Γ → ν → Θ` primitive stays intact (in `theme.rs`)
-    // for when v0.2 populates Θ/ν and they join the column set.
-    let show_gamma = greek_slots_for_width(inner.width) >= 1;
-    let plan = columns(show_gamma);
+    // v0.2 column set: Δ (always) plus the optional Γ/ν/Θ that fit at this width,
+    // dropped in the `Γ → ν → Θ` order the #14 `greek_columns_for_slots` primitive
+    // fixes (Θ retained first, Γ last) — now that the style-keyed analytics sidecar
+    // populates all of them per leg.
+    let greek_cols = greek_columns_for_slots(greek_slots_for_width(inner.width));
+    let plan = columns(greek_cols);
     let widths: Vec<Constraint> = plan.iter().map(|col| col_width(*col)).collect();
     // The body height is the inner height minus the two-row header (the Calls/Puts
     // super-header line plus the per-column label line).
@@ -509,11 +749,11 @@ fn matrix_title(
     Line::from(spans)
 }
 
-/// The number of optional greek **slots** (0..=3) that fit at `width`. In v0.1 the
-/// matrix shows Γ once one slot fits (Δ is always present); the same slot budget
-/// feeds the `Γ → ν → Θ` drop order (`greek_columns_for_slots`, `theme.rs`) once
-/// v0.2 adds Θ/ν. A rough, truncation-safe estimate: below the budget the matrix
-/// keeps only Δ and the price/IV columns and the [`Table`] clips gracefully.
+/// The number of optional greek **slots** (0..=3) that fit at `width` — the budget
+/// fed to the `Γ → ν → Θ` drop order (`greek_columns_for_slots`, `theme.rs`): `0`
+/// keeps Δ only, `1` adds Θ, `2` adds ν, `3` adds Γ (Δ is always present). A rough,
+/// truncation-safe estimate: below the budget the matrix keeps only Δ and the
+/// price/IV columns and the [`Table`] clips gracefully.
 #[must_use]
 fn greek_slots_for_width(width: u16) -> usize {
     // `a - b` floored at zero; `max` guarantees the subtraction never underflows
@@ -593,18 +833,26 @@ enum ChainCol {
     PutGreek(GreekColumn),
 }
 
-/// Build the ordered v0.1 column plan: the call side mirrors the put side around
-/// the center strike (`Δ Γ IV Bid Ask Mark | Strike | Bid Ask Mark IV Γ Δ`), with
-/// Γ shown when `show_gamma`. Only the greeks that can carry data in v0.1 (Δ, Γ)
-/// are in the set; Θ/ν are omitted (always empty until the v0.2 sidecar) rather
-/// than rendered as empty columns that would push Γ off a common terminal. In v0.2
-/// Θ/ν join the set and drop `Γ → ν → Θ` via `greek_columns_for_slots`.
+/// Build the ordered v0.2 column plan: the call side mirrors the put side around
+/// the center strike
+/// (`Δ [Γ] [ν] [Θ] IV Bid Ask Mark | Strike | Bid Ask Mark IV [Θ] [ν] [Γ] Δ`). Δ is
+/// always present; the optional Γ/ν/Θ are included per `greeks` — the responsive
+/// set the `Γ → ν → Θ` drop order yields (Θ retained first, Γ last). The optional
+/// greeks sit between Δ and IV on the call side and mirror on the put side, so the
+/// plan stays a clean mirror at every width.
 #[must_use]
-fn columns(show_gamma: bool) -> Vec<ChainCol> {
+fn columns(greeks: GreekColumns) -> Vec<ChainCol> {
     let mut plan = Vec::new();
+    // Call side: Δ, then the optional greeks (outer→inner: Γ, ν, Θ), then IV/prices.
     plan.push(ChainCol::CallGreek(GreekColumn::Delta));
-    if show_gamma {
+    if greeks.gamma {
         plan.push(ChainCol::CallGreek(GreekColumn::Gamma));
+    }
+    if greeks.vega {
+        plan.push(ChainCol::CallGreek(GreekColumn::Vega));
+    }
+    if greeks.theta {
+        plan.push(ChainCol::CallGreek(GreekColumn::Theta));
     }
     plan.push(ChainCol::CallIv);
     plan.push(ChainCol::CallBid);
@@ -615,8 +863,14 @@ fn columns(show_gamma: bool) -> Vec<ChainCol> {
     plan.push(ChainCol::PutAsk);
     plan.push(ChainCol::PutMark);
     plan.push(ChainCol::PutIv);
-    // Put greeks mirror the call side (Γ Δ, outermost last).
-    if show_gamma {
+    // Put greeks mirror the call side (inner→outer: Θ, ν, Γ, then Δ outermost).
+    if greeks.theta {
+        plan.push(ChainCol::PutGreek(GreekColumn::Theta));
+    }
+    if greeks.vega {
+        plan.push(ChainCol::PutGreek(GreekColumn::Vega));
+    }
+    if greeks.gamma {
         plan.push(ChainCol::PutGreek(GreekColumn::Gamma));
     }
     plan.push(ChainCol::PutGreek(GreekColumn::Delta));
@@ -724,8 +978,8 @@ fn col_cell(
     let cell = match col {
         ChainCol::CallGreek(greek) => greek_cell(&row.call, greek, theme),
         ChainCol::PutGreek(greek) => greek_cell(&row.put, greek, theme),
-        ChainCol::CallIv => num_cell(fmt_iv(row.call.iv)),
-        ChainCol::PutIv => num_cell(fmt_iv(row.put.iv)),
+        ChainCol::CallIv => origin_num_cell(fmt_iv(row.call.iv), row.call.iv_is_local(), theme),
+        ChainCol::PutIv => origin_num_cell(fmt_iv(row.put.iv), row.put.iv_is_local(), theme),
         ChainCol::CallBid => dir_cell(row.call.bid, row.call.bid_dir, theme),
         ChainCol::CallAsk => dir_cell(row.call.ask, row.call.ask_dir, theme),
         ChainCol::CallMark => num_cell(fmt_price(row.call.mark)),
@@ -744,26 +998,36 @@ fn col_cell(
     }
 }
 
-/// A greek cell; the delta cell carries a subtle `~` origin glyph when the Greeks
-/// are ChainView's local computation (v0.2), never for venue-provided Greeks.
+/// A greek cell; it carries a subtle `~` origin glyph when **this specific field**
+/// is ChainView's local computation ([`LegView::greek_is_local`]) — so on a
+/// mixed-origin row the glyph badges the actual computed field (e.g. a local theta),
+/// never the trustworthy venue field beside it (e.g. a venue delta), and a leg with
+/// a local field but a `None` delta is still badged on that field. The glyph is an
+/// intensity/text marker, so it survives `NO_COLOR` (color is never the only signal).
 #[must_use]
 fn greek_cell(leg: &LegView, greek: GreekColumn, theme: Theme) -> Cell<'static> {
-    match greek {
-        GreekColumn::Delta => {
-            if matches!(leg.greeks_origin, GreeksOrigin::ComputedLocally) && leg.delta.is_some() {
-                let line = Line::from(vec![
-                    Span::raw(fmt_greek(leg.delta)),
-                    Span::styled("~", theme.warning()),
-                ])
-                .alignment(Alignment::Right);
-                Cell::from(line)
-            } else {
-                num_cell(fmt_greek(leg.delta))
-            }
-        }
-        GreekColumn::Gamma => num_cell(fmt_greek(leg.gamma)),
-        GreekColumn::Vega => num_cell(fmt_greek(leg.vega)),
-        GreekColumn::Theta => num_cell(fmt_greek(leg.theta)),
+    let value = match greek {
+        GreekColumn::Delta => leg.delta,
+        GreekColumn::Gamma => leg.gamma,
+        GreekColumn::Vega => leg.vega,
+        GreekColumn::Theta => leg.theta,
+    };
+    origin_num_cell(fmt_greek(value), leg.greek_is_local(greek), theme)
+}
+
+/// A right-aligned numeric cell that carries a trailing `~` origin glyph when
+/// `local` — the single place the origin marker is painted, shared by the Greek
+/// cells and the IV cell so they badge consistently. A non-local (venue/shared or
+/// absent) value renders as a plain [`num_cell`]. The glyph is a text marker legible
+/// under `NO_COLOR`.
+#[must_use]
+fn origin_num_cell(text: String, local: bool, theme: Theme) -> Cell<'static> {
+    if local {
+        let line = Line::from(vec![Span::raw(text), Span::styled("~", theme.warning())])
+            .alignment(Alignment::Right);
+        Cell::from(line)
+    } else {
+        num_cell(text)
     }
 }
 
@@ -984,21 +1248,21 @@ mod tests {
 
     use chrono::{DateTime, Utc};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use optionstratlib::OptionStyle;
     use optionstratlib::chains::OptionData;
     use optionstratlib::chains::chain::OptionChain;
     use optionstratlib::prelude::{Decimal, Positive};
+    use optionstratlib::{ExpirationDate, OptionStyle};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
     use super::{
         ChainRow, LegView, clamp_anchor, draw, greek_slots_for_width, handle_key, project_call,
-        project_iv, project_put, project_row, window_start,
+        project_iv, project_put, project_row, resolve_leg, window_start,
     };
     use crate::app::{LegFocus, LiveScreen, LiveState, Mode, ScreenLoad, Selection, SourceBinding};
     use crate::chain::{
-        AliasCatalog, ChainFetch, ChainSource, ChainStore, ExpirySource, GreeksOrigin, Instrument,
-        InstrumentKey, ProviderId, QuoteUpdate, StreamHealth, TickDir,
+        AliasCatalog, ChainFetch, ChainSource, ChainStore, ExpirySource, GreeksOrigin, GreeksRow,
+        Instrument, InstrumentKey, LegGreeks, ProviderId, QuoteUpdate, StreamHealth, TickDir,
     };
     use crate::chain::{ContractSpecFingerprint, ExerciseStyle, SettlementStyle};
     use crate::config::ThemeChoice;
@@ -1139,6 +1403,130 @@ mod tests {
         }
     }
 
+    /// A `LegGreeks` overriding only the named analytic fields on the empty leg
+    /// (every other field `None`, every origin defaulting to `ComputedLocally`).
+    fn mk_leg(
+        iv: Option<(Positive, GreeksOrigin)>,
+        delta: Option<Decimal>,
+        gamma: Option<(Decimal, GreeksOrigin)>,
+        theta: Option<Decimal>,
+        vega: Option<Decimal>,
+    ) -> LegGreeks {
+        let mut leg = LegGreeks::default();
+        if let Some((value, origin)) = iv {
+            leg.iv = Some(value);
+            leg.iv_origin = origin;
+        }
+        leg.delta = delta; // the sidecar delta is always the local fallback
+        if let Some((value, origin)) = gamma {
+            leg.gamma = Some(value);
+            leg.gamma_origin = origin;
+        }
+        leg.theta = theta;
+        leg.vega = vega;
+        leg
+    }
+
+    /// The absolute expiry a chain resolves to — the instant the analytics sidecar
+    /// keys on, so a read key and the sidecar agree.
+    #[track_caller]
+    fn resolved_expiry(chain: &OptionChain) -> DateTime<Utc> {
+        match chain.get_expiration() {
+            Some(ExpirationDate::DateTime(dt)) => dt,
+            other => panic!("expected an absolute-UTC chain expiry, got {other:?}"),
+        }
+    }
+
+    /// A store whose `ExpirySource` expiry matches the chain's resolved expiry, so
+    /// the sidecar's compute keys equal the UI read keys — the setup a
+    /// populated-Greeks projection assertion needs.
+    fn store_consistent(chain: OptionChain) -> ChainStore {
+        let exp = resolved_expiry(&chain);
+        ChainStore::seed(
+            ChainFetch::new(
+                chain,
+                ExpirySource::new("BTC", exp, pid("deribit")),
+                AliasCatalog::new(),
+            ),
+            ChainSource::Merged,
+            Duration::from_secs(2),
+            utc(EXP),
+        )
+    }
+
+    /// A venue Greeks row at an explicit expiry, so its key matches the sidecar's
+    /// compute key. Carries venue theta/vega/rho the sidecar deliberately discards.
+    fn greeks_at(
+        exp: DateTime<Utc>,
+        strike: f64,
+        style: OptionStyle,
+        iv: f64,
+        gamma: Decimal,
+    ) -> GreeksRow {
+        GreeksRow {
+            instrument: Instrument {
+                key: InstrumentKey {
+                    underlying: "BTC".to_owned(),
+                    expiration_utc: exp,
+                    strike: pos(strike),
+                    style,
+                },
+                provider: pid("deribit"),
+                native_symbol: format!("BTC-{strike}-{}", style.as_str()),
+                stream_symbol: None,
+                spec: spec(),
+            },
+            iv: Some(pos(iv)),
+            delta: None,
+            gamma: Some(gamma),
+            theta: Some(dec(-1, 1)),
+            vega: Some(dec(2, 1)),
+            rho: Some(dec(3, 1)),
+            origin: GreeksOrigin::Provider,
+            event_time: None,
+            received_time: utc(EXP + 10),
+        }
+    }
+
+    /// A strike row with realistic ATM premiums (so the local IV inversion converges
+    /// robustly) plus venue delta/gamma — the fixture the populated-Greeks
+    /// projection tests seed.
+    fn priced_row(strike: f64) -> OptionData {
+        let mut od = OptionData {
+            strike_price: pos(strike),
+            call_bid: Some(pos(3_000.0)),
+            call_ask: Some(pos(3_100.0)),
+            put_bid: Some(pos(2_000.0)),
+            put_ask: Some(pos(2_100.0)),
+            implied_volatility: pos(0.5),
+            delta_call: Some(dec(6, 1)),
+            delta_put: Some(dec(-4, 1)),
+            gamma: Some(dec(1, 2)),
+            ..Default::default()
+        };
+        od.set_mid_prices();
+        od
+    }
+
+    fn priced_chain(strikes: &[f64]) -> OptionChain {
+        let mut chain = OptionChain::new("BTC", pos(60_000.0), "2025-06-27".to_owned(), None, None);
+        for strike in strikes {
+            let _ = chain.options.insert(priced_row(*strike));
+        }
+        chain
+    }
+
+    /// A `Ready` live state around a prebuilt store — for render assertions over a
+    /// store whose sidecar keys match its read keys.
+    fn live_ready_from_store(store: ChainStore) -> LiveState {
+        let mut live = LiveState::new(
+            SourceBinding::new(pid("deribit"), caps(), StreamHealth::Live),
+            store,
+        );
+        live.load = ScreenLoad::Ready;
+        live
+    }
+
     #[track_caller]
     fn terminal(width: u16, height: u16) -> Terminal<TestBackend> {
         match Terminal::new(TestBackend::new(width, height)) {
@@ -1200,30 +1588,58 @@ mod tests {
             ..Default::default()
         };
         od.set_mid_prices();
-        let call = project_call(&od, TickDir::Flat, TickDir::Flat);
+        // No sidecar entry: the price sides project verbatim, the venue delta wins,
+        // gamma/theta/vega are absent (render `—`), and the call iv falls back to the
+        // shared od.implied_volatility as a Provider-origin value (the call-leg
+        // shared fallback), not a fabricated one.
+        let call = project_call(&od, None, TickDir::Flat, TickDir::Flat);
         assert_eq!(call.bid, Some(pos(1.0)), "present bid projects Some");
         assert_eq!(call.ask, None, "absent ask projects None (renders em dash)");
         assert_eq!(call.mark, None, "no mid without both sides -> None");
-        assert_eq!(call.delta, Some(dec(5, 1)));
-        assert_eq!(call.gamma, None, "absent gamma projects None");
-        // theta/vega are v0.2 -> always None.
-        assert_eq!(call.theta, None);
-        assert_eq!(call.vega, None);
+        assert_eq!(call.delta, Some(dec(5, 1)), "venue delta_call wins");
+        assert_eq!(call.gamma, None, "no sidecar entry -> gamma None");
+        assert_eq!(
+            call.iv,
+            Some(pos(0.5)),
+            "no sidecar -> call iv falls back to the shared od.implied_volatility"
+        );
+        assert_eq!(
+            call.iv_origin,
+            GreeksOrigin::Provider,
+            "the shared od IV fallback is Provider-origin (no local glyph)"
+        );
+        assert_eq!(call.theta, None, "no sidecar entry -> theta None");
+        assert_eq!(call.vega, None, "no sidecar entry -> vega None");
+        // The shared IV is Provider-origin and no local field resolved, so the row is
+        // Provider-origin (no glyph).
         assert_eq!(call.greeks_origin, GreeksOrigin::Provider);
     }
 
     #[test]
-    fn test_project_put_leg_reads_put_side_fields() {
+    fn test_project_put_leg_reads_put_side_fields_and_put_sidecar() {
         let od = full_row(60_000.0);
-        let put = project_put(&od, TickDir::Up, TickDir::Down);
+        // The put sidecar entry supplies iv/gamma (per style, not the shared field).
+        let put_leg = mk_leg(
+            Some((pos(0.6), GreeksOrigin::Provider)),
+            None,
+            Some((dec(3, 2), GreeksOrigin::Provider)),
+            None,
+            None,
+        );
+        let put = project_put(&od, Some(&put_leg), TickDir::Up, TickDir::Down);
         assert_eq!(put.bid, od.put_bid);
         assert_eq!(put.ask, od.put_ask);
         assert_eq!(put.mark, od.put_middle);
         assert_eq!(
             put.delta, od.delta_put,
-            "put reads delta_put, not delta_call"
+            "put reads the venue delta_put, not delta_call"
         );
-        assert_eq!(put.gamma, od.gamma, "gamma is shared per strike");
+        assert_eq!(
+            put.gamma,
+            Some(dec(3, 2)),
+            "put gamma is the put sidecar entry, not the shared od.gamma"
+        );
+        assert_eq!(put.iv, Some(pos(0.6)), "put iv is the put sidecar entry");
         assert_eq!(put.bid_dir, TickDir::Up);
         assert_eq!(put.ask_dir, TickDir::Down);
     }
@@ -1243,16 +1659,472 @@ mod tests {
     }
 
     #[test]
-    fn test_project_call_leg_absent_iv_zero_is_none() {
+    fn test_project_call_leg_absent_iv_zero_sidecar_is_none() {
         let od = OptionData {
             strike_price: pos(60_000.0),
-            implied_volatility: Positive::ZERO,
             ..Default::default()
         };
-        let call = project_call(&od, TickDir::Flat, TickDir::Flat);
+        // The sidecar can carry the venue's absent-IV zero sentinel; it still
+        // projects to None so the matrix renders `—`, never a fabricated 0.00%.
+        let leg = mk_leg(
+            Some((Positive::ZERO, GreeksOrigin::Provider)),
+            None,
+            None,
+            None,
+            None,
+        );
+        let call = project_call(&od, Some(&leg), TickDir::Flat, TickDir::Flat);
         assert_eq!(
             call.iv, None,
-            "a zero-sentinel IV projects None, not Some(0)"
+            "a zero-sentinel sidecar IV projects None, not Some(0)"
+        );
+        // The zero-IV field is not a present local field, so no origin glyph.
+        assert_eq!(call.greeks_origin, GreeksOrigin::Provider);
+    }
+
+    // --- Per-field §7 precedence (resolve_leg) -------------------------------
+
+    #[test]
+    fn test_resolve_leg_delta_prefers_venue_over_local() {
+        // A local sidecar delta is present, but a venue per-leg delta wins.
+        let leg = mk_leg(None, Some(dec(-9, 1)), None, None, None);
+        let v = resolve_leg(
+            Some(pos(1.0)),
+            Some(pos(1.2)),
+            Some(pos(1.1)),
+            Some(dec(6, 1)),
+            None,
+            Some(&leg),
+            (TickDir::Flat, TickDir::Flat),
+        );
+        assert_eq!(v.delta, Some(dec(6, 1)), "venue delta wins over local");
+        // Only the venue delta resolved -> Provider (no glyph).
+        assert_eq!(v.greeks_origin, GreeksOrigin::Provider);
+    }
+
+    #[test]
+    fn test_resolve_leg_delta_falls_back_to_local() {
+        // No venue delta -> the local sidecar delta is used, and it badges the row.
+        let leg = mk_leg(None, Some(dec(-9, 1)), None, Some(dec(-5, 2)), None);
+        let v = resolve_leg(
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&leg),
+            (TickDir::Flat, TickDir::Flat),
+        );
+        assert_eq!(
+            v.delta,
+            Some(dec(-9, 1)),
+            "no venue delta -> local fallback"
+        );
+        assert_eq!(v.greeks_origin, GreeksOrigin::ComputedLocally);
+    }
+
+    #[test]
+    fn test_resolve_leg_iv_gamma_carry_sidecar_origin() {
+        // Venue-origin iv/gamma (plus a venue delta) keep the row Provider.
+        let venue = mk_leg(
+            Some((pos(0.55), GreeksOrigin::Provider)),
+            None,
+            Some((dec(1, 4), GreeksOrigin::Provider)),
+            None,
+            None,
+        );
+        let v = resolve_leg(
+            None,
+            None,
+            None,
+            Some(dec(5, 1)),
+            None,
+            Some(&venue),
+            (TickDir::Flat, TickDir::Flat),
+        );
+        assert_eq!(v.iv, Some(pos(0.55)));
+        assert_eq!(v.gamma, Some(dec(1, 4)));
+        assert_eq!(
+            v.greeks_origin,
+            GreeksOrigin::Provider,
+            "venue iv/gamma + venue delta -> Provider"
+        );
+        // A locally-computed iv or gamma badges the row local.
+        let local = mk_leg(
+            Some((pos(0.6), GreeksOrigin::ComputedLocally)),
+            None,
+            Some((dec(2, 4), GreeksOrigin::ComputedLocally)),
+            None,
+            None,
+        );
+        let w = resolve_leg(
+            None,
+            None,
+            None,
+            Some(dec(5, 1)),
+            None,
+            Some(&local),
+            (TickDir::Flat, TickDir::Flat),
+        );
+        assert_eq!(w.iv, Some(pos(0.6)));
+        assert_eq!(w.gamma, Some(dec(2, 4)));
+        assert_eq!(w.greeks_origin, GreeksOrigin::ComputedLocally);
+    }
+
+    #[test]
+    fn test_resolve_leg_theta_vega_are_always_local() {
+        // theta/vega only ever come from the local sidecar; present ones badge the
+        // row local even alongside a venue delta (a mixed-origin row).
+        let leg = mk_leg(None, None, None, Some(dec(-5, 2)), Some(dec(3, 2)));
+        let v = resolve_leg(
+            None,
+            None,
+            None,
+            Some(dec(6, 1)),
+            None,
+            Some(&leg),
+            (TickDir::Flat, TickDir::Flat),
+        );
+        assert_eq!(v.theta, Some(dec(-5, 2)));
+        assert_eq!(v.vega, Some(dec(3, 2)));
+        assert_eq!(
+            v.greeks_origin,
+            GreeksOrigin::ComputedLocally,
+            "venue delta + local vega is a mixed-origin, locally-badged row"
+        );
+    }
+
+    #[test]
+    fn test_resolve_leg_absent_fields_stay_none_render_em_dash() {
+        // No venue delta and no sidecar entry: every analytic is None and renders
+        // `—`, never a fabricated 0.
+        let v = resolve_leg(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            (TickDir::Flat, TickDir::Flat),
+        );
+        assert_eq!(v.delta, None);
+        assert_eq!(v.iv, None);
+        assert_eq!(v.gamma, None);
+        assert_eq!(v.theta, None);
+        assert_eq!(v.vega, None);
+        assert_eq!(super::fmt_greek(v.theta), super::EM_DASH);
+        assert_eq!(super::fmt_greek(v.delta), super::EM_DASH);
+        assert_eq!(v.greeks_origin, GreeksOrigin::Provider);
+    }
+
+    // --- IV precedence: shared call-side fallback + the local plausibility floor ---
+
+    #[test]
+    fn test_resolve_iv_local_below_floor_clears_to_none() {
+        // (a) A locally-computed IV below the plausibility floor (0.5%) is
+        // economically implausible for a live quote -> cleared to None (renders `—`),
+        // never a fabricated near-zero percentage.
+        let leg = mk_leg(
+            Some((pos(0.0003), GreeksOrigin::ComputedLocally)),
+            None,
+            None,
+            None,
+            None,
+        );
+        // No shared IV (put-like), so the sub-floor local value is not rescued.
+        let v = resolve_leg(
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&leg),
+            (TickDir::Flat, TickDir::Flat),
+        );
+        assert_eq!(v.iv, None, "a sub-0.5% local IV is floored to None");
+        assert_eq!(super::fmt_iv(v.iv), super::EM_DASH);
+    }
+
+    #[test]
+    fn test_resolve_iv_local_above_floor_still_shows() {
+        // (b) A legitimate provider-computed IV (e.g. IG equities, always >> 0.5%)
+        // clears the floor and renders as a percentage with the local-origin badge.
+        let leg = mk_leg(
+            Some((pos(0.25), GreeksOrigin::ComputedLocally)),
+            None,
+            None,
+            None,
+            None,
+        );
+        let v = resolve_leg(
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&leg),
+            (TickDir::Flat, TickDir::Flat),
+        );
+        assert_eq!(v.iv, Some(pos(0.25)), "an at/above-floor local IV survives");
+        assert_eq!(v.iv_origin, GreeksOrigin::ComputedLocally);
+        assert!(v.iv_is_local(), "a present local IV badges the IV cell");
+        assert_eq!(super::fmt_iv(v.iv), "25.00%");
+    }
+
+    #[test]
+    fn test_resolve_iv_venue_below_floor_is_never_cleared() {
+        // (c) A VENUE (Provider) IV is trusted even below the plausibility floor —
+        // only the exact-zero absent sentinel clears a venue IV, never the floor.
+        let leg = mk_leg(
+            Some((pos(0.001), GreeksOrigin::Provider)),
+            None,
+            None,
+            None,
+            None,
+        );
+        let v = resolve_leg(
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&leg),
+            (TickDir::Flat, TickDir::Flat),
+        );
+        assert_eq!(
+            v.iv,
+            Some(pos(0.001)),
+            "a sub-floor venue IV is trusted, not floored"
+        );
+        assert_eq!(v.iv_origin, GreeksOrigin::Provider);
+        assert!(!v.iv_is_local(), "a venue IV is never badged local");
+    }
+
+    #[test]
+    fn test_resolve_iv_call_shared_fallback_is_provider_origin() {
+        // (d) The sidecar holds only a near-zero LOCAL IV, but the call passes its
+        // shared od.implied_volatility -> the honest venue call-side value wins as a
+        // Provider-origin IV (not the floored local garbage).
+        let od = OptionData {
+            strike_price: pos(60_000.0),
+            implied_volatility: pos(0.4922),
+            delta_call: Some(dec(6, 1)),
+            ..Default::default()
+        };
+        let leg = mk_leg(
+            Some((pos(0.00003), GreeksOrigin::ComputedLocally)),
+            None,
+            None,
+            Some(dec(-1, 1)),
+            None,
+        );
+        let call = project_call(&od, Some(&leg), TickDir::Flat, TickDir::Flat);
+        assert_eq!(
+            call.iv,
+            Some(pos(0.4922)),
+            "the shared od IV wins over the near-zero local"
+        );
+        assert_eq!(
+            call.iv_origin,
+            GreeksOrigin::Provider,
+            "the shared od IV fallback is Provider-origin"
+        );
+        assert!(!call.iv_is_local(), "no local glyph on the shared venue IV");
+    }
+
+    #[test]
+    fn test_resolve_iv_put_ignores_shared_field_no_collision() {
+        // (e) The shared od.implied_volatility is the CALL-side value (§7). A strike
+        // whose shared field is set but whose PUT sidecar has no per-style venue IV
+        // shows put IV `—`, never the call's value — the call/put collision the
+        // style-keyed sidecar exists to prevent.
+        let od = OptionData {
+            strike_price: pos(60_000.0),
+            implied_volatility: pos(0.4922),
+            delta_put: Some(dec(-4, 1)),
+            ..Default::default()
+        };
+        // Put sidecar: a near-zero LOCAL IV (floored) and no venue IV.
+        let leg = mk_leg(
+            Some((pos(0.002), GreeksOrigin::ComputedLocally)),
+            None,
+            None,
+            Some(dec(-1, 1)),
+            None,
+        );
+        let put = project_put(&od, Some(&leg), TickDir::Flat, TickDir::Flat);
+        assert_eq!(
+            put.iv, None,
+            "the put never inherits the call-side shared IV"
+        );
+        assert_eq!(super::fmt_iv(put.iv), super::EM_DASH);
+    }
+
+    #[test]
+    fn test_origin_glyph_badges_present_local_field_not_venue_delta() {
+        // (f) The origin glyph appears iff a PRESENT resolved field is local, badging
+        // the actual computed cell — not the trustworthy venue delta beside it.
+        // Mixed-origin: venue delta (Provider) + local theta.
+        let mixed = mk_leg(None, None, None, Some(dec(-5, 2)), None);
+        let v = resolve_leg(
+            None,
+            None,
+            None,
+            Some(dec(6, 1)),
+            None,
+            Some(&mixed),
+            (TickDir::Flat, TickDir::Flat),
+        );
+        assert!(
+            !v.greek_is_local(GreekColumn::Delta),
+            "the venue delta is not badged"
+        );
+        assert!(
+            v.greek_is_local(GreekColumn::Theta),
+            "the local theta is badged"
+        );
+        // A leg with a local theta but NO delta at all (None) still badges the theta,
+        // where the old delta-gated glyph would have shown nothing.
+        let no_delta = mk_leg(None, None, None, Some(dec(-5, 2)), None);
+        let w = resolve_leg(
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&no_delta),
+            (TickDir::Flat, TickDir::Flat),
+        );
+        assert_eq!(w.delta, None, "no delta at all");
+        assert!(
+            !w.greek_is_local(GreekColumn::Delta),
+            "an absent delta is never badged"
+        );
+        assert!(
+            w.greek_is_local(GreekColumn::Theta),
+            "the local theta still badges with a None delta"
+        );
+        assert_eq!(
+            w.greeks_origin,
+            GreeksOrigin::ComputedLocally,
+            "rollup preserved: any present local field -> row local"
+        );
+        // A fully-venue leg (venue delta + venue iv/gamma) badges nothing.
+        let venue = mk_leg(
+            Some((pos(0.5), GreeksOrigin::Provider)),
+            None,
+            Some((dec(1, 4), GreeksOrigin::Provider)),
+            None,
+            None,
+        );
+        let f = resolve_leg(
+            None,
+            None,
+            None,
+            Some(dec(5, 1)),
+            None,
+            Some(&venue),
+            (TickDir::Flat, TickDir::Flat),
+        );
+        assert!(!f.greek_is_local(GreekColumn::Delta));
+        assert!(!f.greek_is_local(GreekColumn::Gamma));
+        assert!(!f.iv_is_local());
+        assert_eq!(f.greeks_origin, GreeksOrigin::Provider);
+    }
+
+    // --- Store-fed projection: sidecar populated, unequal legs survive -------
+
+    #[test]
+    fn test_project_row_populates_local_theta_vega_from_sidecar() {
+        let chain = priced_chain(&[60_000.0]);
+        let exp = resolved_expiry(&chain);
+        let store = store_consistent(chain);
+        let od = match store.chain().options.iter().next() {
+            Some(od) => od.clone(),
+            None => panic!("expected one row"),
+        };
+        let row = project_row(
+            &od,
+            pos(60_000.0),
+            &store,
+            "BTC",
+            exp,
+            store.last_full_poll(),
+        );
+        // The seed recompute filled the local analytics for the call leg.
+        assert!(row.call.theta.is_some(), "local theta populated");
+        assert!(row.call.vega.is_some(), "local vega populated");
+        assert!(row.call.gamma.is_some(), "local gamma populated");
+        // The call iv resolves — the shared od.implied_volatility fallback outranks
+        // the local inversion at seed, so it is Some regardless.
+        assert!(row.call.iv.is_some(), "call iv resolves");
+        // Venue delta is present, so delta resolves to it, but the local theta/vega
+        // make the row ComputedLocally (a mixed-origin row).
+        assert_eq!(row.call.delta, od.delta_call);
+        assert_eq!(row.call.greeks_origin, GreeksOrigin::ComputedLocally);
+    }
+
+    #[test]
+    fn test_unequal_call_put_iv_gamma_survive_projection_both_orders() {
+        // The shared-field-loss fix: unequal call/put venue iv/gamma both survive,
+        // independent of the arrival order (the style-keyed sidecar).
+        let project_both = |call_first: bool| -> (LegView, LegView) {
+            let chain = priced_chain(&[60_000.0]);
+            let exp = resolved_expiry(&chain);
+            let mut store = store_consistent(chain);
+            let call = greeks_at(exp, 60_000.0, OptionStyle::Call, 0.40, dec(1, 2));
+            let put = greeks_at(exp, 60_000.0, OptionStyle::Put, 0.60, dec(2, 2));
+            if call_first {
+                let _ = store.apply_greeks(&call);
+                let _ = store.apply_greeks(&put);
+            } else {
+                let _ = store.apply_greeks(&put);
+                let _ = store.apply_greeks(&call);
+            }
+            let od = match store.chain().options.iter().next() {
+                Some(od) => od.clone(),
+                None => panic!("expected one row"),
+            };
+            let row = project_row(
+                &od,
+                pos(60_000.0),
+                &store,
+                "BTC",
+                exp,
+                store.last_full_poll(),
+            );
+            (row.call, row.put)
+        };
+        for call_first in [true, false] {
+            let (call, put) = project_both(call_first);
+            assert_eq!(
+                call.iv,
+                Some(pos(0.40)),
+                "call iv preserved (order={call_first})"
+            );
+            assert_eq!(
+                put.iv,
+                Some(pos(0.60)),
+                "put iv preserved (order={call_first})"
+            );
+            assert_eq!(call.gamma, Some(dec(1, 2)), "call gamma preserved");
+            assert_eq!(put.gamma, Some(dec(2, 2)), "put gamma preserved");
+            assert_ne!(call.iv, put.iv, "unequal call/put iv both survive");
+            assert_ne!(call.gamma, put.gamma, "unequal call/put gamma both survive");
+        }
+    }
+
+    #[test]
+    fn test_populated_matrix_shows_origin_glyph_for_local_greeks() {
+        // A consistent-expiry store: the seed recompute fills local theta/vega, so
+        // the rows are ComputedLocally and carry the `~` origin glyph.
+        let live = live_ready_from_store(store_consistent(priced_chain(&[
+            59_000.0, 60_000.0, 61_000.0,
+        ])));
+        let text = rendered(&live, 160, 20);
+        assert!(
+            text.contains('~'),
+            "a locally-computed row shows the origin glyph"
         );
     }
 
@@ -1373,12 +2245,11 @@ mod tests {
         );
     }
 
-    // --- v0.1 column set is {Delta, Gamma} only (Theta/Vega omitted) ---------
+    // --- v0.2 column set: Δ always + responsive Γ→ν→Θ drop order -------------
 
     #[test]
-    fn test_columns_v01_set_is_delta_and_gamma_only() {
-        // Θ/ν are always empty until the v0.2 sidecar, so the v0.1 column set never
-        // includes them; Γ (which carries `od.gamma`) shows once one slot fits.
+    fn test_columns_full_greek_set_honors_drop_order() {
+        use crate::ui::theme::greek_columns_for_slots;
         let call_greeks = |plan: &[super::ChainCol]| -> Vec<GreekColumn> {
             plan.iter()
                 .filter_map(|col| match col {
@@ -1387,41 +2258,67 @@ mod tests {
                 })
                 .collect()
         };
+        // Δ only at 0 slots; Θ retained first (1), then ν (2), then Γ (3).
         assert_eq!(
-            call_greeks(&super::columns(true)),
-            vec![GreekColumn::Delta, GreekColumn::Gamma],
-            "wide: Delta and Gamma",
-        );
-        assert_eq!(
-            call_greeks(&super::columns(false)),
+            call_greeks(&super::columns(greek_columns_for_slots(0))),
             vec![GreekColumn::Delta],
-            "narrow: Delta only",
+            "0 slots: Delta only",
         );
-        // No Theta/Vega column ever appears in v0.1.
-        for show_gamma in [true, false] {
-            assert!(
-                !super::columns(show_gamma).iter().any(|col| matches!(
-                    col,
-                    super::ChainCol::CallGreek(GreekColumn::Theta | GreekColumn::Vega)
-                        | super::ChainCol::PutGreek(GreekColumn::Theta | GreekColumn::Vega)
-                )),
-                "no always-empty Theta/Vega column in v0.1",
-            );
-        }
+        assert_eq!(
+            call_greeks(&super::columns(greek_columns_for_slots(1))),
+            vec![GreekColumn::Delta, GreekColumn::Theta],
+            "1 slot: Delta + Theta (Θ retained first)",
+        );
+        assert_eq!(
+            call_greeks(&super::columns(greek_columns_for_slots(2))),
+            vec![GreekColumn::Delta, GreekColumn::Vega, GreekColumn::Theta],
+            "2 slots: adds Vega",
+        );
+        assert_eq!(
+            call_greeks(&super::columns(greek_columns_for_slots(3))),
+            vec![
+                GreekColumn::Delta,
+                GreekColumn::Gamma,
+                GreekColumn::Vega,
+                GreekColumn::Theta,
+            ],
+            "3 slots: adds Gamma (dropped first as width shrinks)",
+        );
+        // The put side mirrors the call side (Δ outermost on the far right).
+        let put_greeks: Vec<GreekColumn> = super::columns(greek_columns_for_slots(3))
+            .iter()
+            .filter_map(|col| match col {
+                super::ChainCol::PutGreek(greek) => Some(*greek),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            put_greeks,
+            vec![
+                GreekColumn::Theta,
+                GreekColumn::Vega,
+                GreekColumn::Gamma,
+                GreekColumn::Delta,
+            ],
+            "put side mirrors the call side",
+        );
     }
 
     #[test]
-    fn test_draw_matrix_shows_gamma_column_at_common_width() {
-        // The v0.1 fix: on a common 120-col terminal the matrix shows Γ (real data),
-        // never an empty Θ column in its place.
-        let live = live_with(
-            chain_with(&[59_000.0, 60_000.0, 61_000.0]),
-            ScreenLoad::Ready,
-        );
-        let wide = rendered(&live, 120, 20);
-        assert!(wide.contains("Γ"), "gamma column shows at 120 cols");
-        assert!(!wide.contains("Θ"), "no always-empty theta column in v0.1");
-        assert!(!wide.contains("ν"), "no always-empty vega column in v0.1");
+    fn test_draw_matrix_greek_columns_are_responsive() {
+        let live = live_ready_from_store(store_consistent(priced_chain(&[
+            59_000.0, 60_000.0, 61_000.0,
+        ])));
+        // A common 120-col terminal fits one optional greek: Θ (retained first),
+        // not Γ (which needs the widest layout).
+        let common = rendered(&live, 120, 20);
+        assert!(common.contains("Θ"), "theta column shows at 120 cols");
+        assert!(!common.contains("Γ"), "gamma needs a wider terminal");
+        // A wide terminal fits all three optional greeks.
+        let wide = rendered(&live, 200, 20);
+        assert!(wide.contains("Γ"), "gamma shows on a wide terminal");
+        assert!(wide.contains("ν"), "vega shows on a wide terminal");
+        assert!(wide.contains("Θ"), "theta shows on a wide terminal");
     }
 
     // --- fmt_iv never panics at the render edge on an absurd magnitude -------
@@ -1633,6 +2530,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_draw_leaves_sidecar_unchanged_no_pricing_in_draw() {
+        // A consistent-expiry store so the read key hits a real sidecar entry; the
+        // projection reads the cached analytics and must invoke no pricing/recompute
+        // in `draw` (the entry is byte-identical before and after a draw).
+        let chain = priced_chain(&[60_000.0]);
+        let exp = resolved_expiry(&chain);
+        let live = live_ready_from_store(store_consistent(chain));
+        let key = InstrumentKey {
+            underlying: "BTC".to_owned(),
+            expiration_utc: exp,
+            strike: pos(60_000.0),
+            style: OptionStyle::Call,
+        };
+        let before = live.store.leg_greeks(&key).copied();
+        assert!(before.is_some(), "the seeded sidecar entry is present");
+        let _ = rendered(&live, 160, 40);
+        let after = live.store.leg_greeks(&key).copied();
+        assert_eq!(
+            before, after,
+            "draw reads the cached sidecar and never recomputes or mutates it",
+        );
+    }
+
     // --- handle_key: nav resolves through the keymap, mutates local state ----
 
     #[test]
@@ -1715,8 +2636,8 @@ mod tests {
         let od = full_row(60_000.0);
         let row: ChainRow = ChainRow {
             strike: od.strike_price,
-            call: project_call(&od, TickDir::Flat, TickDir::Flat),
-            put: project_put(&od, TickDir::Flat, TickDir::Flat),
+            call: project_call(&od, None, TickDir::Flat, TickDir::Flat),
+            put: project_put(&od, None, TickDir::Flat, TickDir::Flat),
             strike_relation: StrikeRelation::AtSpot,
         };
         // Copy: using the value twice compiles without a move error.
