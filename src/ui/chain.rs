@@ -81,7 +81,10 @@ use ratatui::widgets::{Block, Cell, Paragraph, Row, Table};
 
 use crate::app::keymap::{ChainAction, KeyChord, resolve_chain};
 use crate::app::{LegFocus, LiveState, ScreenLoad};
-use crate::chain::{ChainStore, GreeksOrigin, InstrumentKey, LegGreeks, StreamHealth, TickDir};
+use crate::chain::{
+    ChainStore, GreeksOrigin, InstrumentKey, LegGreeks, MIN_PLAUSIBLE_LOCAL_IV, StreamHealth,
+    TickDir,
+};
 use crate::event::AppEvent;
 use crate::ui::theme::{
     GreekColumn, GreekColumns, StrikeRelation, Theme, greek_columns_for_slots, health_span,
@@ -380,20 +383,6 @@ fn resolve_iv(
     }
     (None, GreeksOrigin::Provider)
 }
-
-/// The smallest implied volatility, **as a fraction** (`0.005` = 0.5%; IV is stored
-/// as a fraction, so `0.4922` renders `49.22%`), that a **locally computed** IV must
-/// reach to be plausible enough to display.
-///
-/// A live listed option quoting real premium with a sub-0.5% IV is economically
-/// implausible — the same reasoning as the exact-zero absent-IV sentinel
-/// ([`project_iv`]): such a near-zero value is almost always a mispriced/garbage
-/// local inversion (e.g. a Deribit inverse, BTC-settled contract whose premium is
-/// priced as USD), not a real quote. A locally-computed IV below this floor is
-/// cleared to `—` rather than painted as a fabricated-looking near-zero percentage.
-/// A **venue** (`Provider`) IV is trusted and never floored — the exact-zero
-/// sentinel already handles a venue absent-zero.
-const MIN_PLAUSIBLE_LOCAL_IV: Decimal = Decimal::from_parts(5, 0, 0, false, 3);
 
 /// Project the non-`Option` [`OptionData::implied_volatility`] into a
 /// `LegView.iv` **honestly** (the "Absent-IV vs 0% IV" decision from #15).

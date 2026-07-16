@@ -93,6 +93,22 @@ pub const DEFAULT_DIVIDEND_YIELD: Positive = Positive::ZERO;
 /// `ExpirationDate::Days` pricing input.
 const SECONDS_PER_DAY: i64 = 86_400;
 
+/// The smallest **locally computed** implied volatility, as a fraction
+/// (`0.005` = 0.5%; IV is a fraction, so `0.4922` renders `49.22%`), that is
+/// economically plausible enough to feed a display analytic.
+///
+/// A live listed option quoting real premium with a sub-0.5% IV is almost always
+/// a mispriced/garbage **local** inversion — e.g. a Deribit inverse, BTC-settled
+/// contract whose premium is denominated in the wrong currency (issue #83) — not a
+/// real quote; the same reasoning as the exact-zero absent-IV sentinel. This is the
+/// **domain** home of that floor so both IV consumers share one definition: the
+/// chain matrix (`src/ui/chain.rs`, #25) clears a sub-floor `ComputedLocally` IV to
+/// `—`, and the payoff t+0 curve (`src/app/payoff_build.rs`, #27) treats a sub-floor
+/// `ComputedLocally` leg IV as "no reliable IV" and renders the t+0 curve
+/// unavailable while the IV-independent expiration curve still renders. A **venue**
+/// (`Provider`) IV is trusted and never floored.
+pub const MIN_PLAUSIBLE_LOCAL_IV: Decimal = Decimal::from_parts(5, 0, 0, false, 3);
+
 // --- Pricing model and quote-selection policy ---------------------------------
 
 /// The exercise / pricing model the local engine applies

@@ -748,6 +748,7 @@ mod tests {
     use crate::app::tests_support::{live_app_caps, live_app_on, replay_app_on};
     use crate::app::{LiveScreen, ReplayScreen, ScreenLoad};
     use crate::providers::{ChainCapability, GreeksCapability, ProviderCapabilities};
+    use crate::ui::view::ViewState;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use proptest::prelude::*;
     use ratatui::Terminal;
@@ -769,8 +770,10 @@ mod tests {
     /// The full-frame text as a single string (row-major), for overlay assertions.
     #[track_caller]
     fn rendered_frame(app: &App, width: u16, height: u16) -> String {
+        let mut view = ViewState::new();
+        view.sync(app);
         let mut term = terminal(width, height);
-        match term.draw(|frame| crate::render(app, frame)) {
+        match term.draw(|frame| crate::render(app, &view, frame)) {
             Ok(_) => {}
             Err(e) => panic!("render failed: {e}"),
         }
@@ -1129,8 +1132,10 @@ mod tests {
         // The full render path shows the cross-screen "widen the terminal" state
         // below the minimum size instead of a screen body.
         let app = live_app_on(LiveScreen::Chain, ScreenLoad::Ready, false);
+        let mut view = ViewState::new();
+        view.sync(&app);
         let mut term = terminal(30, 6);
-        match term.draw(|frame| crate::render(&app, frame)) {
+        match term.draw(|frame| crate::render(&app, &view, frame)) {
             Ok(_) => {}
             Err(e) => panic!("render failed: {e}"),
         }

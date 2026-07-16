@@ -75,6 +75,7 @@ use super::render;
 use crate::app::{App, EventBridge, KeyRoute, LiveScreen, Mode, ReplayScreen, Selection};
 use crate::error::ChainViewError;
 use crate::event::{AppEvent, Command};
+use crate::ui::view::ViewState;
 use crate::ui::{chain, depth, payoff, replay, surface};
 
 /// Capacity of the bounded `AppEvent` channel the render loop parks on
@@ -121,6 +122,10 @@ pub fn event_channel() -> (mpsc::Sender<AppEvent>, mpsc::Receiver<AppEvent>) {
 /// `route` receives every [`Command`] the fold produces (via the bridge) so the
 /// data layer (#11/#16) can act on it; in this issue's scope it may be a no-op.
 ///
+/// `view` is the ui view-cache (`src/ui/view.rs`): the loop [`sync`](ViewState::sync)s
+/// it between the event fold and the draw so the payoff projection (#27) is computed
+/// **off** the draw path, and the draw reads it as a borrow.
+///
 /// # Errors
 ///
 /// [`ChainViewError::Terminal`] if the backend rejects a draw.
@@ -128,6 +133,7 @@ pub fn run_render_loop<B, R>(
     terminal: &mut Terminal<B>,
     app: &mut App,
     bridge: &mut EventBridge,
+    view: &mut ViewState,
     rx_events: &mut mpsc::Receiver<AppEvent>,
     mut route: R,
 ) -> Result<(), ChainViewError>
@@ -136,14 +142,15 @@ where
     R: FnMut(Command),
 {
     // The first frame: `App::dirty` starts true, so the initial state paints
-    // before the loop parks (§7).
+    // before the loop parks (§7). Sync the view cache off the draw path first.
     if app.dirty {
-        draw_frame(terminal, app)?;
+        view.sync(app);
+        draw_frame(terminal, app, view)?;
     }
     // Event-driven: park on the async channel from this dedicated blocking thread.
     // `None` means every producer half was dropped (shutdown) — end the loop.
     while let Some(event) = rx_events.blocking_recv() {
-        let outcome = step(terminal, app, bridge, event, &mut route)?;
+        let outcome = step(terminal, app, bridge, view, event, &mut route)?;
         if outcome.quit {
             break;
         }
@@ -162,12 +169,13 @@ struct StepOutcome {
 }
 
 /// Process one event: fold it (two-level key dispatch), pump the bridge between
-/// frames, and redraw **iff** dirty — clearing dirty after the draw
-/// (`docs/02-tui-architecture.md` §7, §8).
+/// frames, sync the view cache off the draw path, and redraw **iff** dirty —
+/// clearing dirty after the draw (`docs/02-tui-architecture.md` §7, §8).
 fn step<B, R>(
     terminal: &mut Terminal<B>,
     app: &mut App,
     bridge: &mut EventBridge,
+    view: &mut ViewState,
     event: AppEvent,
     route: &mut R,
 ) -> Result<StepOutcome, ChainViewError>
@@ -180,7 +188,10 @@ where
     // control channel + the coalesced quotes/Greeks/depth, and routes commands).
     bridge.pump(app, &mut *route);
     let redrawn = if app.dirty {
-        draw_frame(terminal, app)?;
+        // Re-project any changed screen geometry (the payoff series, #27) off the
+        // draw path — mirrors where `mark_drawn` runs — so the paint stays pure.
+        view.sync(app);
+        draw_frame(terminal, app, view)?;
         true
     } else {
         false
@@ -191,16 +202,21 @@ where
     })
 }
 
-/// Draw one frame from `app` and clear [`App::dirty`]
+/// Draw one frame from `app` + the synced view cache and clear [`App::dirty`]
 /// (`docs/02-tui-architecture.md` §7, §8).
 ///
-/// The draw closure borrows `app` **immutably** (via `view`), so [`render`] stays
-/// a pure function of `&App`; [`mark_drawn`](crate::App::mark_drawn) runs after the
-/// borrow ends.
-fn draw_frame<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<(), ChainViewError> {
-    let view: &App = app;
+/// The draw closure borrows `app` and `view` **immutably**, so [`render`] stays a
+/// pure function of `&App` + `&ViewState`; [`mark_drawn`](crate::App::mark_drawn)
+/// runs after the borrow ends. The view was already synced (off the draw path) by
+/// the caller.
+fn draw_frame<B: Backend>(
+    terminal: &mut Terminal<B>,
+    app: &mut App,
+    view: &ViewState,
+) -> Result<(), ChainViewError> {
+    let view_app: &App = app;
     terminal
-        .draw(|frame| render(view, frame))
+        .draw(|frame| render(view_app, view, frame))
         .map_err(|e| ChainViewError::Terminal(e.to_string()))?;
     app.mark_drawn();
     Ok(())
@@ -411,6 +427,7 @@ mod tests {
     use crate::app::tests_support::{live_app, replay_app};
     use crate::app::{EventBridge, LiveScreen, Mode, ReplayScreen, ScreenLoad};
     use crate::event::{AppEvent, Command, SeekTo};
+    use crate::ui::view::ViewState;
 
     #[track_caller]
     fn test_terminal() -> Terminal<TestBackend> {
@@ -438,12 +455,14 @@ mod tests {
         let (mut app, _rx) = live_app(LiveScreen::Chain, ScreenLoad::Ready, false);
         assert!(!app.dirty, "the app is clean after the initial frame");
         let (mut bridge, _senders) = EventBridge::new(64);
+        let mut view = ViewState::new();
         let mut terminal = test_terminal();
         let mut route = noop_route();
         let outcome = match step(
             &mut terminal,
             &mut app,
             &mut bridge,
+            &mut view,
             AppEvent::Tick,
             &mut route,
         ) {
@@ -465,12 +484,14 @@ mod tests {
     fn test_step_resize_redraws_and_clears_dirty() {
         let (mut app, _rx) = live_app(LiveScreen::Chain, ScreenLoad::Loading, false);
         let (mut bridge, _senders) = EventBridge::new(64);
+        let mut view = ViewState::new();
         let mut terminal = test_terminal();
         let mut route = noop_route();
         let outcome = match step(
             &mut terminal,
             &mut app,
             &mut bridge,
+            &mut view,
             AppEvent::Resize(100, 30),
             &mut route,
         ) {
@@ -486,12 +507,14 @@ mod tests {
     fn test_step_quit_key_redraws_final_frame_and_signals_stop() {
         let (mut app, _rx) = live_app(LiveScreen::Chain, ScreenLoad::Loading, false);
         let (mut bridge, _senders) = EventBridge::new(64);
+        let mut view = ViewState::new();
         let mut terminal = test_terminal();
         let mut route = noop_route();
         let outcome = match step(
             &mut terminal,
             &mut app,
             &mut bridge,
+            &mut view,
             AppEvent::Key(key(KeyCode::Char('q'))),
             &mut route,
         ) {
@@ -517,7 +540,15 @@ mod tests {
         let _ = tx.try_send(AppEvent::Resize(100, 30));
         let _ = tx.try_send(AppEvent::Tick);
         drop(tx);
-        match run_render_loop(&mut terminal, &mut app, &mut bridge, &mut rx, noop_route()) {
+        let mut view = ViewState::new();
+        match run_render_loop(
+            &mut terminal,
+            &mut app,
+            &mut bridge,
+            &mut view,
+            &mut rx,
+            noop_route(),
+        ) {
             Ok(()) => {}
             Err(e) => panic!("render loop failed: {e}"),
         }
@@ -535,7 +566,15 @@ mod tests {
         // Keep the sender OPEN: the loop must break on quit, not wait for close.
         let _keep_open = tx.clone();
         drop(tx);
-        match run_render_loop(&mut terminal, &mut app, &mut bridge, &mut rx, noop_route()) {
+        let mut view = ViewState::new();
+        match run_render_loop(
+            &mut terminal,
+            &mut app,
+            &mut bridge,
+            &mut view,
+            &mut rx,
+            noop_route(),
+        ) {
             Ok(()) => {}
             Err(e) => panic!("render loop failed: {e}"),
         }

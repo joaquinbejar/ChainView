@@ -19,7 +19,7 @@
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
-use chainview::{bench_support, render};
+use chainview::{ViewState, bench_support, render};
 use criterion::Criterion;
 use hdrhistogram::Histogram;
 use ratatui::Terminal;
@@ -62,12 +62,14 @@ fn hdr_report() {
             return;
         }
     };
+    let mut view = ViewState::new();
+    view.sync(&app);
     for _ in 0..WARMUP {
-        let _ = terminal.draw(|frame| render(&app, frame));
+        let _ = terminal.draw(|frame| render(&app, &view, frame));
     }
     for _ in 0..SAMPLES {
         let start = Instant::now();
-        let _ = terminal.draw(|frame| render(black_box(&app), frame));
+        let _ = terminal.draw(|frame| render(black_box(&app), &view, frame));
         record(&mut hist, start);
     }
     report(
@@ -88,9 +90,11 @@ fn criterion_bench(c: &mut Criterion) {
             return;
         }
     };
+    let mut view = ViewState::new();
+    view.sync(&app);
     c.bench_function("render_chain_120x40", |b| {
         b.iter(|| {
-            let _ = terminal.draw(|frame| render(black_box(&app), frame));
+            let _ = terminal.draw(|frame| render(black_box(&app), &view, frame));
         });
     });
 }

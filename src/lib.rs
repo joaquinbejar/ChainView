@@ -80,6 +80,7 @@ pub use event::{AppEvent, Command, SeekTo};
 pub use ui::driver::{
     EVENT_CHANNEL_CAPACITY, event_channel, run_render_loop, spawn_input_reader, spawn_tick_task,
 };
+pub use ui::view::ViewState;
 pub use ui::{RootLayout, layout_root, render};
 // The chain-matrix view models (`src/ui/chain.rs`, issue #18,
 // `docs/01-domain-model.md` §8): `ChainRow`/`LegView`, projected from the domain

@@ -39,6 +39,7 @@ use ratatui::widgets::{Block, Paragraph};
 
 use crate::app::{App, LiveScreen, Mode, ReplayScreen};
 use crate::ui::theme::Theme;
+use crate::ui::view::ViewState;
 
 pub mod chain;
 pub mod depth;
@@ -48,6 +49,7 @@ pub mod payoff;
 pub mod replay;
 pub mod surface;
 pub mod theme;
+pub mod view;
 
 // The render-golden test support (#19): render a screen into a fixed-size
 // `TestBackend`, capture the buffer as text, and compare against — or, under
@@ -95,19 +97,21 @@ pub fn layout_root(area: Rect) -> RootLayout {
 // The total, wildcard-free draw dispatch (§7).
 // ---------------------------------------------------------------------------
 
-/// Draw the whole frame from `app` — the **pure**, total, wildcard-free draw
-/// dispatch (`docs/02-tui-architecture.md` §7).
+/// Draw the whole frame from `app` and the ui view cache — the **pure**, total,
+/// wildcard-free draw dispatch (`docs/02-tui-architecture.md` §7).
 ///
-/// Takes `&App` (never `&mut`), so a draw cannot mutate state or perform I/O. The
-/// dispatch is a total match — the mode first, then an exhaustive match over that
-/// mode's screens with **no `_` arm** — so a new screen forces the matching mode
-/// arm to be revisited by the compiler.
+/// Takes `&App` and `&ViewState` (never `&mut`), so a draw cannot mutate state or
+/// perform I/O — the projected geometry the payoff screen reads was computed off the
+/// draw path by [`ViewState::sync`] before this call. The dispatch is a total match
+/// — the mode first, then an exhaustive match over that mode's screens with **no
+/// `_` arm** — so a new screen forces the matching mode arm to be revisited by the
+/// compiler.
 ///
 /// The resolved [`Theme`] (auto/dark/light + `NO_COLOR`) is computed once here and
 /// passed to the status bar, keybar, and help overlay. Below the minimum terminal
 /// size ([`theme::is_too_small`]) any screen shows the cross-screen "widen the
 /// terminal" state instead of a corrupt layout (`docs/05-views-and-ux.md` §8).
-pub fn render(app: &App, frame: &mut Frame) {
+pub fn render(app: &App, view: &ViewState, frame: &mut Frame) {
     let area = frame.area();
     let theme = Theme::resolve(app.theme, app.no_color);
     if theme::is_too_small(area) {
@@ -128,7 +132,9 @@ pub fn render(app: &App, frame: &mut Frame) {
             }
             LiveScreen::Depth => depth::draw(state, frame, root.body),
             LiveScreen::Surface => surface::draw(state, frame, root.body),
-            LiveScreen::Payoff => payoff::draw(state, frame, root.body, theme),
+            // The payoff line reads only the cached projection the view synced off
+            // the draw path — this paint builds no `GraphData` (#27).
+            LiveScreen::Payoff => payoff::draw(state, view.payoff(), frame, root.body, theme),
         },
         Mode::Replay(state) => match state.screen {
             ReplayScreen::Replay => replay::draw(state, frame, root.body),
@@ -188,6 +194,7 @@ mod tests {
     use super::{layout_root, render};
     use crate::app::tests_support::{live_app_on, replay_app_on};
     use crate::app::{LiveScreen, Mode, ReplayScreen, ScreenLoad};
+    use crate::ui::view::ViewState;
 
     /// A `TestBackend`-backed terminal for pure render assertions (no runtime, no
     /// real TTY).
@@ -220,18 +227,23 @@ mod tests {
 
     #[test]
     fn test_render_is_pure_does_not_mutate_app() {
-        // `render` takes `&App`, so a draw cannot mutate state — the purity
-        // guarantee is enforced by the signature. This test documents it by
+        // `render` takes `&App` + `&ViewState`, so a draw cannot mutate state — the
+        // purity guarantee is enforced by the signatures. This test documents it by
         // asserting the observable app state is byte-for-byte unchanged across a
-        // draw (dirty/help/quit/screen).
-        let app = live_app_on(LiveScreen::Surface, ScreenLoad::Loading, true);
+        // draw (dirty/help/quit/screen) and that the payoff projection is stable
+        // (the geometry is projected off the draw path by `ViewState::sync`, never
+        // in `draw`).
+        let app = live_app_on(LiveScreen::Payoff, ScreenLoad::Loading, true);
+        let mut view = ViewState::new();
+        view.sync(&app);
+        let before_projection = view.payoff().clone();
         let before = (app.dirty, app.help_open, app.should_quit);
         let before_screen = match &app.mode {
             Mode::Live(s) => s.screen,
             Mode::Replay(_) => panic!("expected a live app"),
         };
         let mut terminal = terminal(80, 24);
-        match terminal.draw(|frame| render(&app, frame)) {
+        match terminal.draw(|frame| render(&app, &view, frame)) {
             Ok(_) => {}
             Err(e) => panic!("draw failed: {e}"),
         }
@@ -245,14 +257,21 @@ mod tests {
             before_screen, after_screen,
             "render must not switch screens"
         );
+        assert_eq!(
+            &before_projection,
+            view.payoff(),
+            "render must not rebuild or mutate the payoff projection",
+        );
     }
 
     #[test]
     fn test_render_help_overlay_open_and_closed_never_panics() {
         for help in [false, true] {
             let app = live_app_on(LiveScreen::Chain, ScreenLoad::Loading, help);
+            let mut view = ViewState::new();
+            view.sync(&app);
             let mut terminal = terminal(100, 30);
-            match terminal.draw(|frame| render(&app, frame)) {
+            match terminal.draw(|frame| render(&app, &view, frame)) {
                 Ok(_) => {}
                 Err(e) => panic!("draw failed (help={help}): {e}"),
             }
@@ -277,8 +296,10 @@ mod tests {
         for screen in screens {
             for load in &loads {
                 let app = live_app_on(screen, load.clone(), false);
+                let mut view = ViewState::new();
+                view.sync(&app);
                 let mut terminal = terminal(120, 40);
-                match terminal.draw(|frame| render(&app, frame)) {
+                match terminal.draw(|frame| render(&app, &view, frame)) {
                     Ok(_) => {}
                     Err(e) => panic!("draw failed ({screen:?}/{load:?}): {e}"),
                 }
@@ -290,8 +311,10 @@ mod tests {
     fn test_render_every_reachable_replay_screen_never_panics() {
         for screen in [ReplayScreen::Replay, ReplayScreen::Payoff] {
             let app = replay_app_on(screen, false);
+            let mut view = ViewState::new();
+            view.sync(&app);
             let mut terminal = terminal(120, 40);
-            match terminal.draw(|frame| render(&app, frame)) {
+            match terminal.draw(|frame| render(&app, &view, frame)) {
                 Ok(_) => {}
                 Err(e) => panic!("draw failed ({screen:?}): {e}"),
             }
@@ -342,8 +365,10 @@ mod tests {
                 };
                 replay_app_on(screen, help)
             };
+            let mut view = ViewState::new();
+            view.sync(&app);
             let mut terminal = terminal(width, height);
-            match terminal.draw(|frame| render(&app, frame)) {
+            match terminal.draw(|frame| render(&app, &view, frame)) {
                 Ok(_) => {}
                 Err(e) => prop_assert!(false, "draw failed at {width}x{height}: {e}"),
             }
