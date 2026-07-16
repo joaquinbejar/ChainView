@@ -19,6 +19,16 @@ pub(crate) mod providers;
 pub(crate) mod terminal;
 pub(crate) mod ui;
 
+// In-crate Part B integration tests (issue #22) that require `pub(crate)`
+// internals a `tests/*.rs` (a separate crate seeing only the public API) cannot
+// reach — the live-path golden render (assembled `ChainStore` merge + the
+// `pub(crate)` chain-matrix `draw` + the recorded-fixture assembler + the
+// `#[cfg(test)]` golden helper), the id-agnostic render-parity proof, and the
+// draw-path no-I/O assertion. The public-surface faux-provider conformance and
+// the layering arch test live under `tests/` (`docs/TESTING.md` §7).
+#[cfg(test)]
+mod tests_integration;
+
 // Bench-only support surface (issue #21), compiled ONLY under the `bench` Cargo
 // feature. It exposes the constructors the `benches/*` targets need — a
 // populated render `App`, a seeded `ChainStore`, a scripted `MarketUpdate`

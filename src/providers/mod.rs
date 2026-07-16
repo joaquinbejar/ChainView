@@ -578,8 +578,8 @@ mod tests {
     /// Drive a future to completion on the current thread with a no-op waker.
     /// The fake provider's futures resolve on the first poll (no real await
     /// points), so a single poll suffices — this avoids pulling a tokio runtime
-    /// into a port-only unit test. `Waker::noop` is stable from Rust 1.85 (the
-    /// crate MSRV), so no `unsafe` waker construction is needed.
+    /// into a port-only unit test. `Waker::noop` is stable since Rust 1.85,
+    /// below the crate's 1.88 MSRV, so no `unsafe` waker construction is needed.
     fn block_on<F: Future>(future: F) -> F::Output {
         let mut future = std::pin::pin!(future);
         let waker = Waker::noop();

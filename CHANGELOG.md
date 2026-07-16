@@ -14,6 +14,39 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- The end-to-end live-path integration test, the layering arch test, the
+  external faux-provider conformance, and the manual live smoke (issue #22 Part B;
+  `docs/TESTING.md` §7–§8, `docs/03-data-providers.md` §11–§12). **Live-path
+  integration** (`src/tests_integration.rs`, in-crate `#[cfg(test)]` because it
+  needs the `pub(crate)` `ChainStore` merge, chain-matrix `draw`, recorded-fixture
+  assembler, and golden helper): the recorded Deribit #17 fixtures →
+  normalize/assemble seam → `ChainStore` **poll→stream merge** (seed + re-poll +
+  an idempotent quote folded into every priced leg) → `chain::draw` → the
+  committed `chain/deribit_btc_atm` golden, with **no network** and a fixed as-of
+  instant — the zero-config Deribit acceptance proven against fixtures. It also
+  proves the render path is **provider-id agnostic** (the same fixture chain under
+  an external `ProviderId("faux")` renders the identical golden) and that the draw
+  path runs with **no async runtime** (a plain sync `#[test]` over `render(&App)`,
+  mutating nothing). **Layering arch test** (`tests/arch.rs`): a deterministic,
+  filesystem-only grep of the `src/` import graph (production regions only —
+  `#[cfg(test)] mod` blocks are masked) that **fails the build on any back-edge**
+  — domain→adapter/port/ui, adapter→app/ui, adapter→adapter, a `src/ui/*` import
+  of a provider or `tokio` I/O, and any `ui→` reverse edge — with a self-test
+  proving the detector fires on a synthetic offender (not a vacuous pass).
+  **Faux-provider conformance** (`tests/integration.rs`, PUBLIC API only): a
+  test-only `FauxProvider` (non-reserved `ProviderId("faux")`) implementing **only**
+  the public `Provider` port, registered via `ChainViewApp::builder().register(..)`
+  and driven end-to-end — its `fetch_chain` returns the named `ChainFetch`, a
+  forced reconnect **resubscribes off the fresh `ChainFetch.aliases`** (no bare
+  `OptionChain`, no symbol re-derivation), it plugs into the ADR-0009 supervised
+  composition seam identically to a built-in, and its declared
+  `ProviderCapabilities` gate the screens (a `capabilities_total` proptest proves
+  the gate is total over declared caps, never a `ProviderId` match) — proving the
+  port reaches parity through the public surface with **no built-in
+  special-casing**. **Live smoke** (`tests/live_smoke.rs`): a `#[ignore]`,
+  `SMOKE_DERIBIT=1`-gated manual Deribit sanity check that never runs in CI. Every
+  integration test is deterministic (no socket, no wall-clock wait) and finishes
+  far under the 10 s bound.
 - First bench suite and the `BENCH.md` baseline (issue #21;
   `docs/06-performance.md` §3–§5, `docs/TESTING.md` §11). Three `criterion`
   benches under `benches/`, each a `harness = false` binary that reports
