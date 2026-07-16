@@ -43,6 +43,7 @@ use crate::ui::theme::Theme;
 pub mod chain;
 pub mod depth;
 pub mod driver;
+pub mod graph;
 pub mod payoff;
 pub mod replay;
 pub mod surface;
