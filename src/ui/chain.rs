@@ -47,14 +47,14 @@
 //! glyph with text — all legible under `NO_COLOR`
 //! (`docs/05-views-and-ux.md` §7, `CLAUDE.md` accessibility policy).
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, Utc};
 use crossterm::event::KeyEvent;
 use optionstratlib::OptionStyle;
 use optionstratlib::chains::OptionData;
 use optionstratlib::chains::chain::OptionChain;
 use optionstratlib::prelude::{Decimal, Positive};
 use ratatui::Frame;
-use ratatui::layout::{Alignment, Constraint, Rect};
+use ratatui::layout::{Alignment, Constraint, Flex, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Cell, Paragraph, Row, Table};
@@ -64,8 +64,8 @@ use crate::app::{LegFocus, LiveState, ScreenLoad};
 use crate::chain::{ChainStore, GreeksOrigin, InstrumentKey, StreamHealth, TickDir};
 use crate::event::AppEvent;
 use crate::ui::theme::{
-    GreekColumn, StrikeRelation, Theme, health_span, spinner_frame, strike_relation_marker_span,
-    tick_dir_span,
+    GreekColumn, StrikeRelation, Theme, health_span, sanitize, spinner_frame,
+    strike_relation_marker_span, tick_dir_span,
 };
 
 // ===========================================================================
@@ -275,12 +275,14 @@ pub fn draw(
     let chain = state.store.chain();
     match &state.load {
         ScreenLoad::Loading => {
+            // A consistent two-line body (primary + secondary hint), matching the
+            // empty/error states, vertically centered so it reads as a deliberate
+            // state rather than content that failed to fill.
             draw_state_body(
                 frame,
                 area,
                 theme,
                 Text::from(vec![
-                    Line::from(""),
                     Line::from(Span::styled(
                         format!(
                             "{} connecting to {}…",
@@ -303,7 +305,6 @@ pub fn draw(
                         format!("! {}", sanitize(message)),
                         theme.warning(),
                     )),
-                    Line::from(""),
                     Line::from(Span::styled("press r to reconnect", theme.dim())),
                 ]),
             );
@@ -336,13 +337,23 @@ pub fn draw(
     }
 }
 
-/// Draw a centered state body (loading / empty / error) inside the framed "Chain"
-/// block — a first-class state, never a blank void.
+/// Draw a state body (loading / empty / error) inside the framed "Chain" block,
+/// **vertically centered** in the available height and horizontally centered — a
+/// first-class, deliberate-looking state, never a blank void or a top-anchored
+/// fragment. All three states share this two-line baseline.
 fn draw_state_body(frame: &mut Frame, area: Rect, theme: Theme, text: Text<'static>) {
     let block = Block::bordered().title(Span::styled("Chain", theme.accent()));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    frame.render_widget(Paragraph::new(text).alignment(Alignment::Center), inner);
+    // Reserve exactly the text height and center it in the body; `Flex::Center`
+    // does the geometry, so there is no manual arithmetic (and no `saturating_*`).
+    let height = u16::try_from(text.height())
+        .unwrap_or(u16::MAX)
+        .min(inner.height);
+    let [centered] = Layout::vertical([Constraint::Length(height)])
+        .flex(Flex::Center)
+        .areas(inner);
+    frame.render_widget(Paragraph::new(text).alignment(Alignment::Center), centered);
 }
 
 // ===========================================================================
@@ -382,7 +393,7 @@ fn draw_matrix(state: &LiveState, frame: &mut Frame, area: Rect, theme: Theme, n
     let underlying = key.1.clone();
     let expiration = key.2;
 
-    let block = Block::bordered().title(matrix_title(chain, health, theme));
+    let block = Block::bordered().title(matrix_title(chain, expiration, health, theme));
     let inner = block.inner(area);
 
     // The mandatory column set (strike + bid/ask/mark + IV + Δ) needs BASE_W inner
@@ -415,8 +426,9 @@ fn draw_matrix(state: &LiveState, frame: &mut Frame, area: Rect, theme: Theme, n
     let show_gamma = greek_slots_for_width(inner.width) >= 1;
     let plan = columns(show_gamma);
     let widths: Vec<Constraint> = plan.iter().map(|col| col_width(*col)).collect();
-    // The body height is the inner height minus the one header row.
-    let visible = floor_sub(usize::from(inner.height), 1);
+    // The body height is the inner height minus the two-row header (the Calls/Puts
+    // super-header line plus the per-column label line).
+    let visible = floor_sub(usize::from(inner.height), 2);
 
     let strikes: Vec<&OptionData> = chain.options.iter().collect();
     let len = strikes.len();
@@ -471,13 +483,23 @@ fn draw_matrix(state: &LiveState, frame: &mut Frame, area: Rect, theme: Theme, n
     frame.render_widget(table, area);
 }
 
-/// The block title `<symbol>  exp <expiry>  spot <S>`, with the stream-health
-/// badge appended when the feed is not live (`◐ stale` / `↻ reconnecting (n)`).
+/// The block title `<symbol>  exp <date>  spot <S>`, with the stream-health badge
+/// appended when the feed is not live (`◐ stale` / `↻ reconnecting (n)`).
+///
+/// The venue-controlled `symbol` is sanitized at this render edge; the expiry is
+/// formatted from the canonical [`DateTime<Utc>`] as a bare date (every listed
+/// contract settles at 08:00 UTC, so the time/offset are noise), so it carries no
+/// venue bytes.
 #[must_use]
-fn matrix_title(chain: &OptionChain, health: &StreamHealth, theme: Theme) -> Line<'static> {
+fn matrix_title(
+    chain: &OptionChain,
+    expiration: DateTime<Utc>,
+    health: &StreamHealth,
+    theme: Theme,
+) -> Line<'static> {
     let mut spans = vec![
         Span::styled(sanitize(&chain.symbol), theme.accent()),
-        Span::raw(format!("  exp {}", sanitize(&chain.get_expiration_date()))),
+        Span::raw(format!("  exp {}", fmt_expiry_date(expiration))),
         Span::raw(format!("  spot {}", fmt_strike(chain.underlying_price))),
     ];
     if !matches!(health, StreamHealth::Live) {
@@ -653,7 +675,23 @@ fn greek_label(greek: GreekColumn) -> &'static str {
     }
 }
 
-/// The header row, right-aligned numeric labels and a centered `Strike`.
+/// The `Calls` / `Puts` super-header marker for a column — placed on the two
+/// `Mark` columns that flank the center `Strike`, so the mirror halves are labeled
+/// unambiguously (`Calls  Strike  Puts`) without relying on color. Every other
+/// column has no super-header text.
+#[must_use]
+fn group_label(col: ChainCol) -> &'static str {
+    match col {
+        ChainCol::CallMark => "Calls",
+        ChainCol::PutMark => "Puts",
+        _ => "",
+    }
+}
+
+/// The two-line header row: a `Calls` / `Puts` super-header line above the
+/// per-column labels, so which mirror half is calls vs puts is explicit (not a
+/// guess from position). Numeric labels are right-aligned, `Strike` centered; the
+/// super-header markers are centered over the `Mark` columns flanking the strike.
 #[must_use]
 fn header_row(plan: &[ChainCol], theme: Theme) -> Row<'static> {
     let cells: Vec<Cell> = plan
@@ -664,10 +702,12 @@ fn header_row(plan: &[ChainCol], theme: Theme) -> Row<'static> {
             } else {
                 Alignment::Right
             };
-            Cell::from(Line::from(col_header(*col)).alignment(align))
+            let group = Line::from(group_label(*col)).alignment(Alignment::Center);
+            let label = Line::from(col_header(*col)).alignment(align);
+            Cell::from(Text::from(vec![group, label]))
         })
         .collect();
-    Row::new(cells).style(theme.accent())
+    Row::new(cells).height(2).style(theme.accent())
 }
 
 /// The cell for one column of one row, with leg-focus emphasis (an underline on
@@ -735,8 +775,14 @@ fn num_cell(text: String) -> Cell<'static> {
 
 /// A right-aligned price cell with a trailing tick-direction glyph (`▲`/`▼`/`·`) —
 /// color-independent, so the direction reads under `NO_COLOR`.
+///
+/// A **missing** price carries no tick direction, so it renders just the em dash
+/// (`—`) with no redundant trailing glyph.
 #[must_use]
 fn dir_cell(price: Option<Positive>, dir: TickDir, theme: Theme) -> Cell<'static> {
+    if price.is_none() {
+        return num_cell(fmt_price(price));
+    }
     let line = Line::from(vec![
         Span::raw(fmt_price(price)),
         Span::raw(" "),
@@ -746,17 +792,30 @@ fn dir_cell(price: Option<Positive>, dir: TickDir, theme: Theme) -> Cell<'static
     Cell::from(line)
 }
 
+/// The width (display columns) of the [`AT_SPOT_MARKER`](crate::ui::theme::AT_SPOT_MARKER)
+/// `◀ATM`, reserved on every strike row so the ATM row does not left-shift its
+/// digits out of the ladder.
+const ATM_MARKER_W: usize = 4;
+
 /// The shared center strike cell: the strike shaded by its `K/S` relation, with
 /// the `◀ATM` marker on the nearest listed strike (both legible under `NO_COLOR`).
+///
+/// The marker's trailing width is reserved on **every** row (the marker, or an
+/// equal-width blank), so the strike digits form a clean vertical ladder — the ATM
+/// row no longer jogs the number left relative to the others.
 #[must_use]
 fn strike_cell(row: &ChainRow, theme: Theme, is_atm: bool) -> Cell<'static> {
-    let mut spans = vec![Span::styled(
-        fmt_strike(row.strike),
-        theme.strike_relation_style(row.strike_relation),
-    )];
+    let mut spans = vec![
+        Span::styled(
+            fmt_strike(row.strike),
+            theme.strike_relation_style(row.strike_relation),
+        ),
+        Span::raw(" "),
+    ];
     if is_atm {
-        spans.push(Span::raw(" "));
         spans.push(strike_relation_marker_span(StrikeRelation::AtSpot, theme));
+    } else {
+        spans.push(Span::raw(" ".repeat(ATM_MARKER_W)));
     }
     Cell::from(Line::from(spans).alignment(Alignment::Center))
 }
@@ -809,6 +868,20 @@ fn fmt_greek(value: Option<Decimal>) -> String {
     }
 }
 
+/// Format an absolute-UTC expiry as a bare calendar date (`2025-06-27`) for the
+/// matrix title — a display-edge formatter over the canonical [`DateTime<Utc>`]
+/// (the domain stays a `DateTime`, not a display string). Built from the date
+/// components, so it needs no `strftime`/locale.
+#[must_use]
+fn fmt_expiry_date(expiration: DateTime<Utc>) -> String {
+    format!(
+        "{:04}-{:02}-{:02}",
+        expiration.year(),
+        expiration.month(),
+        expiration.day(),
+    )
+}
+
 /// Format a strike, trailing zeros stripped (`Positive` `Display` normalizes), so
 /// an integer strike reads `60000` and a fractional one keeps its places.
 #[must_use]
@@ -819,14 +892,12 @@ fn fmt_strike(strike: Positive) -> String {
     format!("{}", strike.round_to(2))
 }
 
-/// Strip control/escape characters from a venue- or user-controlled string before
-/// it reaches the render edge (`docs/SECURITY.md` terminal escape-sequence
-/// hygiene). The full escape-hygiene hardening + goldens land in #19; this is the
-/// defensive minimum for the display symbol/expiry/message.
-#[must_use]
-fn sanitize(raw: &str) -> String {
-    raw.chars().filter(|c| !c.is_control()).collect()
-}
+// Every venue-controlled string that reaches this screen's render edge — the
+// matrix title symbol/expiry, the empty-state underlying/expiry, the loading
+// provider id, and the error message — is routed through the SINGLE shared
+// [`sanitize`](crate::ui::theme::sanitize) (`src/ui/theme.rs`, hardened in #19),
+// so the chain matrix and the status bar can never neutralize venue bytes
+// differently (`docs/SECURITY.md` §6.4).
 
 // ===========================================================================
 // Key handling — resolved THROUGH the single keymap, no parallel table, no I/O.
@@ -1672,6 +1743,137 @@ mod tests {
         match app_mode {
             Mode::Live(state) => assert_eq!(state.screen, LiveScreen::Chain),
             Mode::Replay(_) => panic!("expected a live mode"),
+        }
+    }
+
+    // =====================================================================
+    // Render goldens (#19, docs/TESTING.md §4) + escape-sequence hygiene
+    // (docs/SECURITY.md §6.4). Rendered into a TestBackend at a FIXED 120x40
+    // and compared against a committed golden; deterministic (fixed as-of
+    // instant / the fixture's own timestamps, no wall clock, no socket), so
+    // the bytes are stable across machines.
+    // =====================================================================
+
+    /// A hostile venue-controlled underlying carrying an OSC clipboard-write
+    /// (`ESC ] 52 … BEL`), a CSI clear-screen (`ESC [ 2J`), a raw newline/tab, and
+    /// an 8-bit C1 `CSI` (`0x9B`) — the escape-hygiene probe. Written with `\u{..}`
+    /// escapes, so the SOURCE file carries no raw control byte.
+    const HOSTILE_SYMBOL: &str = "BTC\u{1b}]52;c;cHduZWQ=\u{7}\u{1b}[2J\nEVIL\t\u{9b}31m";
+
+    /// Seed a [`LiveState`] on the Chain screen from an assembled [`ChainFetch`]
+    /// (the adapter-seam output), with a Live source and a fixed as-of instant.
+    fn live_from_fetch(fetch: ChainFetch, load: ScreenLoad) -> LiveState {
+        let store = ChainStore::seed(fetch, ChainSource::Merged, Duration::from_secs(2), utc(EXP));
+        let mut live = LiveState::new(
+            SourceBinding::new(pid("deribit"), caps(), StreamHealth::Live),
+            store,
+        );
+        live.load = load;
+        live
+    }
+
+    /// Draw the chain body for `live` into a fixed 120x40 `TestBackend` (tick 0,
+    /// so the loading spinner frame is fixed) and return the buffer as golden text.
+    #[track_caller]
+    fn render_chain_golden(live: &LiveState) -> String {
+        use crate::ui::golden::{GOLDEN_HEIGHT, GOLDEN_WIDTH, buffer_to_text};
+        let mut term = terminal(GOLDEN_WIDTH, GOLDEN_HEIGHT);
+        match term.draw(|frame| draw(live, frame, frame.area(), theme(), 0)) {
+            Ok(_) => {}
+            Err(e) => panic!("golden draw failed: {e}"),
+        }
+        buffer_to_text(term.backend().buffer())
+    }
+
+    #[test]
+    fn test_chain_deribit_btc_atm_render_golden() {
+        // The populated matrix, assembled from the recorded Deribit fixture through
+        // the real adapter seam (fixture -> normalize -> assemble -> ChainStore ->
+        // chain::draw).
+        let fetch = crate::providers::deribit::fixture_btc_chain_fetch_named("BTC");
+        let live = live_from_fetch(fetch, ScreenLoad::Ready);
+        let text = render_chain_golden(&live);
+        crate::ui::golden::assert_golden("chain", "deribit_btc_atm.txt", &text);
+    }
+
+    #[test]
+    fn test_chain_loading_render_golden() {
+        // The pre-first-frame LOADING state: the vertically-centered spinner +
+        // "connecting to deribit". tick 0 fixes the spinner frame, so it is stable.
+        let empty = OptionChain::new("BTC", pos(60_000.0), "2025-06-27".to_owned(), None, None);
+        let live = live_with(empty, ScreenLoad::Loading);
+        let text = render_chain_golden(&live);
+        crate::ui::golden::assert_golden("chain", "loading.txt", &text);
+    }
+
+    #[test]
+    fn test_chain_empty_render_golden() {
+        // The EMPTY-Ready state (distinct from loading): "no data for BTC
+        // 2025-06-27" + "no strikes yet - press r to reconnect".
+        let empty = OptionChain::new("BTC", pos(60_000.0), "2025-06-27".to_owned(), None, None);
+        let live = live_with(empty, ScreenLoad::Ready);
+        let text = render_chain_golden(&live);
+        crate::ui::golden::assert_golden("chain", "empty.txt", &text);
+    }
+
+    #[test]
+    fn test_chain_provider_error_render_golden() {
+        let mut live = live_with(chain_with(&[60_000.0]), ScreenLoad::Loading);
+        live.load = ScreenLoad::Error {
+            message: "provider unreachable".to_owned(),
+        };
+        let text = render_chain_golden(&live);
+        crate::ui::golden::assert_golden("chain", "provider_error.txt", &text);
+    }
+
+    #[test]
+    fn test_chain_stale_render_golden() {
+        // The stale-feed state (a #18 acceptance criterion): the last chain still
+        // renders (dimmed) with a `◐ stale` badge in the title — never blanked,
+        // never shown as live. Deterministic (a fixed `since` instant).
+        let fetch = crate::providers::deribit::fixture_btc_chain_fetch_named("BTC");
+        let mut live = live_from_fetch(fetch, ScreenLoad::Ready);
+        live.source.health = StreamHealth::Stale { since: utc(EXP) };
+        live.store
+            .apply_health(StreamHealth::Stale { since: utc(EXP) });
+        let text = render_chain_golden(&live);
+        crate::ui::golden::assert_golden("chain", "stale.txt", &text);
+    }
+
+    #[test]
+    fn test_chain_escape_hygiene_render_golden_renders_inert_text() {
+        // A hostile venue-controlled symbol flows through the real adapter seam
+        // (the domain keeps the bytes verbatim) into the rendered matrix title;
+        // the render edge neutralizes it to inert visible text. The committed
+        // golden proves it and carries NO raw escape byte.
+        let fetch = crate::providers::deribit::fixture_btc_chain_fetch_named(HOSTILE_SYMBOL);
+        let live = live_from_fetch(fetch, ScreenLoad::Ready);
+        let text = render_chain_golden(&live);
+        assert!(
+            !text.contains('\u{1b}'),
+            "the rendered hostile symbol must carry no raw ESC byte",
+        );
+        assert!(
+            !text.contains('\u{9b}'),
+            "the rendered hostile symbol must carry no 8-bit CSI introducer",
+        );
+        assert!(
+            !text.contains('\u{7}'),
+            "the rendered hostile symbol must carry no BEL byte",
+        );
+        crate::ui::golden::assert_golden("chain", "escape_hygiene.txt", &text);
+    }
+
+    #[test]
+    fn test_draw_hostile_symbol_renders_inert_across_sizes_without_panic() {
+        // The hostile symbol renders as inert text at every size (including the
+        // minimum body) — never a panic, never a residual escape/introducer byte.
+        let fetch = crate::providers::deribit::fixture_btc_chain_fetch_named(HOSTILE_SYMBOL);
+        let live = live_from_fetch(fetch, ScreenLoad::Ready);
+        for (w, h) in [(40u16, 8u16), (80, 24), (120, 40), (200, 60)] {
+            let text = rendered(&live, w, h);
+            assert!(!text.contains('\u{1b}'), "no ESC byte at {w}x{h}");
+            assert!(!text.contains('\u{9b}'), "no 8-bit CSI at {w}x{h}");
         }
     }
 }

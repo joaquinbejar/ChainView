@@ -14,6 +14,71 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- Chain render goldens and the terminal escape-sequence sanitizer
+  (`src/ui/theme.rs`, `src/ui/golden.rs`, `tests/render/golden/chain/`, issue #19;
+  `docs/TESTING.md` §4, §13.2, `docs/SECURITY.md` §6.4). Because stdout **is** the
+  UI, a venue-controlled string (instrument name, symbol, venue error text) is
+  **not** trusted display-safe; the sanitizer neutralizes it at the render edge,
+  and the goldens pin the rendered chain screen byte-for-byte. Key behaviours:
+  - **Hardened, single-source sanitizer.** `theme::sanitize` (the #14 status-line
+    helper, promoted to `pub(crate)` and hardened) now **replaces** every C0 control
+    (`0x00..=0x1F`, incl. `TAB`/`LF`/`CR` and the `ESC` `0x1B` introducer), `DEL`
+    (`0x7F`), and C1 control (`0x80..=0x9F`, incl. the 8-bit `CSI` `0x9B` / `OSC`
+    `0x9D` / `DCS` `0x90` introducers) with a visible placeholder (`U+FFFD`). Because
+    a terminal only enters escape-processing on an introducer, replacing every
+    introducer makes a whole `ESC`-prefixed sequence inert visible text without
+    parsing it — an `OSC 52` clipboard-write, a `CSI` cursor-move, or a `TAB`/`LF`
+    can neither fire a terminal side effect nor break the matrix layout. The pure
+    helper is the **one** sanitizer every venue-string edge routes through; the
+    chain matrix's local duplicate is removed, so the matrix and the status bar can
+    never neutralize venue bytes differently.
+  - **Wired at every venue-string render edge.** The chain matrix title
+    symbol/expiry, the empty-state underlying/expiry, the loading provider id, the
+    error message, and the status bar / keybar hint all pass through the shared
+    sanitizer. The `NO_COLOR` / marker-not-color policy (#14) is unaffected —
+    sanitization touches only control sequences, not ChainView's own styling.
+  - **Render goldens at a fixed 120×40.** A new `ui::golden` test-support module
+    renders a screen into a `TestBackend` and captures the buffer as text (one row
+    per line), compared against a committed golden or, under `UPDATE_GOLDENS=1`,
+    rewritten (the documented regeneration mechanism, so a deliberate screen change
+    refreshes the golden in the same commit — a screen change without a golden
+    update is caught by the mismatch). Committed: `chain/deribit_btc_atm.txt` (the
+    populated matrix assembled from the recorded #17 Deribit fixture through the
+    real adapter seam — fixture → `normalize_leg` → `assemble_chain` → `ChainStore`
+    → `chain::draw`), `chain/loading.txt` (the pre-first-frame loading state),
+    `chain/empty.txt` (the empty-Ready "no data" state), `chain/provider_error.txt`
+    (the provider-unreachable state), and `chain/stale.txt` (the stale-feed state:
+    the last chain dimmed with a `◐ stale` badge — the "never show stale as live"
+    honesty guarantee, a #18 acceptance criterion). Deterministic: the fixture's own
+    timestamps and a fixed as-of instant, never a wall clock or a live socket.
+  - **A believable populated golden (UX-review fixes).** The golden fixture gives
+    each option a **distinct** recorded ticker (`ticker_normal` / `ticker_put` /
+    `ticker_61000_call`), so the matrix depicts a realistic call/put asymmetry — a
+    60000 call Δ `+0.5500` beside a 60000 put Δ `-0.4500` (delta parity holds) and a
+    61000 call Δ `+0.4200` — rather than one cloned ticker showing an impossible
+    `+0.55` put; distinct per-leg Greeks also close the blind spot where a
+    read-the-wrong-leg regression would have gone uncaught. The chain screen also
+    gained forward render fixes visible in the goldens: a **Calls / Puts**
+    super-header over the mirror halves (text, `NO_COLOR`-legible); the loading /
+    empty / error state bodies **vertically centered** on a shared two-line
+    baseline (no longer top-anchored); the title expiry formatted as a bare date
+    (`exp 2025-06-27`, not the verbose RFC 3339); the `◀ATM` marker width reserved
+    on every strike row so the digits form a clean ladder; and the redundant
+    tick-direction glyph suppressed on an absent (`—`) price.
+  - **Escape-hygiene golden.** `chain/escape_hygiene.txt` feeds a hostile
+    underlying symbol carrying an `OSC` clipboard-write, a `CSI` clear-screen, a raw
+    newline/tab, and an 8-bit C1 `CSI` through the adapter seam into the rendered
+    matrix title; the golden proves it renders as inert visible text, and its
+    committed bytes contain **no** raw `ESC` (`0x1B`), `BEL` (`0x07`), or 8-bit
+    introducer — proof the sanitizer ran.
+  - **No new dependency.** Tests: 6 in `src/ui/theme.rs` (C0/C1 replacement, the
+    `OSC`/`CSI`/`DCS`-to-inert-text case, printable/glyph preservation, the
+    control-range predicate, and two property tests — `prop_sanitize_*` — asserting
+    the no-control/no-introducer invariant over arbitrary Unicode strings and
+    arbitrary bytes) + 7 in `src/ui/chain.rs` (the six render goldens —
+    populated / loading / empty / error / stale / escape-hygiene — and the
+    render-hostile-name-inert-across-sizes case). Two new Deribit ticker fixtures
+    (`ticker_put.json`, `ticker_61000_call.json`).
 - The chain-matrix screen with honest empty/loading/error states
   (`src/ui/chain.rs`, issue #18; `docs/05-views-and-ux.md` §2.1, §6, §8,
   `docs/01-domain-model.md` §8, `docs/02-tui-architecture.md` §7). The first real
