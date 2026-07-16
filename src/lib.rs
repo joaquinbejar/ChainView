@@ -121,11 +121,12 @@ pub use app::keymap::{
 
 pub use chain::{
     AliasCatalog, CHAIN_STALE_SLACK, ChainFetch, ChainSnapshot, ChainSource, ChainStore,
-    ContractSpecFingerprint, DIRECTION_DECAY, DepthLadder, DepthLevel, ExerciseStyle, ExpirySource,
-    FEED_DELAY_WARN, Freshness, GREEKS_STALE_AFTER, GreeksOrigin, GreeksRow, Instrument,
-    InstrumentKey, MAX_PENDING, MarketUpdate, MergeOutcome, ProviderId, QUOTE_STALE_AFTER,
-    QuoteUpdate, RESERVED_PROVIDER_IDS, SettlementStyle, StreamHealth, TickDir, chain_stale_after,
-    pending_ttl,
+    ContractSpecFingerprint, DEFAULT_DIVIDEND_YIELD, DEFAULT_RISK_FREE_RATE, DIRECTION_DECAY,
+    DepthLadder, DepthLevel, ExerciseStyle, ExpirySource, FEED_DELAY_WARN, Freshness,
+    GREEKS_STALE_AFTER, GreeksOrigin, GreeksRow, GreeksSidecar, Instrument, InstrumentKey,
+    LegGreeks, LegStatus, MAX_PENDING, MarketUpdate, MergeOutcome, PricingInputs, PricingModel,
+    ProviderId, QUOTE_STALE_AFTER, QuoteSelect, QuoteUpdate, RESERVED_PROVIDER_IDS,
+    SettlementStyle, StreamHealth, TickDir, chain_stale_after, compute_leg_greeks, pending_ttl,
 };
 pub use config::{CliOverrides, Config, ModeSelect, ProviderSettings, ThemeChoice};
 pub use error::{

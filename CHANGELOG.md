@@ -14,6 +14,30 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- The local Greeks/IV fill-in engine (`src/chain/greeks.rs`, issue #24; docs 01
+  §7) — the analytics sidecar that fills the Greeks/IV `optionstratlib`'s
+  `OptionData` cannot hold (it persists only iv/delta/shared-gamma, no
+  theta/vega/rho). `GreeksSidecar { by_key: HashMap<InstrumentKey, LegGreeks> }`
+  is keyed by the **style-bearing** `InstrumentKey`, so a call and a put leg of
+  one strike keep **separate** entries — the venue's single shared
+  `OptionData.iv`/`gamma` never collides call/put (asserted in both permutations).
+  `LegGreeks` carries per-field `GreeksOrigin` (venue vs local) with
+  theta/vega/rho **always** `ComputedLocally` (venue-streamed theta/vega/rho are
+  discarded). `compute_leg_greeks(chain, ctx, sink)` builds an
+  `optionstratlib::Options` and calls the real `optionstratlib::greeks::{delta,
+  gamma, theta, vega, rho}` + `Options::calculate_implied_volatility` — **no
+  hand-rolled Black-Scholes or root-finder**. The IV quote-selection is explicit
+  (Mid of an uncrossed two-sided quote → else Absent); a crossed / stale / absent
+  quote or a `GreeksError` clears the leg's local fields to `None` with a
+  `LegStatus` recorded (never a bogus IV or a stale computed Greek shown as
+  fresh). Recompute is event-driven and cached by `input_generation` (an
+  unchanged generation does no work) — never in `draw`. The kernel is
+  deterministic: expiry is priced via a `expiration_utc − as_of` day count
+  through `ExpirationDate::Days`, deliberately avoiding `optionstratlib`'s
+  `DateTime`-variant path that reads `Utc::now()`. Analytics are
+  `Positive`/`Decimal` — no `f64` past the seam. 17 unit + property
+  (`greeks_fill_deterministic`) tests. No new dependency. (The risk-free
+  rate/dividend default to `0` pending a config knob.)
 - The `GraphData` → ratatui dataset adapter (`src/ui/graph.rs`, issue #23;
   `docs/05-views-and-ux.md` §4, ADR-0001). ratatui does not consume
   `optionstratlib`'s `GraphData` directly, so `project(&GraphData) ->

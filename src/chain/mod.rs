@@ -25,6 +25,15 @@
 //! `aliases`/`source` fields now that [`AliasCatalog`] and [`ChainSource`] exist
 //! (the store LOGIC that drives them lands in #7).
 //!
+//! Issue #24 landed the local Greeks/IV fill-in engine in the [`greeks`]
+//! submodule — the style-keyed [`GreeksSidecar`]/[`LegGreeks`], the fully-sourced
+//! [`PricingInputs`] ([`PricingModel`]/[`QuoteSelect`]), and [`compute_leg_greeks`]:
+//! it builds an `optionstratlib::Options` and calls the `optionstratlib` Greeks
+//! functions plus IV inversion (never a hand-rolled Black-Scholes/root-finder),
+//! deterministically and cached by `input_generation`, clearing a crossed / stale
+//! / solver-failed leg to `None` with a recorded [`LegStatus`]
+//! (`docs/01-domain-model.md` §7).
+//!
 //! Issue #7 landed the live [`ChainStore`] in the [`store`] submodule — the
 //! deterministic poll -> stream merge over the `optionstratlib` chain: the
 //! strike-keyed clone/patch/re-insert row update, the field-fold rules
@@ -37,6 +46,7 @@
 
 mod events;
 mod fetch;
+mod greeks;
 mod identity;
 mod store;
 
@@ -46,6 +56,10 @@ pub use events::{
     QuoteUpdate, StreamHealth, chain_stale_after,
 };
 pub use fetch::{AliasCatalog, ChainFetch, ExpirySource};
+pub use greeks::{
+    DEFAULT_DIVIDEND_YIELD, DEFAULT_RISK_FREE_RATE, GreeksSidecar, LegGreeks, LegStatus,
+    PricingInputs, PricingModel, QuoteSelect, compute_leg_greeks,
+};
 pub use identity::{
     ContractSpecFingerprint, ExerciseStyle, Instrument, InstrumentKey, ProviderId,
     RESERVED_PROVIDER_IDS, SettlementStyle,
