@@ -241,12 +241,20 @@ fn key_in_subscription(key: &InstrumentKey, underlying: &str, expiration: &Expir
 /// The producer-side halves of the bridge's three bounded channels, handed back
 /// by [`EventBridge::new`] (`docs/02-tui-architecture.md` §5).
 ///
-/// The supervisor (#11) wires these before startup: [`tx_control`] and
-/// [`tx_coalesced`] go to the provider adapters (a `subscribe` call takes an
-/// `mpsc::Sender<MarketUpdate>`, `docs/03-data-providers.md` §5), and
-/// [`tx_command`] is the render -> data half [`App`] holds (an event handler that
-/// needs I/O emits a [`Command`] on it). All three are cheap to `Clone` so a
-/// per-provider-task sender is a clone of one shared half.
+/// A `Provider::subscribe` call takes exactly **one**
+/// `mpsc::Sender<MarketUpdate>`, so an adapter cannot hold both halves: the
+/// composition seam (#22, per ADR-0009) wires an adapter's `subscribe` sender to
+/// **[`tx_coalesced`]**, and a control-class update (`Chain` / `Health`) that
+/// consequently arrives on the coalesced channel is **folded directly** by the
+/// bridge rather than dropped — the misrouted-control fallback in `StagingMap`
+/// (`stage` returns a control update to the caller for a direct fold). The true
+/// **two-sender priority routing** — a separate control channel drained first
+/// each wakeup — is the consumer bridge's design that #22 reconciles; until then
+/// [`tx_control`] carries only updates a control-aware producer (a future poll
+/// task, or the seam wiring) puts on it. [`tx_command`] is the render -> data
+/// half [`App`] holds (an event handler that needs I/O emits a [`Command`] on
+/// it). All three are cheap to `Clone`, so a per-provider-task sender is a clone
+/// of one shared half.
 ///
 /// [`tx_control`]: BridgeSenders::tx_control
 /// [`tx_coalesced`]: BridgeSenders::tx_coalesced

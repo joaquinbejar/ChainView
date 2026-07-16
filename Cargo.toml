@@ -71,6 +71,21 @@ crossterm = "0.28"
 # exposes no `install_default_crypto_provider`; any provider install belongs to
 # the websocket path (#16), and no live TLS handshake runs in the test suite.
 deribit-http = "0.7.1"
+# The Deribit WebSocket client (issue #16, the streaming overlay + reconnect
+# loop). Wraps the venue's JSON-RPC 2.0 over WebSocket; ChainView never
+# reimplements the protocol (CLAUDE.md "Key Decisions"). Explicit-approval
+# addition (CLAUDE.md "Coding Rules") — audit note in CHANGELOG. Public market
+# data needs NO credentials: the adapter drives the production URL and never
+# authenticates, so no credential is required or logged.
+# Supply-chain delta over #15's `deribit-http`: adds `tokio-tungstenite` (WS
+# framing) and the default `rustls-aws-lc` TLS backend — `rustls` + the
+# `aws-lc-rs` crypto provider — installed ONCE via
+# `install_default_crypto_provider()` before the first WS TLS handshake (this is
+# what differs from #15, where the REST client used `reqwest`'s default TLS and
+# needed no provider install), plus `futures-util`. It shares `tokio`
+# (feature-unified toward `full`), `serde`/`serde_json`, `url`, and `dotenv`
+# with the existing tree. `aws-lc-rs` requires a C/ASM toolchain at build time.
+deribit-websocket = "0.3.1"
 
 [dev-dependencies]
 proptest = "1"

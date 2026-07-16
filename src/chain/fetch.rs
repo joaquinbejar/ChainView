@@ -159,6 +159,16 @@ impl AliasCatalog {
         self.by_key.len()
     }
 
+    /// Every feed alias the catalog holds, across all keys — the enumeration a
+    /// provider adapter uses to **resubscribe off the fresh aliases** after a
+    /// reconnect re-fetch (`docs/03-data-providers.md` §5), so it never
+    /// re-derives symbols from strikes. The iteration order is unspecified (the
+    /// backing map is unordered); a caller that needs the legs for one feed
+    /// filters on [`Instrument::provider`](crate::chain::Instrument).
+    pub fn instruments(&self) -> impl Iterator<Item = &Instrument> {
+        self.by_key.values().flatten()
+    }
+
     /// The native/stream symbols (and spec fingerprint) to (re)subscribe for one
     /// leg on a given feed, or `None` when that feed does not know the leg.
     #[must_use]
@@ -419,6 +429,31 @@ mod tests {
         let mut catalog = AliasCatalog::new();
         catalog.insert(instrument("deribit", "BTC-27JUN25-60000-C", None));
         assert!(catalog.resolve_symbol("UNKNOWN").is_none());
+    }
+
+    #[test]
+    fn test_alias_catalog_instruments_enumerates_every_feed_alias() {
+        // Two feeds know the same leg — `instruments()` yields BOTH aliases (one
+        // per feed), the enumeration a reconnect resubscribe walks.
+        let mut catalog = AliasCatalog::new();
+        catalog.insert(instrument("deribit", "BTC-27JUN25-60000-C", None));
+        catalog.insert(instrument("dxlink", ".BTC250627C60000", Some("dxfeed-sym")));
+        let mut natives: Vec<String> = catalog
+            .instruments()
+            .map(|instrument| instrument.native_symbol.clone())
+            .collect();
+        natives.sort();
+        assert_eq!(natives, vec![".BTC250627C60000", "BTC-27JUN25-60000-C"]);
+        // Filtering on the owning feed yields exactly that feed's leg.
+        let deribit_only: Vec<&Instrument> = catalog
+            .instruments()
+            .filter(|instrument| instrument.provider == pid("deribit"))
+            .collect();
+        assert_eq!(deribit_only.len(), 1);
+        match deribit_only.first() {
+            Some(found) => assert_eq!(found.native_symbol, "BTC-27JUN25-60000-C"),
+            None => panic!("expected the deribit leg"),
+        }
     }
 
     #[test]
