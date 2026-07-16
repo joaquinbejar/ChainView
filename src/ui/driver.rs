@@ -234,16 +234,17 @@ fn dispatch_key(app: &mut App, key: KeyEvent) {
     match app.dispatch_key_global(key) {
         KeyRoute::Consumed => {}
         KeyRoute::ToScreen => {
-            // A screen-local navigation change — the chain strike cursor or the
-            // focused leg (#18) — mutates `LiveState` directly and produces **no**
-            // `AppEvent`, so it would not otherwise mark the app dirty. Detect it by
-            // diffing the live `Selection` (a `Copy` value) across the forward and
-            // request a redraw when it changed, so the cursor actually paints while
-            // a truly-unbound key that the screen ignores leaves the frame clean
-            // (the idle-redraw property of `docs/05-views-and-ux.md` §8 holds).
-            let before = live_selection(app);
+            // A screen-local change — the chain strike cursor / focused leg (#18) or a
+            // payoff-builder edit (#26) — mutates `LiveState` directly and produces
+            // **no** `AppEvent`, so it would not otherwise mark the app dirty. Detect
+            // it by diffing a `Copy` live-view signature (the `Selection` plus the
+            // builder's edit revision) across the forward and request a redraw when it
+            // changed, so the edit actually paints while a truly-unbound key the screen
+            // ignores leaves the frame clean (the idle-redraw property of
+            // `docs/05-views-and-ux.md` §8 holds).
+            let before = live_view_sig(app);
             let follow = screen_handle_key(app, key);
-            if live_selection(app) != before {
+            if live_view_sig(app) != before {
                 app.dirty = true;
             }
             if let Some(follow) = follow {
@@ -253,13 +254,15 @@ fn dispatch_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// The live-mode [`Selection`] as a `Copy` snapshot, or `None` in replay mode
-/// (which has no strike cursor) — the diff basis that turns a screen-local
-/// navigation change into a redraw request.
+/// A `Copy` snapshot of the live screen's local mutable state that a screen key can
+/// change without emitting an `AppEvent` — the chain [`Selection`] plus the
+/// payoff-builder edit revision (`docs/02-tui-architecture.md` §8) — or `None` in
+/// replay mode (which has no such cursor). The diff basis that turns a screen-local
+/// change into a redraw request.
 #[must_use]
-fn live_selection(app: &App) -> Option<Selection> {
+fn live_view_sig(app: &App) -> Option<(Selection, u64)> {
     match &app.mode {
-        Mode::Live(live) => Some(live.selection),
+        Mode::Live(live) => Some((live.selection, live.payoff_builder.revision())),
         Mode::Replay(_) => None,
     }
 }
@@ -590,6 +593,39 @@ mod tests {
             ),
             Mode::Replay(_) => panic!("expected a live app"),
         }
+    }
+
+    #[test]
+    fn test_fold_event_payoff_add_leg_marks_dirty() {
+        // A payoff builder key (`a`) is forwarded to the payoff screen (#26), which
+        // appends a leg — a screen-local edit that emits no command, so the loop
+        // detects the builder's revision change and requests a redraw.
+        let (mut app, mut rx) = live_app(LiveScreen::Payoff, ScreenLoad::Ready, false);
+        assert!(!app.dirty, "the app is clean after its initial frame");
+        fold_event(&mut app, AppEvent::Key(key(KeyCode::Char('a'))));
+        assert!(app.dirty, "appending a builder leg requests a redraw");
+        assert!(rx.try_recv().is_err(), "a builder edit emits no command");
+        match &app.mode {
+            Mode::Live(live) => assert_eq!(
+                live.payoff_builder.legs().len(),
+                1,
+                "the focused leg is appended",
+            ),
+            Mode::Replay(_) => panic!("expected a live app"),
+        }
+    }
+
+    #[test]
+    fn test_fold_event_payoff_unbound_key_makes_no_change_no_dirty() {
+        // A key bound to nothing on the payoff screen (`z`) changes no builder state,
+        // so the revision is unchanged and no redundant redraw fires (§8).
+        let (mut app, _rx) = live_app(LiveScreen::Payoff, ScreenLoad::Ready, false);
+        assert!(!app.dirty, "the app is clean after its initial frame");
+        fold_event(&mut app, AppEvent::Key(key(KeyCode::Char('z'))));
+        assert!(
+            !app.dirty,
+            "an unbound key changes nothing and requests no redraw"
+        );
     }
 
     #[test]

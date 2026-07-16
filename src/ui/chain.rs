@@ -1175,10 +1175,12 @@ fn fmt_strike(strike: Positive) -> String {
 /// dispatch and the help overlay read one table and cannot drift — there is **no**
 /// parallel key table here. Local navigation (strike cursor, leg focus) mutates
 /// [`LiveState`] and returns `None` (the render loop detects the [`Selection`]
-/// change and redraws, `docs/05-views-and-ux.md` §8). Actions that need I/O
-/// (multi-expiry subscribe, underlying switch, drill-in, the v0.2 payoff builder)
-/// are resolved but not yet wired — never performed inline; they land with their
-/// data plumbing, exactly as the replay screen defers its playback actions.
+/// change and redraws, `docs/05-views-and-ux.md` §8). `a` appends the focused leg to
+/// the payoff builder — the headline chain→`a`→builder gesture, sharing the Payoff
+/// screen's [`append_focused_leg`](crate::ui::payoff) helper. Actions that need I/O
+/// (multi-expiry subscribe, underlying switch, drill-in) are resolved but not yet
+/// wired — never performed inline; they land with their data plumbing, exactly as the
+/// replay screen defers its playback actions.
 ///
 /// [`Selection`]: crate::Selection
 #[must_use]
@@ -1193,13 +1195,19 @@ pub fn handle_key(state: &mut LiveState, key: KeyEvent) -> Option<AppEvent> {
             focus_leg(state, chord);
             None
         }
+        ChainAction::AddLeg => {
+            // The headline gesture: focus a strike with `c`/`p`, press `a` to append
+            // it to the payoff builder. Reuses the SAME append logic the Payoff screen
+            // uses (ui→ui is allowed), which bumps the builder revision so the driver's
+            // `live_view_sig` diff marks the frame dirty; an empty chain is a safe
+            // no-op.
+            crate::ui::payoff::append_focused_leg(state);
+            None
+        }
         // Resolved through the map, but their I/O plumbing is a later issue: a
-        // multi-expiry subscribe path, an underlying list, the drill-in view, and
-        // the v0.2 payoff builder. They never perform I/O inline here.
-        ChainAction::SwitchExpiry
-        | ChainAction::SwitchUnderlying
-        | ChainAction::Drill
-        | ChainAction::AddLeg => None,
+        // multi-expiry subscribe path, an underlying list, and the drill-in view.
+        // They never perform I/O inline here.
+        ChainAction::SwitchExpiry | ChainAction::SwitchUnderlying | ChainAction::Drill => None,
     }
 }
 
@@ -2603,19 +2611,98 @@ mod tests {
 
     #[test]
     fn test_handle_key_deferred_actions_are_noops_no_io() {
-        // Expiry/underlying/drill/add resolve through the map but are not yet wired;
-        // they return None and perform no I/O, changing no selection.
+        // Expiry/underlying/drill resolve through the map but are not yet wired; they
+        // return None and perform no I/O, changing no selection. (AddLeg `a` is wired
+        // in #26 — covered separately — so it is not in this deferred set.)
         let mut live = live_with(chain_with(&[60_000.0]), ScreenLoad::Ready);
         let before = live.selection;
         for code in [
             KeyCode::Char('l'), // SwitchExpiry
             KeyCode::Char(']'), // SwitchUnderlying
             KeyCode::Enter,     // Drill
-            KeyCode::Char('a'), // AddLeg
         ] {
             assert!(handle_key(&mut live, press(code)).is_none());
         }
         assert_eq!(live.selection, before, "deferred actions change no state");
+    }
+
+    #[test]
+    fn test_handle_key_add_leg_appends_focused_leg_to_builder_and_marks_dirty() {
+        // The headline chain→`a`→builder gesture: focus a call with `c`, press `a`, and
+        // the focused leg lands in the payoff builder; a second focus+`a` appends in
+        // order. Each successful append bumps the builder revision (what the driver
+        // diffs to mark the frame dirty).
+        let mut live = live_with(
+            chain_with(&[58_000.0, 60_000.0, 62_000.0]),
+            ScreenLoad::Ready,
+        );
+        assert!(live.payoff_builder.is_empty(), "builder starts empty");
+        let rev0 = live.payoff_builder.revision();
+
+        // `c` focuses the call leg and reveals the cursor at the ATM anchor (index 1 =
+        // 60000); `a` appends that focused call.
+        let _ = handle_key(&mut live, press(KeyCode::Char('c')));
+        assert_eq!(
+            live.selection.focused_row,
+            Some(1),
+            "focus reveals the ATM cursor"
+        );
+        let _ = handle_key(&mut live, press(KeyCode::Char('a')));
+        assert_eq!(live.payoff_builder.legs().len(), 1, "one leg appended");
+        let leg0 = match live.payoff_builder.legs().first() {
+            Some(leg) => *leg,
+            None => panic!("expected a first leg"),
+        };
+        assert_eq!(leg0.strike, pos(60_000.0), "the focused strike is appended");
+        assert_eq!(leg0.style, OptionStyle::Call, "the focused call leg");
+        let rev1 = live.payoff_builder.revision();
+        assert!(
+            rev1 > rev0,
+            "a successful append bumps the builder revision (marks the frame dirty)"
+        );
+
+        // Step down to 62000, focus the put leg, then `a` appends it AFTER the call.
+        let _ = handle_key(&mut live, press(KeyCode::Char('j')));
+        let _ = handle_key(&mut live, press(KeyCode::Char('p')));
+        let _ = handle_key(&mut live, press(KeyCode::Char('a')));
+        assert_eq!(
+            live.payoff_builder.legs().len(),
+            2,
+            "second leg appended in order"
+        );
+        let leg1 = match live.payoff_builder.legs().get(1) {
+            Some(leg) => *leg,
+            None => panic!("expected a second leg"),
+        };
+        assert_eq!(
+            leg1.strike,
+            pos(62_000.0),
+            "second leg is the newly focused strike"
+        );
+        assert_eq!(leg1.style, OptionStyle::Put, "second leg is a put");
+        assert!(
+            live.payoff_builder.revision() > rev1,
+            "the second append bumps the revision again"
+        );
+    }
+
+    #[test]
+    fn test_handle_key_add_leg_on_empty_chain_is_safe_noop() {
+        // An empty chain: `a` appends nothing and leaves the builder untouched (no
+        // revision bump), the same bounds-safe no-op as before wiring.
+        let empty = OptionChain::new("BTC", pos(60_000.0), "2025-06-27".to_owned(), None, None);
+        let mut live = live_with(empty, ScreenLoad::Ready);
+        let rev0 = live.payoff_builder.revision();
+        let _ = handle_key(&mut live, press(KeyCode::Char('a')));
+        assert!(
+            live.payoff_builder.is_empty(),
+            "no leg appended on an empty chain"
+        );
+        assert_eq!(
+            live.payoff_builder.revision(),
+            rev0,
+            "a no-op append does not bump the revision"
+        );
     }
 
     #[test]

@@ -128,7 +128,7 @@ pub fn render(app: &App, frame: &mut Frame) {
             }
             LiveScreen::Depth => depth::draw(state, frame, root.body),
             LiveScreen::Surface => surface::draw(state, frame, root.body),
-            LiveScreen::Payoff => payoff::draw(state, frame, root.body),
+            LiveScreen::Payoff => payoff::draw(state, frame, root.body, theme),
         },
         Mode::Replay(state) => match state.screen {
             ReplayScreen::Replay => replay::draw(state, frame, root.body),

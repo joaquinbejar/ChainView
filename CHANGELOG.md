@@ -14,6 +14,40 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- Multi-leg payoff builder state, keybindings, and validation (`src/app.rs`,
+  `src/ui/payoff.rs`, `src/app/keymap.rs`, issue #26; docs 05 §3, §6) — the
+  interaction layer the payoff screen (#27) will render, state + keys + validation
+  only (no curve). The application layer gains the ordered builder state machine:
+  `BuilderLeg { strike, style, side, qty }`, a `Side { Buy, Sell }`, a `CurveMode
+  { Expiration, TPlus0 }`, a structured `LegError`, and a `CommittedStrategy`, all
+  owned by a fleshed-out `PayoffBuilder` (an ordered `Vec<BuilderLeg>` + a cursor +
+  a monotonic edit revision). The payoff screen's `handle_key` resolves through the
+  single keymap (new `resolve_payoff`) and drives the builder: `a` appends the
+  chain's focused leg (cursor strike + call/put, long by default; falls back to the
+  nearest-spot strike when no row is focused), `x` removes the cursor leg, `+`/`-`
+  increment/decrement the **cursor** leg's quantity (the direction read from the
+  shared chord), `s` toggles its side, `Enter` validates and commits, `Esc`
+  discards, and `t` toggles the expiration ⇄ t+0 curve mode (the curve itself
+  renders in #27). Every edit is cursor-scoped and bounds-safe (`.get()`/`.get_mut()`,
+  checked/floored quantity arithmetic — no overflow, no zero-underflow). `Enter`
+  runs a **pure** `PayoffBuilder::validate(&chain)` returning a typed result — ≥ 1
+  leg, no zero-qty leg, and every leg with a known/fresh mark
+  (`BuilderLeg::mark_in`, the `—`-not-`0` rule) — and commits only when valid;
+  otherwise it renders the inline per-leg error (e.g. `leg 2: no mark`) and commits
+  nothing. `handle_key` is pure over `&mut LiveState` (no I/O, no `.await`), returns
+  no `AppEvent`; the render loop learns a builder edit changed via the builder's
+  revision (diffed alongside the chain `Selection`), so a mutation redraws while an
+  ignored key leaves the frame clean. `payoff::draw` renders the states first — the
+  empty "add a leg with `a`" hint, the in-progress leg list (cursor-marked, with
+  each leg's mark or `—`), the inline validation errors, and the committed
+  strategy's legs — never a blank, never a panic; color is never the only signal
+  (BUY/SELL text, `▸` cursor glyph, `!` error, `✓` commit). The payoff keys are now
+  wired (deferred markers cleared) and continue to appear in the help overlay from
+  the one keymap. The **Chain**-screen `a` (`ChainAction::AddLeg`) is wired to the
+  same append path, so the headline gesture — focus a strike on the chain with
+  `c`/`p`, then press `a` to add it to the builder — is now live (its deferred marker
+  cleared too), sharing `payoff::append_focused_leg` (ui→ui) and bumping the same
+  builder revision the driver diffs to redraw.
 - Per-leg Greeks precedence wired through the chain matrix (`src/chain/store.rs`,
   `src/ui/chain.rs`, issue #25; docs 01 §7, §8) — the projection+wiring layer on
   the #24 engine. `ChainStore` now **owns** the style-keyed `GreeksSidecar` and

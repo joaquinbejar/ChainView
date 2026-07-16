@@ -44,8 +44,9 @@ use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use optionstratlib::OptionStyle;
 use optionstratlib::chains::chain::OptionChain;
-use optionstratlib::prelude::Decimal;
+use optionstratlib::prelude::{Decimal, Positive};
 use tokio::sync::mpsc;
 
 use crate::app::keymap::{GlobalCommand, KeyChord, resolve_global};
@@ -936,18 +937,428 @@ pub struct Selection {
     pub focused_leg: LegFocus,
 }
 
-/// The multi-leg payoff-builder state (`docs/05-views-and-ux.md` §3). A
-/// documented stub whose internals land in v0.2; `#[non_exhaustive]` so those
-/// fields are a source-compatible addition.
-#[derive(Debug, Clone, Default)]
+/// Whether a payoff-builder leg is **bought** (long) or **sold** (short)
+/// (`docs/05-views-and-ux.md` §3). A ChainView UI closed set, fieldless, so
+/// `#[repr(u8)]` per the ruleset; it defaults to [`Buy`](Side::Buy) — a freshly
+/// appended leg is long until `s` toggles it. The `Selection` carries no side, so
+/// [`PayoffBuilder`](PayoffBuilder)'s append seeds a leg long and `s` flips it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum Side {
+    /// A bought (long) leg.
+    #[default]
+    Buy,
+    /// A sold (short) leg.
+    Sell,
+}
+
+impl Side {
+    /// The opposite side — `Buy ⇄ Sell` (`s` on the payoff screen). Exhaustive
+    /// over the closed set with no wildcard arm.
+    #[must_use]
+    pub fn toggled(self) -> Self {
+        match self {
+            Self::Buy => Self::Sell,
+            Self::Sell => Self::Buy,
+        }
+    }
+
+    /// The short, color-independent label for the side (`BUY` / `SELL`), so the
+    /// side reads on a monochrome terminal (color is never the only signal).
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Buy => "BUY",
+            Self::Sell => "SELL",
+        }
+    }
+}
+
+/// One leg of the multi-leg payoff builder (`docs/05-views-and-ux.md` §3): a
+/// contract at a `strike`/`style`, a `side` (buy/sell), and an integer `qty`
+/// (contracts). Appended from the chain's focused leg (`a`) and edited in place by
+/// the cursor keys. A `qty` of `0` is an invalid state validation rejects, so it is
+/// a plain `u32`, not a `NonZero` — the zero-qty check exists precisely to catch it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BuilderLeg {
+    /// The strike price of the contract.
+    pub strike: Positive,
+    /// The option style (call or put).
+    pub style: OptionStyle,
+    /// Whether the leg is bought or sold.
+    pub side: Side,
+    /// The number of contracts; a `0` qty fails validation.
+    pub qty: u32,
+}
+
+impl BuilderLeg {
+    /// The leg's mark (mid) price in `chain`, or `None` when the strike is absent
+    /// from the chain, the relevant side has no mid this frame, **or** the mid is the
+    /// non-finite `Positive::INFINITY` sentinel — the `—`-not-`0` honesty rule
+    /// (`docs/01-domain-model.md` §8). A pure lookup: validation and the builder
+    /// widget both read the mark through this one helper so they cannot disagree on
+    /// what "known" means.
+    #[must_use]
+    pub fn mark_in(&self, chain: &OptionChain) -> Option<Positive> {
+        let od = chain
+            .options
+            .iter()
+            .find(|o| o.strike_price == self.strike)?;
+        let mid = match self.style {
+            OptionStyle::Call => od.call_middle,
+            OptionStyle::Put => od.put_middle,
+        };
+        // Honesty symmetry with the display: `fmt_price` renders the `Positive::INFINITY`
+        // sentinel as `—` (unknown), so an infinite mid is "no mark" here too — it fails
+        // validation with `NoMark`, never passing a value the widget would paint as `—`.
+        mid.filter(|m| *m != Positive::INFINITY)
+    }
+}
+
+/// Which payoff curve the screen draws (`docs/05-views-and-ux.md` §4): the
+/// **expiration** payoff or the **t+0** (mark-based) curve, toggled by `t`. The
+/// state lives here because the toggle is a view preference on the builder; the
+/// curve itself is rendered by the payoff screen (#27). A closed set, fieldless, so
+/// `#[repr(u8)]` per the ruleset; defaults to [`Expiration`](CurveMode::Expiration).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum CurveMode {
+    /// The payoff at expiration.
+    #[default]
+    Expiration,
+    /// The t+0 (current-mark) curve.
+    TPlus0,
+}
+
+impl CurveMode {
+    /// The other curve — `Expiration ⇄ t+0` (`t`). Exhaustive with no wildcard arm.
+    #[must_use]
+    pub fn toggled(self) -> Self {
+        match self {
+            Self::Expiration => Self::TPlus0,
+            Self::TPlus0 => Self::Expiration,
+        }
+    }
+
+    /// The short, color-independent label for the curve mode.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Expiration => "expiration",
+            Self::TPlus0 => "t+0",
+        }
+    }
+}
+
+/// A single validation failure of the payoff builder, projected inline in the
+/// builder panel (`docs/05-views-and-ux.md` §3, §6). A ChainView closed set matched
+/// exhaustively with no wildcard arm. Leg indices are **1-based** in the message so
+/// the text matches the ladder the user sees (e.g. `leg 2: no mark`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LegError {
+    /// The builder has no legs — the empty state, not a per-leg failure.
+    Empty,
+    /// The leg at zero-based index `idx` has a zero quantity.
+    ZeroQty {
+        /// The zero-based index of the offending leg.
+        idx: usize,
+    },
+    /// The leg at zero-based index `idx` has no known/fresh mark in the current
+    /// chain snapshot (its strike is absent, or its side has no mid this frame).
+    NoMark {
+        /// The zero-based index of the offending leg.
+        idx: usize,
+    },
+}
+
+impl std::fmt::Display for LegError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => write!(f, "add a leg with `a`"),
+            Self::ZeroQty { idx } => write!(f, "leg {}: zero quantity", idx + 1),
+            Self::NoMark { idx } => write!(f, "leg {}: no mark", idx + 1),
+        }
+    }
+}
+
+/// A validated, committed multi-leg strategy (`docs/05-views-and-ux.md` §3). Built
+/// only by [`PayoffBuilder::validate`] from a strategy that passed every check, so
+/// the payoff screen (#27) can draw it **without re-validating**. `#[non_exhaustive]`
+/// so the cached payoff `GraphData` the render adapter (#23/#27) adds is a
+/// source-compatible addition.
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
-pub struct PayoffBuilder;
+pub struct CommittedStrategy {
+    /// The validated legs, in the order they were built.
+    legs: Vec<BuilderLeg>,
+}
+
+impl CommittedStrategy {
+    /// The validated legs, in build order.
+    #[must_use]
+    pub fn legs(&self) -> &[BuilderLeg] {
+        &self.legs
+    }
+}
+
+/// The multi-leg payoff-builder state machine (`docs/05-views-and-ux.md` §3): an
+/// ordered [`BuilderLeg`] list with a cursor, the current [`CurveMode`], the last
+/// validation errors, and the committed strategy. It lives in the **application**
+/// layer so the payoff screen (`src/ui/payoff.rs`) drives it through these methods
+/// and reads it through the accessors — the UI never reaches into the fields
+/// directly (`rules/global_rules.md`, inner fields private).
+///
+/// Every mutation that changes visible state bumps a monotonic
+/// [`revision`](Self::revision) the render loop diffs to schedule a redraw, exactly
+/// as it diffs the chain [`Selection`] (`docs/02-tui-architecture.md` §8): a builder
+/// edit emits **no** [`AppEvent`], so the revision is how the loop learns the frame
+/// changed.
+#[derive(Debug, Clone, Default)]
+pub struct PayoffBuilder {
+    /// The ordered legs being built.
+    legs: Vec<BuilderLeg>,
+    /// The cursor index into [`legs`](Self::legs); every in-place edit targets this
+    /// leg. Kept in bounds by every mutator (or `0` when empty).
+    cursor: usize,
+    /// Which payoff curve the screen draws (`t` toggles); a view preference kept
+    /// across a discard.
+    curve: CurveMode,
+    /// The validation errors from the last [`commit`](Self::commit) attempt, cleared
+    /// on any edit. Rendered inline in the builder.
+    errors: Vec<LegError>,
+    /// The committed strategy (set by a successful [`commit`](Self::commit), cleared
+    /// on any edit). `None` while the strategy is still being built.
+    committed: Option<CommittedStrategy>,
+    /// A monotonic edit counter the render loop diffs to schedule a redraw.
+    revision: u64,
+}
+
+/// The default quantity of a freshly appended leg (one contract).
+const DEFAULT_LEG_QTY: u32 = 1;
+
+/// The maximum quantity a single leg's `+` can reach, so an increment can never
+/// overflow `u32` (`rules/global_rules.md`, no `saturating_*`/`wrapping_*`). A
+/// four-digit cap is far beyond any realistic hand-built strategy.
+const MAX_LEG_QTY: u32 = 9_999;
 
 impl PayoffBuilder {
-    /// An empty payoff builder.
+    /// An empty payoff builder (no legs, cursor at `0`, expiration curve).
     #[must_use]
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    // --- Accessors (the UI reads state; it never mutates the fields) ----------
+
+    /// The ordered legs being built, borrowed for rendering.
+    #[must_use]
+    pub fn legs(&self) -> &[BuilderLeg] {
+        &self.legs
+    }
+
+    /// Whether the builder has no legs (the empty state).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.legs.is_empty()
+    }
+
+    /// The cursor index into [`legs`](Self::legs) — always in bounds, or `0` when
+    /// empty. The UI reads it with [`legs`](Self::legs)`.get(cursor)`, never an
+    /// unchecked index.
+    #[must_use]
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    /// The active payoff [`CurveMode`] (`t` toggles it).
+    #[must_use]
+    pub fn curve(&self) -> CurveMode {
+        self.curve
+    }
+
+    /// The validation errors from the last commit attempt (empty when none),
+    /// borrowed for the inline error render.
+    #[must_use]
+    pub fn errors(&self) -> &[LegError] {
+        &self.errors
+    }
+
+    /// The committed strategy, or `None` while still building.
+    #[must_use]
+    pub fn committed(&self) -> Option<&CommittedStrategy> {
+        self.committed.as_ref()
+    }
+
+    /// The monotonic edit counter the render loop diffs to schedule a redraw
+    /// (`docs/02-tui-architecture.md` §8).
+    #[must_use]
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    // --- Mutations (each edit clears the stale commit + errors and bumps the
+    //     revision when it changes visible state) ------------------------------
+    //
+    // These are `pub(crate)`: the builder is hand-driven only by the in-crate UI
+    // (`payoff::handle_key`, the chain-side `a`, the driver), never by an external
+    // lib consumer — so the semver-governed public surface stays the types, the read
+    // accessors, and `validate`, not these mutators.
+
+    /// Append a leg from the chain's focused `strike`/`style`, long by default, with
+    /// the cursor tracking the newly added leg (`a`). Any prior commit/errors are
+    /// stale once the strategy changes, so they are cleared.
+    pub(crate) fn append(&mut self, strike: Positive, style: OptionStyle) {
+        self.legs.push(BuilderLeg {
+            strike,
+            style,
+            side: Side::Buy,
+            qty: DEFAULT_LEG_QTY,
+        });
+        // The cursor tracks the leg just added; `len` is ≥ 1 here.
+        self.cursor = self.legs.len().max(1) - 1;
+        self.on_edit();
+    }
+
+    /// Remove the cursor leg (`x`), clamping the cursor to the new last leg (or `0`
+    /// when the list becomes empty). A no-op when the cursor is out of bounds.
+    pub(crate) fn remove_cursor(&mut self) {
+        if self.cursor >= self.legs.len() {
+            return;
+        }
+        let _ = self.legs.remove(self.cursor);
+        if self.cursor >= self.legs.len() {
+            // Removed the last leg: step the cursor back to the new last (or 0).
+            self.cursor = self.legs.len().max(1) - 1;
+        }
+        self.on_edit();
+    }
+
+    /// Increase the cursor leg's quantity by one, capped at `MAX_LEG_QTY` so the
+    /// add can never overflow (`+`). A no-op with no cursor leg or already at the cap.
+    pub(crate) fn increment_qty(&mut self) {
+        if let Some(leg) = self.legs.get_mut(self.cursor)
+            && leg.qty < MAX_LEG_QTY
+        {
+            // `leg.qty < MAX_LEG_QTY < u32::MAX`, so `+ 1` cannot overflow.
+            leg.qty += 1;
+            self.on_edit();
+        }
+    }
+
+    /// Decrease the cursor leg's quantity by one, floored at `0` (`-`). A `0`-qty leg
+    /// is left in place (validation reports it) so the user can bump it back up or
+    /// remove it. A no-op with no cursor leg or already at `0`.
+    pub(crate) fn decrement_qty(&mut self) {
+        if let Some(leg) = self.legs.get_mut(self.cursor)
+            && leg.qty > 0
+        {
+            // `leg.qty > 0`, so `- 1` cannot underflow.
+            leg.qty -= 1;
+            self.on_edit();
+        }
+    }
+
+    /// Toggle the cursor leg buy ⇄ sell (`s`). A no-op with no cursor leg.
+    pub(crate) fn toggle_cursor_side(&mut self) {
+        if let Some(leg) = self.legs.get_mut(self.cursor) {
+            leg.side = leg.side.toggled();
+            self.on_edit();
+        }
+    }
+
+    /// Toggle the payoff curve expiration ⇄ t+0 (`t`). The curve **render** lands in
+    /// #27; this owns the view-mode state so the key is never orphaned. Does not
+    /// touch the built legs, so it keeps any commit/errors.
+    pub(crate) fn toggle_curve(&mut self) {
+        self.curve = self.curve.toggled();
+        self.bump();
+    }
+
+    /// Discard the uncommitted strategy and return to the empty state (`Esc`): clear
+    /// the legs, cursor, errors, and any commit. The [`CurveMode`] is a view
+    /// preference and is **kept**. A no-op (no redraw) when already empty.
+    pub(crate) fn discard(&mut self) {
+        if self.legs.is_empty() && self.errors.is_empty() && self.committed.is_none() {
+            return;
+        }
+        self.legs.clear();
+        self.cursor = 0;
+        self.errors.clear();
+        self.committed = None;
+        self.bump();
+    }
+
+    /// Validate the built strategy against `chain` and, when valid, store the
+    /// committed strategy (`Enter`); on failure store the per-leg errors and commit
+    /// nothing. Returns whether the strategy committed.
+    ///
+    /// The chain is borrowed immutably while `self` is borrowed mutably — the caller
+    /// passes disjoint field borrows (`store.chain()` vs `payoff_builder`), so the
+    /// draw path stays free of any pricing or I/O; validation is a pure read.
+    pub(crate) fn commit(&mut self, chain: &OptionChain) -> bool {
+        match self.validate(chain) {
+            Ok(strategy) => {
+                self.committed = Some(strategy);
+                self.errors.clear();
+                self.bump();
+                true
+            }
+            Err(errors) => {
+                self.committed = None;
+                self.errors = errors;
+                self.bump();
+                false
+            }
+        }
+    }
+
+    /// Validate the built strategy against the current `chain` snapshot — a **pure**
+    /// function of the builder and the chain, inventing and pricing nothing. The
+    /// checks are: **≥ 1 leg**, **no zero-qty leg**, and **every leg has a
+    /// known/fresh mark** ([`BuilderLeg::mark_in`], the `—`-not-`0` rule). The
+    /// result is what the widget renders inline, so #27 draws the committed strategy
+    /// without re-validating.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`Vec`] of [`LegError`] describing every failure: a lone
+    /// [`LegError::Empty`] when there are no legs, else a [`LegError::ZeroQty`] /
+    /// [`LegError::NoMark`] per offending leg (a leg can report both).
+    pub fn validate(&self, chain: &OptionChain) -> Result<CommittedStrategy, Vec<LegError>> {
+        if self.legs.is_empty() {
+            return Err(vec![LegError::Empty]);
+        }
+        let mut errors = Vec::new();
+        for (idx, leg) in self.legs.iter().enumerate() {
+            if leg.qty == 0 {
+                errors.push(LegError::ZeroQty { idx });
+            }
+            if leg.mark_in(chain).is_none() {
+                errors.push(LegError::NoMark { idx });
+            }
+        }
+        if errors.is_empty() {
+            Ok(CommittedStrategy {
+                legs: self.legs.clone(),
+            })
+        } else {
+            Err(errors)
+        }
+    }
+
+    /// Shared post-edit bookkeeping: a strategy edit invalidates the last commit and
+    /// its errors, then bumps the revision so the loop redraws.
+    fn on_edit(&mut self) {
+        self.committed = None;
+        self.errors.clear();
+        self.bump();
+    }
+
+    /// Advance the redraw revision, wrapping to `0` on the (practically unreachable)
+    /// `u64` overflow — `checked_add` avoids the banned `wrapping_add`, matching the
+    /// tick counter (`docs/02-tui-architecture.md` §8).
+    fn bump(&mut self) {
+        self.revision = self.revision.checked_add(1).unwrap_or(0);
     }
 }
 
