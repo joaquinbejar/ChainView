@@ -203,13 +203,13 @@ impl StagingMap {
     }
 
     /// The number of staged instruments (slots) — bounded by N.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "bench"))]
     fn len(&self) -> usize {
         self.slots.len()
     }
 
     /// The allocated slot capacity, for asserting the reuse discipline (HP-3).
-    #[cfg(test)]
+    #[cfg(any(test, feature = "bench"))]
     fn capacity(&self) -> usize {
         self.slots.capacity()
     }
@@ -405,23 +405,28 @@ impl EventBridge {
     }
 }
 
-#[cfg(test)]
+// Test- and bench-only inspection of the O(N) staging bound (NFR-15). The
+// `bench` arm lets the `bench_chain_merge` harness (#21, `crate::bench_support`)
+// measure the staging bound — slots ≤ N, capacity flat across bursts — as the
+// bounded-memory demonstration, not just latency. `pub(crate)` (never public), so
+// the default semver surface is unchanged.
+#[cfg(any(test, feature = "bench"))]
 impl EventBridge {
-    /// The number of staged instruments — test-only view of the O(N) bound.
-    fn staged_len(&self) -> usize {
+    /// The number of staged instruments — a view of the O(N) bound.
+    pub(crate) fn staged_len(&self) -> usize {
         self.staging.len()
     }
 
-    /// The staging map's allocated capacity — test-only view of the HP-3 reuse.
-    fn staged_capacity(&self) -> usize {
+    /// The staging map's allocated capacity — a view of the HP-3 allocation reuse.
+    pub(crate) fn staged_capacity(&self) -> usize {
         self.staging.capacity()
     }
 
     /// Drain the coalesced channel into the staging map **without** flushing, so
-    /// a test can inspect the staged bound before it is emitted. A misrouted
+    /// a caller can inspect the staged bound before it is emitted. A misrouted
     /// control update is dropped here (production uses `pump`/`pump_into`, which
-    /// fold it); tests drive only coalesced-class updates through this helper.
-    fn coalesce_pending(&mut self) {
+    /// fold it); callers drive only coalesced-class updates through this helper.
+    pub(crate) fn coalesce_pending(&mut self) {
         let mut discard = |_update: MarketUpdate| {};
         self.coalesce(&mut discard);
     }

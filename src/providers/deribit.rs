@@ -973,10 +973,13 @@ fn assemble_chain(
 /// chain) proves the rendered matrix reflects the adapter's output. Passing a
 /// **hostile** `underlying` also proves the seam keeps venue bytes verbatim — the
 /// domain never mangles a venue string — so it is the render edge, not the domain,
-/// that neutralizes the escape sequence (`docs/SECURITY.md` §6.4). `#[cfg(test)]`,
-/// so it never rides in the release binary; the fixture bytes are baked in with
-/// `include_str!`, so the golden is byte-stable across machines (no I/O, no socket).
-#[cfg(test)]
+/// that neutralizes the escape sequence (`docs/SECURITY.md` §6.4).
+/// `#[cfg(any(test, feature = "bench"))]`, so it never rides in the release
+/// binary; it is reachable from the bench harness (issue #21) to confirm the
+/// recorded-fixture normalize/assemble path is exercisable off the default
+/// surface. The fixture bytes are baked in with `include_str!`, so the golden is
+/// byte-stable across machines (no I/O, no socket).
+#[cfg(any(test, feature = "bench"))]
 pub(crate) fn fixture_btc_chain_fetch_named(underlying: &str) -> ChainFetch {
     use deribit_http::model::ticker::TickerData;
     use deribit_websocket::prelude::Value;
@@ -1048,6 +1051,78 @@ pub(crate) fn fixture_btc_chain_fetch_named(underlying: &str) -> ChainFetch {
         &legs,
         &deribit_provider_id(),
     )
+}
+
+// ---------------------------------------------------------------------------
+// Bench-only streaming-normalization burst (#21) — the HP-3 seam.
+// ---------------------------------------------------------------------------
+
+/// Bench-only: normalize a synthetic `ticker.`+`book.` burst for `legs` through
+/// the **real** streaming-normalization seam ([`normalize_ticker`] /
+/// [`normalize_book`]) — the busiest provider path (HP-3,
+/// `docs/06-performance.md` §2) exercised with no socket and no wall clock.
+///
+/// `round` perturbs each quote so successive bursts carry fresh, non-crossed
+/// values (the coalescing merge then does real last-value-wins work), and every
+/// event carries a monotonically advancing venue `event_time`, so the store's
+/// per-instrument watermark advances rather than dropping the update out of
+/// order. Each leg yields a [`QuoteUpdate`], a [`GreeksRow`], and a
+/// [`DepthLadder`] — the three coalesced-class updates the Deribit overlay emits.
+///
+/// Gated behind the `bench` feature only (its sole caller is
+/// [`crate::bench_support`], also `bench`-gated), so it never rides in a normal
+/// build and adds nothing to the default public surface.
+#[cfg(feature = "bench")]
+pub(crate) fn bench_stream_burst(
+    legs: &[Instrument],
+    round: u64,
+    received: DateTime<Utc>,
+) -> Vec<MarketUpdate> {
+    // A deterministic, non-crossed quote that varies by round (16-step cycle) so
+    // the merge is real work, not a no-op re-apply of an identical value.
+    let step = u32::try_from(round % 16).unwrap_or(0);
+    let base = 1.0 + f64::from(step) * 0.05;
+    // Advance the venue `event_time` monotonically so the store's watermark
+    // accepts each burst (an equal or lower timestamp would drop as out of order).
+    let base_ms = 1_751_011_200_000_i64; // 2025-06-27T08:00:00Z, the fixture expiry
+    let event_ms = base_ms
+        .checked_add(i64::try_from(round).unwrap_or(0))
+        .unwrap_or(i64::MAX);
+
+    let mut out = Vec::new();
+    for leg in legs {
+        let ticker = TickerPayload {
+            best_bid_price: Some(base),
+            best_ask_price: Some(base + 0.2),
+            best_bid_amount: Some(10.0),
+            best_ask_amount: Some(12.0),
+            last_price: Some(base + 0.1),
+            mark_iv: Some(49.22),
+            timestamp: Some(event_ms),
+            greeks: Some(GreeksPayload {
+                delta: Some(0.5),
+                gamma: Some(0.01),
+            }),
+        };
+        let (quote, greeks) = normalize_ticker(leg, &ticker, received);
+        out.push(MarketUpdate::Quote(quote));
+        out.push(MarketUpdate::Greeks(greeks));
+
+        let book = BookPayload {
+            change_id: Some(round),
+            timestamp: Some(event_ms),
+            bids: vec![
+                BookLevel::Priced([base, 10.0]),
+                BookLevel::Priced([base - 0.1, 20.0]),
+            ],
+            asks: vec![
+                BookLevel::Priced([base + 0.2, 12.0]),
+                BookLevel::Priced([base + 0.3, 22.0]),
+            ],
+        };
+        out.push(MarketUpdate::Depth(normalize_book(leg, &book, received)));
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------

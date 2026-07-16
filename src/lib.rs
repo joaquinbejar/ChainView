@@ -19,6 +19,19 @@ pub(crate) mod providers;
 pub(crate) mod terminal;
 pub(crate) mod ui;
 
+// Bench-only support surface (issue #21), compiled ONLY under the `bench` Cargo
+// feature. It exposes the constructors the `benches/*` targets need — a
+// populated render `App`, a seeded `ChainStore`, a scripted `MarketUpdate`
+// burst, and the Deribit `ticker.`/`book.` → coalescing-merge harness — through
+// the crate's own public types, so a `benches/*.rs` (a separate crate that sees
+// only the public API) can reach the three hot paths WITHOUT the pure-render
+// `chain::draw`, the `ChainStore`, or the Deribit fixture being promoted to the
+// default public surface. Because it is `#[cfg(feature = "bench")]`, a normal
+// build never compiles it and the semver-governed API is unchanged
+// (`docs/06-performance.md` §4, `docs/TESTING.md` §11).
+#[cfg(feature = "bench")]
+pub mod bench_support;
+
 // The application state machine + fan-in (`docs/02-tui-architecture.md` §3, §4):
 // the `App`, the `Live | Replay` `Mode`, the mode-scoped `LiveScreen`/
 // `ReplayScreen`, the composite source/overlay bindings and per-screen state, and
