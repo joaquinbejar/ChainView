@@ -14,6 +14,42 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- **Replay adversarial fixtures + the HP-4 decode bench — the v0.3 security /
+  performance gate** (`tests/fixtures/bundle/*`, `tests/common/bundle_gen.rs`,
+  `tests/replay_bundle_fixtures.rs`, `benches/bench_replay_decode.rs`,
+  `src/replay/mod.rs`, `Cargo.toml`, `BENCH.md`, `docs/adr/0011-*`, issue #36;
+  `docs/TESTING.md` §6/§11/§13.3, `docs/04-replay-mode.md` §3/§5,
+  `docs/06-performance.md` §3.4/§4, `docs/SECURITY.md` §6.2). New crate deps: none
+  (the fixture generator + bench reuse the existing `parquet`/`arrow-array` deps and
+  the `arrow-schema`/`tempfile` dev-deps).
+  - **Committed adversarial corpus** under `tests/fixtures/bundle/` — deterministic,
+    tiny (~100 KB total) bundles produced by the reproducible generator
+    `tests/common/bundle_gen.rs` and loaded through the **real**
+    `BundleReader::open`+`load` path: the shared **conformance** bundle (`valid/`,
+    round-trips clean through the whole #32 chain — equity + attribution identities,
+    `run_id` as an opaque key), plus `bad_schema/` → `UnsupportedSchema`,
+    `missing_table/` → `MissingTable`, and the four resource adversaries
+    `oversized_footer/` / `rowcount_lie/` / `truncated/` / `decompression_bomb/`
+    each rejecting with its exact typed `BundleError`
+    (`TooLarge`/`Invariant`/`Parquet`) at a **pre-materialization** stage. Money is
+    integer cents throughout; a test asserts no `f64` on the decode path except the
+    analytic `drawdown` ratio.
+  - **Positive bounded-reject proofs** — three new `src/replay/mod.rs` unit tests
+    drive `scan_table` with a probe decoder and assert each adversarial shape
+    (bomb / over-ceiling footer / `row_counts` lie) rejects **without invoking the
+    decoder** and with `budget.used() == 0` (reusing the #30 working-set machinery),
+    so the reject provably never materializes the hostile payload.
+  - **HP-4 `bench_replay_decode`** — a `criterion` + `hdrhistogram` (p50/p99/p99.9)
+    bench of the open+decode+validate path over a 20 000-step (80 000-row)
+    conformance bundle, gated behind the `bench` feature; the measured baseline +
+    environment + coordinated-omission disclosure are recorded in `BENCH.md`.
+  - **ADR-0011 (Proposed)** records the `fills.position_id → positions.position_id`
+    referential gap (§5 does not require it; §6 drill-down joins on it): the check is
+    **not** added unilaterally (it would false-reject until IronCondor's writer
+    freezes), and the drill-down is proven to **degrade gracefully today** on a
+    dangling `position_id` (the detail panel reads the fill's own columns;
+    `open_positions` never fabricates a leg) by the committed
+    `dangling_position_id/` fixture + tests.
 - **Replay screen: equity, attribution, drill-down** (`src/ui/replay.rs`,
   `src/app/replay_view.rs`, `src/app.rs`, `src/ui/view.rs`, `src/ui/mod.rs`,
   `src/ui/driver.rs`, `src/app/keymap.rs`, issue #35; `docs/05-views-and-ux.md` §5/§6,
