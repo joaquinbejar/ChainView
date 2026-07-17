@@ -51,6 +51,70 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
     surface** — `serde_json` (currently `1.0.150`) is already in the transitive tree
     via `deribit-http`/`deribit-websocket`; this only names an existing crate
     directly (ADR-0007).
+- **Bundle reader + resource ceilings — the v0.3 untrusted-input hardening spine**
+  (`src/replay/mod.rs`, `src/error.rs`, issue #30; `docs/04-replay-mode.md` §3/§5,
+  ADR-0010). Lands the real `BundleReader::open`/`load` bodies against #29's type
+  shapes: a **read-only** reader that validates the manifest, schema-gates it, and
+  enforces the three resource ceilings via a **measured, batched, cancellable**
+  Parquet decode — a malformed or oversized bundle is a typed `BundleError`, never
+  a panic or an unbounded allocation. The typed per-column decode (#31) and the
+  cross-table validation chain (#32) are still stubbed at a documented seam
+  (`load` runs the ceilings and returns a `LoadedBundle` with empty tables).
+  - **`BundleReader::open`** — verifies the directory exists, **stat-checks
+    `manifest.json` against its own byte ceiling** (`MAX_MANIFEST_BYTES` 8 MiB)
+    **before reading it** so a giant `manifest.json` (a *manifest bomb*) is
+    `TooLarge` pre-read rather than an OOM, parses it **permissively**,
+    **schema-gates** it (`manifest.schema` must equal `SUPPORTED_SCHEMA` =
+    `"ironcondor.bundle.v1"`, else `UnsupportedSchema`), checks the `row_counts`
+    **fixed four-key shape** (`Invariant` otherwise), and confirms the four Parquet
+    files are present. The operator-supplied `ResourceCeilings` are `validate()`d
+    **on this enforcement path** (a misconfigured knob such as `max_batch_rows: 0`,
+    which would silently disable the measured guard, is a typed `BundleError::Config`,
+    never a silent open). Read-only by construction — it only stats and reads.
+  - **The three ceilings**, each rejecting **before** the offending allocation:
+    **Ceiling 1** stats each file pre-open (`MAX_TABLE_BYTES` 512 MiB); **Ceiling
+    2** reads the Parquet footer row count pre-decode (`MAX_TABLE_ROWS` 5,000,000)
+    and cross-checks it against `row_counts` (mismatch → `Invariant`); **Ceiling 3**
+    is a footer pre-check (`DECODED_OVERHEAD_PERMILLE` 1500 = 1.5×, plus a
+    `MAX_EXPANSION_RATIO` 20× decompression-bomb reject) followed by a
+    **measured per-batch** tally (`MAX_BATCH_ROWS` 65,536, `MAX_BATCH_BYTES`
+    256 MiB) into the `WorkingSetBudget`'s running `used` total across all four
+    tables, checked after every batch — the decode stops with `TooLarge` the moment
+    the total *would* exceed `MAX_WORKING_SET` (2 GiB), so `used` stays strictly
+    under the ceiling on the reject path (asserted by a unit test). `MAX_BATCH_BYTES`
+    is a **post-materialization** reject, so the true transient peak is ~one batch.
+    `manifest.row_counts` is an integrity **hint** — it never sizes an allocation.
+  - **Checked conversions** — every footer integer crosses into a Rust size via
+    `try_from`/`checked_mul` (never an `as` cast); a negative or overflowing footer
+    value is `TooLarge`, not a giant allocation.
+  - **Cancellable decode** — `load_cancellable(&dyn Fn() -> bool)` polls the probe
+    at every batch boundary and returns `BundleError::Cancelled` promptly. The
+    probe is a plain closure (the app seam adapts `&|| token.is_cancelled()` from
+    its shutdown token), so `src/replay/*` stays **free of `tokio`** and the
+    layering arch test stays green.
+  - **`ResourceCeilings`** config knobs with documented `MAX_*` defaults (now
+    including `MAX_MANIFEST_BYTES`) and a `validate() -> Result<(), ConfigError>`
+    check, called both at startup **and on the `open` enforcement path** (out-of-range
+    → typed error, never a panic). Wiring a CLI/env/file override into `Config` is
+    deferred to the config surface; the defaults are always valid.
+  - **`BundleError`** — added `Io` (a non-secret filesystem-failure summary),
+    `Cancelled`, and `Config(#[from] ConfigError)` (a misconfigured ceiling on the
+    enforcement path, thiserror `#[from]`-consistent with the other sub-boundaries);
+    **removed** the #29 `NotImplemented` placeholder now that `load` has a real body.
+    The attacker-supplied `manifest.schema` tag echoed by `UnsupportedSchema` is
+    **clamped to a bounded length at construction** (64 chars + ellipsis, on `char`
+    boundaries — no multi-byte panic), so a junk tag cannot bloat the message; the
+    type-doc records it as attacker-supplied-but-non-secret, clamped, and further
+    sanitized at the render edge.
+  - **Dependency:** adds **`parquet = "59"`** (arrow-rs) with
+    `default-features = false, features = ["arrow", "snap", "zstd", "lz4"]` — no
+    `async`, no `object_store` (ADR-0010). MSRV `1.85` (verified under our `1.88`
+    floor with `cargo +1.88 check`). Dev-only test-writer deps `arrow-array` /
+    `arrow-schema` (matched to parquet 59) and `tempfile`. **Supply-chain audit
+    note:** `cargo audit` exit 0 (**no new advisory** — the only overlap is
+    `paste`, an already-ignored path); `cargo deny check` → advisories/bans/
+    licenses/sources **ok** (arrow/parquet resolve to a single 59.1.0 epoch, all
+    licenses already allow-listed).
 - **v0.2 acceptance gate — payoff goldens, break-even / max-P&L parity, and the
   computed-Greeks tolerance fixture** (`src/ui/payoff.rs`, `src/ui/chain.rs`,
   `src/providers/deribit.rs`, `tests/render/golden/payoff/`, issue #28; docs
