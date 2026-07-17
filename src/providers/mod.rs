@@ -61,6 +61,26 @@ use crate::error::ProviderError;
 /// named on the public surface, so no raw `deribit-http` DTO crosses the port.
 pub(crate) mod deribit;
 
+/// The **neutral**, shared dxfeed event-decode helpers (issue #38,
+/// `docs/03-data-providers.md` §3, §12). Both the tastytrade adapter (#40) and
+/// the standalone dxlink overlay (#42) map their upstream `dxfeed::Event` /
+/// `MarketEvent` onto this module's neutral input views and call its
+/// `decode_quote` / `decode_greeks`, so the DXLink adapter reuses the tastytrade
+/// decode path **without** an adapter-to-adapter edge — both depend on THIS
+/// module, neither on the other (the module-map hard rule). It is a neutral
+/// provider-layer helper: no `Provider` impl, no upstream crate dependency, and
+/// it never `use`s a sibling adapter, `src/app.rs`, or `src/ui/*`.
+///
+/// `#[allow(dead_code)]` is a **deliberate, time-boxed** exception: #38 is
+/// sequenced ahead of its two consumers (`blocks: [040, 042]`, both landing in
+/// this same v0.4 milestone) precisely because the module-map rule requires the
+/// shared decode to exist as a neutral node *before* either adapter wires it in.
+/// Until #40/#42 land there is no production caller (only the in-module fixture
+/// + property tests exercise it), so the crate-internal helpers would trip
+/// `dead_code`; the allow is removed the moment the first adapter calls in.
+#[allow(dead_code)]
+pub(crate) mod dxfeed_decode;
+
 /// The seam every adapter implements: one trait, one adapter per provider id
 /// (`docs/03-data-providers.md` §2).
 ///
