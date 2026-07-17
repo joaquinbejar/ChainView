@@ -67,6 +67,7 @@ pub(crate) mod keymap;
 mod payoff_build;
 mod registry;
 mod replay_load;
+mod replay_view;
 mod supervisor;
 
 pub use bridge::{BridgeSenders, COMMAND_CHANNEL_CAPACITY, CONTROL_CHANNEL_CAPACITY, EventBridge};
@@ -1855,7 +1856,10 @@ impl ReplayState {
 
     /// Move the timeline cursor by `seek` (an in-memory index move, #33), returning
     /// whether the cursor position changed (so the caller sets `dirty`). A no-op
-    /// until the bundle is [`BundleLoad::Ready`].
+    /// until the bundle is [`BundleLoad::Ready`]. On a real move it rebuilds the
+    /// cached equity series (bumping its revision) and re-clamps the drill-down
+    /// selection to the fills still visible at the new head (#35) — all off the draw
+    /// path.
     pub fn seek(&mut self, seek: SeekTo) -> bool {
         let BundleLoad::Ready(loaded) = &mut self.bundle else {
             return false;
@@ -1865,7 +1869,25 @@ impl ReplayState {
         let loaded: &mut LoadedReplay = loaded;
         let before = loaded.cursor;
         loaded.cursor.seek(seek, &loaded.bundle);
-        loaded.cursor != before
+        if loaded.cursor == before {
+            return false;
+        }
+        loaded.on_cursor_moved();
+        true
+    }
+
+    /// Step the drill-down [`selection`](LoadedReplay::selection) to the previous
+    /// (`forward == false`) or next (`forward == true`) fill visible at the head
+    /// (`docs/05-views-and-ux.md` §5, #35), returning whether the selection changed
+    /// (so the driver's view-signature diff schedules a redraw). A no-op until the
+    /// bundle is [`BundleLoad::Ready`]; an empty fills list clears the selection to
+    /// the deliberate empty state. An in-memory selection move — never I/O.
+    pub fn step_fill(&mut self, forward: bool) -> bool {
+        let BundleLoad::Ready(loaded) = &mut self.bundle else {
+            return false;
+        };
+        let loaded: &mut LoadedReplay = loaded;
+        loaded.step_fill(forward)
     }
 
     /// Fold a play/pause/speed control into the [`Playback`] state, returning
@@ -1910,7 +1932,13 @@ impl ReplayState {
                 let loaded: &mut LoadedReplay = loaded;
                 let before = loaded.cursor;
                 loaded.cursor.advance_playback(play, &loaded.bundle);
-                (loaded.cursor != before, loaded.cursor.is_at_end())
+                let moved = loaded.cursor != before;
+                if moved {
+                    // Rebuild the cached equity series + re-clamp the selection off
+                    // the draw path, exactly as a manual seek does (#35).
+                    loaded.on_cursor_moved();
+                }
+                (moved, loaded.cursor.is_at_end())
             }
             BundleLoad::Loading | BundleLoad::Error { .. } => return false,
         };
@@ -1945,12 +1973,15 @@ pub enum BundleLoad {
 }
 
 /// The loaded replay payload — the fully materialised bundle, its timeline cursor
-/// over the integer `step` clock, and the currently drilled-into fill
-/// (`docs/02-tui-architecture.md` §3, `docs/04-replay-mode.md` §4).
+/// over the integer `step` clock, the currently drilled-into fill, and the cached
+/// equity geometry the screen renders (`docs/02-tui-architecture.md` §3,
+/// `docs/04-replay-mode.md` §4, `docs/05-views-and-ux.md` §5).
 ///
 /// Built by [`LoadedReplay::new`] from a [`LoadedBundle`] the load worker decoded
-/// off the render thread. `#[non_exhaustive]` so later replay fields stay a
-/// source-compatible addition.
+/// off the render thread. The equity `GraphData` + peak-drawdown figure are rebuilt
+/// **off the draw path** on every cursor move, bumping
+/// [`equity_revision`](Self::equity_revision) the ui view-cache diffs to re-project
+/// (#35). `#[non_exhaustive]` so later replay fields stay a source-compatible addition.
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct LoadedReplay {
@@ -1960,23 +1991,162 @@ pub struct LoadedReplay {
     /// through [`ReplayState::seek`] / [`ReplayState::advance_playback`], never
     /// per frame.
     pub cursor: TimelineCursor,
-    /// The drilled-into fill, or `None` before any drill-down (#35 wires the
-    /// fill-nav keys that set it).
+    /// The drilled-into fill, or `None` before any drill-down / after the selected
+    /// fill scrubs out of the as-of window (`,` / `.` step it, #35).
     pub selection: Option<Fill>,
+    /// The equity line series (step → equity **cents**) up to the head, built off
+    /// the draw path from the cursor's as-of slice and projected by the ui view-cache
+    /// (#23/#35). Private — the screen reads the projection, never this `GraphData`.
+    equity_graph: GraphData,
+    /// The peak drawdown in **integer cents** (`<= 0`) over the as-of slice, computed
+    /// off the draw path so the widget reads an exact `Copy` figure, never scanning
+    /// the equity per frame.
+    peak_drawdown_cents: i64,
+    /// A monotonic counter bumped whenever [`equity_graph`](Self::equity_graph) is
+    /// rebuilt (load + every cursor move), diffed by the ui view-cache to re-project
+    /// the equity series only when it actually changed (#35, the payoff-cache pattern).
+    equity_revision: u64,
 }
 
 impl LoadedReplay {
     /// Build the loaded payload from `bundle`, resolving the timeline cursor at the
-    /// first step (`docs/01-domain-model.md` §10) with no drill-down selection.
+    /// first step (`docs/01-domain-model.md` §10) with no drill-down selection and the
+    /// equity geometry built once for step 0 (off the draw path).
     #[must_use]
     pub fn new(bundle: LoadedBundle) -> Self {
         let cursor = TimelineCursor::new(&bundle);
+        let visible = cursor.visible_equity(&bundle);
+        let equity_graph = replay_view::build_equity_series(visible);
+        let peak_drawdown_cents = replay_view::peak_drawdown_cents(visible);
         Self {
             bundle,
             cursor,
             selection: None,
+            equity_graph,
+            peak_drawdown_cents,
+            equity_revision: 0,
         }
     }
+
+    /// The cached equity `GraphData` (step → cents), for the ui view-cache to
+    /// project off the draw path. Not read by `draw`.
+    #[must_use]
+    pub fn equity_graph(&self) -> &GraphData {
+        &self.equity_graph
+    }
+
+    /// The equity-series revision the ui view-cache diffs to schedule a re-project
+    /// (#35): monotonic within this bundle, bumped on every cursor move.
+    #[must_use]
+    pub fn equity_revision(&self) -> u64 {
+        self.equity_revision
+    }
+
+    /// The peak drawdown up to the head in **integer cents** (`<= 0`), formatted to
+    /// `$` at the render edge (#35). A `Copy` read — never a per-frame equity scan.
+    #[must_use]
+    pub fn peak_drawdown_cents(&self) -> i64 {
+        self.peak_drawdown_cents
+    }
+
+    /// The `Copy` identity key of the drill-down selection — `(step, order_id,
+    /// fill_seq)`, the fill's unique sort key — or `None` when nothing is selected.
+    /// The driver's view-signature diffs this to turn a `,` / `.` selection move into
+    /// a redraw (#35).
+    #[must_use]
+    pub fn selection_key(&self) -> Option<(u32, u64, u32)> {
+        self.selection.as_ref().map(fill_key)
+    }
+
+    /// Rebuild the cached equity geometry and re-clamp the drill-down selection after
+    /// the cursor moved — the single off-draw refresh both [`ReplayState::seek`] and
+    /// [`ReplayState::advance_playback`] run (#35).
+    fn on_cursor_moved(&mut self) {
+        self.rebuild_equity();
+        self.reclamp_selection();
+    }
+
+    /// Rebuild the equity series + peak-drawdown figure from the cursor's as-of slice
+    /// and bump the revision, off the draw path. `O(visible)` on the seek/tick path,
+    /// never per frame.
+    fn rebuild_equity(&mut self) {
+        let visible = self.cursor.visible_equity(&self.bundle);
+        let graph = replay_view::build_equity_series(visible);
+        let peak = replay_view::peak_drawdown_cents(visible);
+        self.equity_graph = graph;
+        self.peak_drawdown_cents = peak;
+        self.equity_revision = self.equity_revision.checked_add(1).unwrap_or(0);
+    }
+
+    /// Drop the drill-down selection when its fill is no longer visible at the head
+    /// (the head scrubbed back past it) — "the selection follows the visible fills at
+    /// the cursor" (#35). A no-op when nothing is selected or the fill is still in the
+    /// as-of window.
+    fn reclamp_selection(&mut self) {
+        let key = match &self.selection {
+            Some(fill) => fill_key(fill),
+            None => return,
+        };
+        let present = self
+            .cursor
+            .visible_fills(&self.bundle)
+            .iter()
+            .any(|fill| fill_key(fill) == key);
+        if !present {
+            self.selection = None;
+        }
+    }
+
+    /// Step the selection to the previous / next visible fill, returning whether it
+    /// changed. From no selection, either direction lands on the most recent visible
+    /// fill (nearest the head); thereafter `forward` walks toward the head and back
+    /// steps toward the run start, clamped at both ends. An empty fills list clears
+    /// the selection (the deliberate empty state). Index arithmetic is checked — no
+    /// unchecked index, no `saturating_*`.
+    fn step_fill(&mut self, forward: bool) -> bool {
+        let next = {
+            let visible = self.cursor.visible_fills(&self.bundle);
+            match visible.len().checked_sub(1) {
+                // Empty fills list: clear any stale selection.
+                None => None,
+                Some(last) => {
+                    let current = self.selection.as_ref().and_then(|fill| {
+                        let key = fill_key(fill);
+                        visible.iter().position(|f| fill_key(f) == key)
+                    });
+                    let idx = match (current, forward) {
+                        (None, _) => last,
+                        (Some(i), true) => i.checked_add(1).map_or(last, |j| j.min(last)),
+                        // Step back one, clamped at the run start. `Some(0)` matches
+                        // first, so the `i - 1` arm has `i >= 1` and never underflows —
+                        // no `saturating_sub` needed (`rules/global_rules.md`).
+                        (Some(0), false) => 0,
+                        (Some(i), false) => i - 1,
+                    };
+                    visible.get(idx).cloned()
+                }
+            }
+        };
+        if selection_key(self.selection.as_ref()) == selection_key(next.as_ref()) {
+            return false;
+        }
+        self.selection = next;
+        true
+    }
+}
+
+/// The `Copy` identity key of a fill — its unique `(step, order_id, fill_seq)` sort
+/// key (`docs/04-replay-mode.md` §2.2) — used to locate and compare the drill-down
+/// selection without cloning a whole [`Fill`].
+#[must_use]
+fn fill_key(fill: &Fill) -> (u32, u64, u32) {
+    (fill.step, fill.order_id, fill.fill_seq)
+}
+
+/// The optional [`fill_key`] of an optional selection, for a cheap change check.
+#[must_use]
+fn selection_key(selection: Option<&Fill>) -> Option<(u32, u64, u32)> {
+    selection.map(fill_key)
 }
 
 // ---------------------------------------------------------------------------
@@ -2215,7 +2385,10 @@ pub(crate) mod tests_support {
     use crate::providers::{
         ChainCapability, ChainPollCapability, GreeksCapability, ProviderCapabilities,
     };
-    use crate::replay::{BundleManifest, EquityPoint, LoadedBundle, SUPPORTED_SCHEMA};
+    use crate::replay::{
+        BundleManifest, EquityPoint, ExecMode, Fill, GreeksAttribution, LoadedBundle, PositionSide,
+        SUPPORTED_SCHEMA,
+    };
 
     const EXP: i64 = 1_700_000_000;
 
@@ -2275,6 +2448,63 @@ pub(crate) mod tests_support {
         let (tx, rx) = mpsc::channel::<Command>(8);
         let mut replay = ReplayState::new(PathBuf::from("/bundle"));
         replay.apply_load_result(BundleLoadResult::Loaded(Box::new(loaded_bundle(n_steps))));
+        let mut app = App::new(Mode::Replay(replay), ThemeChoice::Auto, tx);
+        app.mark_drawn();
+        (app, rx)
+    }
+
+    fn replay_fill(step: u32, order_id: u64) -> Fill {
+        Fill {
+            step,
+            ts_ns: 1_700_000_000_000_000_000 + i64::from(step),
+            strategy_run_id: "run-test".to_owned(),
+            trade_id: order_id,
+            position_id: order_id,
+            order_id,
+            fill_seq: 0,
+            underlying: "BTC".to_owned(),
+            expiration_ns: 1_735_286_400_000_000_000,
+            contract_id: "v1:BTC:1735286400000000000:6000000:C".to_owned(),
+            strike_cents: 6_000_000,
+            style: optionstratlib::OptionStyle::Call,
+            side: PositionSide::Long,
+            quantity: 1,
+            price_cents: 235,
+            fees_cents: 30,
+            slippage_cents: -15,
+            mode: ExecMode::Realistic,
+        }
+    }
+
+    fn greeks_row(step: u32) -> GreeksAttribution {
+        GreeksAttribution {
+            step,
+            ts_ns: 1_700_000_000_000_000_000 + i64::from(step),
+            theta_pnl_cents: 193_000,
+            delta_pnl_cents: -42_000,
+            vega_pnl_cents: 31_000,
+            spread_capture_cents: 18_000,
+            fees_cents: 500,
+            residual_cents: -6_000,
+        }
+    }
+
+    /// A `Ready` replay [`App`] carrying fills + greeks over `0..n_steps` (fills at
+    /// steps 0, 0, 1), with the cursor at the **last** step so every fill is visible —
+    /// for the drill-down (`,` / `.`) dispatch + render tests.
+    #[must_use]
+    pub(crate) fn ready_replay_app_with_fills(n_steps: u32) -> (App, mpsc::Receiver<Command>) {
+        let (tx, rx) = mpsc::channel::<Command>(8);
+        let bundle = LoadedBundle {
+            manifest: replay_manifest(),
+            fills: vec![replay_fill(0, 10), replay_fill(0, 11), replay_fill(1, 20)],
+            equity: (0..n_steps).map(equity_point).collect(),
+            positions: Vec::new(),
+            greeks: (0..n_steps).map(greeks_row).collect(),
+        };
+        let mut replay = ReplayState::new(PathBuf::from("/bundle"));
+        replay.apply_load_result(BundleLoadResult::Loaded(Box::new(bundle)));
+        let _ = replay.seek(crate::event::SeekTo::Step(u32::MAX));
         let mut app = App::new(Mode::Replay(replay), ThemeChoice::Auto, tx);
         app.mark_drawn();
         (app, rx)

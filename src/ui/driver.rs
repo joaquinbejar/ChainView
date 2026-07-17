@@ -72,7 +72,9 @@ use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 
 use super::render;
-use crate::app::{App, EventBridge, KeyRoute, LiveScreen, Mode, ReplayScreen, Selection};
+use crate::app::{
+    App, EventBridge, KeyRoute, LiveScreen, LoadedReplay, Mode, ReplayScreen, Selection,
+};
 use crate::error::ChainViewError;
 use crate::event::{AppEvent, Command};
 use crate::ui::view::ViewState;
@@ -252,17 +254,18 @@ fn dispatch_key(app: &mut App, key: KeyEvent) {
     match app.dispatch_key_global(key) {
         KeyRoute::Consumed => {}
         KeyRoute::ToScreen => {
-            // A screen-local change — the chain strike cursor / focused leg (#18) or a
-            // payoff-builder edit (#26) — mutates `LiveState` directly and produces
-            // **no** `AppEvent`, so it would not otherwise mark the app dirty. Detect
-            // it by diffing a `Copy` live-view signature (the `Selection` plus the
-            // builder's edit revision) across the forward and request a redraw when it
-            // changed, so the edit actually paints while a truly-unbound key the screen
-            // ignores leaves the frame clean (the idle-redraw property of
+            // A screen-local change — the chain strike cursor / focused leg (#18), a
+            // payoff-builder edit (#26), or a replay drill-down `,` / `.` selection
+            // step (#35) — mutates screen state directly and produces **no**
+            // `AppEvent`, so it would not otherwise mark the app dirty. Detect it by
+            // diffing a `Copy` view signature (the live `Selection` + builder revision,
+            // or the replay selection key) across the forward and request a redraw when
+            // it changed, so the edit actually paints while a truly-unbound key the
+            // screen ignores leaves the frame clean (the idle-redraw property of
             // `docs/05-views-and-ux.md` §8 holds).
-            let before = live_view_sig(app);
+            let before = view_sig(app);
             let follow = screen_handle_key(app, key);
-            if live_view_sig(app) != before {
+            if view_sig(app) != before {
                 app.dirty = true;
             }
             if let Some(follow) = follow {
@@ -272,16 +275,30 @@ fn dispatch_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// A `Copy` snapshot of the live screen's local mutable state that a screen key can
-/// change without emitting an `AppEvent` — the chain [`Selection`] plus the
-/// payoff-builder edit revision (`docs/02-tui-architecture.md` §8) — or `None` in
-/// replay mode (which has no such cursor). The diff basis that turns a screen-local
-/// change into a redraw request.
+/// A `Copy` snapshot of the active screen's local mutable state that a screen key can
+/// change without emitting an `AppEvent` (`docs/02-tui-architecture.md` §8): in live
+/// mode the chain [`Selection`] plus the payoff-builder edit revision; in replay mode
+/// the drill-down selection key (`(step, order_id, fill_seq)`, or `None`). The diff
+/// basis that turns a screen-local change into a redraw request.
+///
+/// The replay scrub (`←`/`→`/`Home`/`End`) does **not** flow through this — it returns
+/// an [`AppEvent::ReplaySeek`](crate::event::AppEvent) whose fold sets `dirty`
+/// directly — so this signature only has to catch the direct `,` / `.` selection move.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ViewSig {
+    /// The live chain selection + payoff-builder edit revision.
+    Live(Selection, u64),
+    /// The replay drill-down selection key (`None` when nothing is drilled).
+    Replay(Option<(u32, u64, u32)>),
+}
+
 #[must_use]
-fn live_view_sig(app: &App) -> Option<(Selection, u64)> {
+fn view_sig(app: &App) -> ViewSig {
     match &app.mode {
-        Mode::Live(live) => Some((live.selection, live.payoff_builder.revision())),
-        Mode::Replay(_) => None,
+        Mode::Live(live) => ViewSig::Live(live.selection, live.payoff_builder.revision()),
+        Mode::Replay(replay) => {
+            ViewSig::Replay(replay.loaded().and_then(LoadedReplay::selection_key))
+        }
     }
 }
 
@@ -426,7 +443,7 @@ mod tests {
         StepOutcome, event_channel, fold_event, run_render_loop, spawn_tick_task, step,
         to_app_event,
     };
-    use crate::app::tests_support::{live_app, ready_replay_app};
+    use crate::app::tests_support::{live_app, ready_replay_app, ready_replay_app_with_fills};
     use crate::app::{BundleLoad, EventBridge, LiveScreen, Mode, ScreenLoad};
     use crate::event::{AppEvent, Command};
     use crate::ui::view::ViewState;
@@ -613,6 +630,40 @@ mod tests {
             Mode::Live(_) => panic!("expected a replay app"),
         }
         assert!(rx.try_recv().is_err(), "a scrub emits no command (#33)");
+    }
+
+    #[test]
+    fn test_fold_event_replay_drill_down_selects_fill_and_marks_dirty() {
+        // A drill-down key (`.`) is forwarded to the replay screen (#35), which steps
+        // the in-memory selection directly and returns no `AppEvent`; the loop detects
+        // the selection-key change via the view signature and requests a redraw.
+        let (mut app, mut rx) = ready_replay_app_with_fills(6);
+        assert!(!app.dirty, "the app is clean after its initial frame");
+        fold_event(&mut app, AppEvent::Key(key(KeyCode::Char('.'))));
+        assert!(app.dirty, "stepping the drill-down requests a redraw");
+        assert!(rx.try_recv().is_err(), "a drill-down step emits no command");
+        match &app.mode {
+            Mode::Replay(replay) => match &replay.bundle {
+                BundleLoad::Ready(loaded) => {
+                    assert!(loaded.selection.is_some(), "the drill-down selected a fill",)
+                }
+                other => panic!("expected a Ready bundle, got {other:?}"),
+            },
+            Mode::Live(_) => panic!("expected a replay app"),
+        }
+    }
+
+    #[test]
+    fn test_fold_event_replay_drill_down_noop_when_no_fills_makes_no_dirty() {
+        // A drill-down key on a run with no fills changes nothing, so no redundant
+        // redraw fires (§8).
+        let (mut app, _rx) = ready_replay_app(6);
+        assert!(!app.dirty, "the app is clean after its initial frame");
+        fold_event(&mut app, AppEvent::Key(key(KeyCode::Char('.'))));
+        assert!(
+            !app.dirty,
+            "an empty-fills drill-down changes nothing, no redraw"
+        );
     }
 
     #[test]

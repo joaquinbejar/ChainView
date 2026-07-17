@@ -14,6 +14,60 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- **Replay screen: equity, attribution, drill-down** (`src/ui/replay.rs`,
+  `src/app/replay_view.rs`, `src/app.rs`, `src/ui/view.rs`, `src/ui/mod.rs`,
+  `src/ui/driver.rs`, `src/app/keymap.rs`, issue #35; `docs/05-views-and-ux.md` §5/§6,
+  `docs/04-replay-mode.md` §4/§6). Replaces the `Ready` placeholder with the real
+  replay body at the scrub head, rendered as a pure function of app state (no I/O, no
+  `.await`, no `GraphData` build in `draw`). New crate deps: none.
+  - **Equity curve + drawdown** — the as-of equity slice (step → equity **cents**) is
+    projected off the draw path into a `GraphData::Series`, cached on `LoadedReplay`
+    and re-projected via `ViewState::sync` on an `equity_revision` bump (the #27
+    revision-diff pattern, extended to replay). The line chart marks the scrub head
+    and the panel shows the exact **peak drawdown** in `$` plus the authored drawdown
+    ratio (`NaN`/`Inf`-guarded to `—`). The series is stride-sampled to a bounded
+    point count so the draw stays `O(rendered)`, not `O(full backtest)`.
+  - **P&L attribution panel** — the head `GreeksAttribution` row (Θ/Δ/ν/spread
+    capture/fees/residual) rendered **as authored, never recomputed**, with `+`/`−`
+    sign glyphs, cents→`$` magnitudes, and a magnitude-proportional bar; an absent
+    head row renders every term as `—`, never a fabricated `0`.
+  - **Trade drill-down** — `,` / `.` step the previous/next fill; the selection lives
+    on `LoadedReplay.selection` and **follows the visible fills at the cursor**
+    (clamped, cleared when it scrubs out of the as-of window). The selected fill's
+    detail (contract, side, qty, price, fees, slippage, mode) renders in a panel — the
+    fill's own position context, never a per-fill Greek split the bundle cannot
+    derive. The `,` / `.` keymap entries are **un-deferred** (real bodies + truthful
+    overlay); the selection step mutates in-memory state and the render loop's
+    view-signature diff schedules the redraw.
+  - **States first** — the #34 loading/error rendering stays; an empty run (zero rows /
+    zero fills) renders deliberate per-panel empty states, never a blank or a panic.
+  - **Money edge** — a single `fmt_cents_abs` seam converts integer cents to `$` at
+    the widget only (thousands-grouped, two decimals, checked integer arithmetic, no
+    `f64` money); the equity axis labels are the sole `$` derived from the projection's
+    `f64` plot bounds (display geometry), guarded for non-finite.
+  - **Review-pass fixes** (ux + architect). **Off-window selection indicator** — the
+    drill-down selection walks the whole as-of tape but the fills list renders only its
+    recent-tape window, so a selection stepped **above** the window kept updating the
+    detail panel while its highlight silently vanished; now the TOP list row is
+    replaced with a dim `▸ selected fill ↑ (step N)` indicator (the window anchors the
+    newest fill at the bottom, so a selection can only leave via the top), still
+    `O(rendered rows)`. Full scroll-to-selection stays deferred to the v1.0 polish pass
+    (#57). **Axis thousands grouping** — the equity y-axis whole-dollar labels reuse the
+    attribution `group_thousands` grouping (`$1000000` → `$1,000,000`, wider gutter
+    accepted; a negative bound carries the shared U+2212 `−`). **Narrow-width
+    attribution honesty** — the attribution row is budgeted label → sign → amount → bar,
+    so the magnitude **bar drops first** at narrow widths to keep the amount room, and
+    an amount that still cannot fit is elided with a trailing `…` (never a bare,
+    misreadable `$1` prefix). **`−` glyph consistency** — `fmt_drawdown_ratio` now
+    formats the magnitude `.abs()` behind the shared `pnl_sign_char` glyph, so a
+    negative drawdown reads with the same U+2212 `−` as every other signed value (never
+    an ASCII `-`). Docs: the fees attribution row + its −$-contribution convention are
+    recorded in `docs/05` §5, `docs/04` §6, and the milestone; the `visible_greeks`
+    docstring + `docs/04` §4 drop the "cumulative/summed" wording (the panel renders the
+    head-step row as authored; the slice is currently unused). +3 tests (the off-window
+    indicator + its in-window counter-case, the narrow-width elision); two existing
+    formatter tests updated for the `−` glyph + the axis grouping.
+
 - **Replay state machine + the `replay` subcommand** (`src/app.rs`,
   `src/app/replay_load.rs`, `src/event.rs`, `src/main.rs`, `src/ui/replay.rs`,
   `src/ui/mod.rs`, `src/ui/theme.rs`, `src/app/keymap.rs`, `src/lib.rs`, issue #34;

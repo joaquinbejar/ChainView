@@ -138,9 +138,17 @@ pub fn render(app: &App, view: &ViewState, frame: &mut Frame) {
         },
         Mode::Replay(state) => match state.screen {
             // The replay body reads the resolved theme (so `NO_COLOR` degrades to
-            // markers) and the tick counter (so its loading spinner advances) — both
-            // `Copy`, so the draw stays pure over the borrowed state.
-            ReplayScreen::Replay => replay::draw(state, frame, root.body, theme, app.tick_count),
+            // markers), the tick counter (so its loading spinner advances), and the
+            // cached equity projection the view synced off the draw path — this paint
+            // builds no `GraphData` (#35). All `Copy`/borrowed, so the draw stays pure.
+            ReplayScreen::Replay => replay::draw(
+                state,
+                view.replay(),
+                frame,
+                root.body,
+                theme,
+                app.tick_count,
+            ),
             ReplayScreen::Payoff => payoff::draw_replay(state, frame, root.body),
         },
     }
@@ -195,7 +203,9 @@ mod tests {
     use ratatui::layout::Rect;
 
     use super::{layout_root, render};
-    use crate::app::tests_support::{live_app_on, replay_app_on};
+    use crate::app::tests_support::{
+        live_app_on, ready_replay_app, ready_replay_app_with_fills, replay_app_on,
+    };
     use crate::app::{LiveScreen, Mode, ReplayScreen, ScreenLoad};
     use crate::ui::view::ViewState;
 
@@ -320,6 +330,26 @@ mod tests {
             match terminal.draw(|frame| render(&app, &view, frame)) {
                 Ok(_) => {}
                 Err(e) => panic!("draw failed ({screen:?}): {e}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_render_ready_replay_screen_never_panics() {
+        // The populated Ready body (equity + drawdown, attribution, drill-down) and
+        // the empty-run Ready body both render through the full loop — the projection
+        // is synced off the draw path, and the paint stays pure (#35).
+        let (with_fills, _rx1) = ready_replay_app_with_fills(6);
+        let (empty_run, _rx2) = ready_replay_app(0);
+        for app in [&with_fills, &empty_run] {
+            let mut view = ViewState::new();
+            view.sync(app);
+            for (w, h) in [(1u16, 1u16), (40, 8), (120, 40)] {
+                let mut terminal = terminal(w, h);
+                match terminal.draw(|frame| render(app, &view, frame)) {
+                    Ok(_) => {}
+                    Err(e) => panic!("ready replay render failed at {w}x{h}: {e}"),
+                }
             }
         }
     }
