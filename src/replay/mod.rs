@@ -83,8 +83,15 @@ use serde_json::Value;
 use crate::error::{BundleError, ConfigError};
 
 mod tables;
+mod timeline;
 mod validate;
 
+// The domain playback enum `Playback` shares a name with the `app::Playback`
+// stub the crate root already exports, so the crate root re-exports it under the
+// transitional alias `ReplayPlayback` (see `src/lib.rs`); issue #34 (the app-state
+// wiring) reconciles the two into one `Playback`. It is re-exported here so
+// `crate::replay::Playback` names the domain type for that wiring.
+pub use timeline::{Playback, PlaybackSpeed, TimelineCursor};
 pub use validate::{BundleDivergence, ORACLE_ABS_TOL, ORACLE_REL_TOL, compare_bundles};
 
 /// The versioned `contract_id` join-key format, fixed here as the single source

@@ -234,6 +234,59 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
     oracle-tolerance symmetry; plus oracle reflexivity, sort-insensitivity, and
     single-field-mutation detection across tables/types (money, enum, float, string,
     and the excluded `created_utc`/`metrics`).
+- **Timeline cursor and scrubbing model** (`src/replay/timeline.rs`,
+  `src/replay/mod.rs`, `src/lib.rs`, issue #33; `docs/04-replay-mode.md` §4,
+  `docs/01-domain-model.md` §10). Adds the read-only scrub model over the validated
+  `LoadedBundle` #32 produces — the domain the replay screen (#35) and the deferred
+  payoff-at-head (#49) both read. Deterministic (no wall clock, no RNG), domain-pure
+  (no `ui`/`app`/`provider`/`tokio` import — the arch layering test stays green).
+  New crate deps: none.
+  - **`TimelineCursor`** — a `Copy` value holding only the scrub `position`,
+    `end_step`, and one per-table index (`fills_ix`/`equity_ix`/`positions_ix`/
+    `greeks_ix`) into the borrowed tables; it copies no row. `seek(SeekTo, &LoadedBundle)`
+    resolves each index to the invariant "count of rows with `step <= position`" by
+    two paths over the one integer `step` clock (`ts_ns` is display only): an
+    **incremental** `SeekTo::StepBy` walks each index ±1 from its current value
+    (O(rows moved), no rescan — a single step is O(1)) and an **arbitrary**
+    `SeekTo::Step` binary-searches via `slice::partition_point` (O(log n)); both land
+    on the same index, so the result depends only on the final clamped `position`.
+    The `SeekTo` shape is consumed from `crate::event` (one shared type behind
+    `AppEvent::ReplaySeek`, wired by #34).
+  - **Post-fill open-position set** — `open_positions(&LoadedBundle)` is the single
+    algorithm for open positions, selection, and payoff: the latest non-terminal
+    `positions` row per `position_id` with `step <= position`, **excluding** any
+    `position_id` whose terminal (`exit_reason`-bearing) row is at `step <= position`.
+    A same-step open + close resolves deterministically (the terminal row wins the
+    exclusion); an `open_at_end` leg with no terminal row stays open through
+    `end_step`. Ordered by `position_id`, borrows into the bundle.
+  - **As-of accessors** (all `#[must_use]`, all borrowed) — `visible_equity` /
+    `visible_greeks` / `visible_fills` / `visible_positions` up to the head step,
+    `head_equity` / `head_greeks` (the `step == position` row), and `head_fills` (the
+    fill(s) at exactly the head step, for the drill-down). Every slice reflects one
+    consistent `position`.
+  - **Playback model** — domain `Playback { Paused, Playing { speed } }` +
+    `PlaybackSpeed { X1, X2, X5, X10 }` (`multiplier`/`quantum`/`faster`/`slower`,
+    clamped — no wrap). `Playback::tick_seek()` yields `SeekTo::StepBy(quantum)`; the
+    cursor's clamp makes playback **stop at `end_step`** without wrapping. This models
+    the quantum and the stop-at-end rule only — the tick cadence is #34's.
+  - **#32 invariants relied on (never re-validated)** — dense contiguous `0..N`
+    `equity`/`greeks` sharing `N` (`end_step`, `head_equity`/`head_greeks`),
+    step-sorted tables (`partition_point` + the incremental walk), every
+    `fills`/`positions` step in `0..N`, and stable `position_id` / positive `quantity`
+    (`open_positions`); each reliance is documented at its use site.
+  - **Re-exports** — `crate::replay::{TimelineCursor, Playback, PlaybackSpeed}`; the
+    crate root exposes `TimelineCursor` + `PlaybackSpeed`, plus the domain `Playback`
+    under the **transitional alias `ReplayPlayback`** (a bare `Playback` at the crate
+    root would collide with the `app::Playback` stub). #34 (app-state wiring)
+    reconciles the app stub with the domain type into a single `Playback`.
+  - **Tests** — unit: construction at step 0, seek to mid/last, out-of-range and edge
+    clamps (never a panic), `Home`/`End`, incremental-vs-arbitrary agreement on sparse
+    tables, the no-rescan move count, as-of slice consistency, head-fills at/without a
+    fill on the head step, the full open-position matrix (before open, latest
+    non-terminal, terminal exclusion, same-step open+close, `open_at_end`), and empty
+    / single-step degenerate runs. Property: `incremental_equals_arbitrary` (the
+    binding property), `seek_lands_on_last_le_step` (index == `partition_point`, in
+    bounds), `seek_is_idempotent`, and `step_then_back_returns`.
 - **v0.2 acceptance gate — payoff goldens, break-even / max-P&L parity, and the
   computed-Greeks tolerance fixture** (`src/ui/payoff.rs`, `src/ui/chain.rs`,
   `src/providers/deribit.rs`, `tests/render/golden/payoff/`, issue #28; docs
