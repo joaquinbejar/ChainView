@@ -115,6 +115,58 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
     `paste`, an already-ignored path); `cargo deny check` → advisories/bans/
     licenses/sources **ok** (arrow/parquet resolve to a single 59.1.0 epoch, all
     licenses already allow-listed).
+- **Typed Parquet table decoders — the replay wire→domain boundary**
+  (`src/replay/tables.rs`, `src/replay/mod.rs`, `src/error.rs`, issue #31;
+  `docs/04-replay-mode.md` §2.2/§3/§5, ADR-0004). Replaces the #30 empty-tables
+  seam: `BundleReader::load` now decodes the four tables into populated `Vec`s of
+  the #29 row types **in file order** (the reader never sorts) — money stays integer
+  cents, and the decode runs **inside** #30's batched, measured, cancellable loop
+  (all #30 ceiling/cancellation guarantees preserved).
+  - **Four per-batch decoders** — `read_fills` / `read_equity` / `read_positions`
+    / `read_greeks` (`pub(crate)`; the public surface stays `BundleReader::load`).
+    Each looks the documented columns up **by name** and appends its rows into the
+    eager `Vec` the working-set budget accounts for, **in file order — the reader
+    never sorts**. Each table's stated sort key (`fills` by
+    `(step, order_id, fill_seq)`, `positions` by `(step, position_id)`,
+    `equity_curve` / `greeks_attribution` by `step`) is a WRITER guarantee the #32
+    validation chain verifies (`Invariant` on violation), not a repair the reader
+    performs — repairing it on load would silently mask the exact writer bug #32
+    must reject.
+  - **Permissive to unknown columns, strict on the contract** — an **extra**
+    column is ignored (a newer minor of the same schema tag still decodes, §3);
+    a **missing required** column or a **wrong Arrow/Parquet type** is the new
+    typed `BundleError::Schema` (naming the table + column + expected/actual type,
+    no bundle payload). Both the column name and the actual type — the latter the
+    `{:?}` rendering of the UNTRUSTED footer `DataType`, which a deeply-nested type
+    renders long — are routed through `clamp_echo` (64 chars + ellipsis), so the
+    error Display stays bounded regardless of the footer schema.
+  - **Checked wire→domain narrowing, never an `as` cast** — every unsigned-domain
+    field (`step`/`fill_seq`/`quantity`, the ids, and the non-negative cents
+    fields, incl. `fees_cents` which IronCondor keeps `i64`) crosses via
+    `u32`/`u64::try_from`; a negative value is `BundleError::Invariant` naming the
+    table + column + row (tested per field), and a large id at the signed-wire max
+    decodes losslessly. `slippage_cents` and the attribution terms stay signed
+    `i64`; `drawdown` is the **only** `f64` and is guarded non-finite
+    (`NaN`/`±∞` → typed error, never a stored `NaN`). `exit_reason` is the one
+    nullable column (→ `Option<String>`); a NULL in any other column is a typed
+    error. Unknown enum wire strings (`style`/`side`/`mode`) are typed errors with
+    the offending value clamped; string columns are read as plain `Utf8` **or**
+    `Dictionary<Int32, Utf8>` defensively (§2.2 is silent on page encoding).
+  - **Ceilings stay in charge** — each batch is decoded only after it passes the
+    `WorkingSetBudget`; capacity is grown from ACTUAL decoded batch sizes (never
+    pre-reserved from the untrusted `row_counts` hint), the cancellation probe
+    still fires at every batch boundary, and the ACTUAL decoded row total is
+    cross-checked against the Parquet footer count (mismatch → `Invariant`).
+  - **`BundleError`** — added `Schema(String)` for a missing/wrong-typed column
+    during the typed decode (ChainView-authored, non-secret, bounded, dynamic
+    echoes clamped).
+  - **Dependency:** promotes **`arrow-array = "59"`** from a #30 dev-dependency to
+    a direct dependency (the production decoders read its array types). **No new
+    crate** enters the graph — `arrow-array` is already `parquet`'s transitive dep
+    and was already a dev-dep, so this is a "no new surface" promotion (same
+    pattern as #29's `serde_json`; ADR-0010). `arrow-schema` stays a dev-dep (only
+    the `#[cfg(test)]` writers build schemas). **Supply-chain audit note:** no new
+    advisory — the crate was already vetted in the tree.
 - **v0.2 acceptance gate — payoff goldens, break-even / max-P&L parity, and the
   computed-Greeks tolerance fixture** (`src/ui/payoff.rs`, `src/ui/chain.rs`,
   `src/providers/deribit.rs`, `tests/render/golden/payoff/`, issue #28; docs
