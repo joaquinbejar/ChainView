@@ -83,6 +83,9 @@ use serde_json::Value;
 use crate::error::{BundleError, ConfigError};
 
 mod tables;
+mod validate;
+
+pub use validate::{BundleDivergence, ORACLE_ABS_TOL, ORACLE_REL_TOL, compare_bundles};
 
 /// The versioned `contract_id` join-key format, fixed here as the single source
 /// of truth for the round-trip check the validation chain (#32) enforces.
@@ -677,6 +680,28 @@ fn unsupported_schema(tag: String) -> BundleError {
     BundleError::UnsupportedSchema(clamp_schema_tag(tag))
 }
 
+/// Maximum characters retained from an attacker-supplied **cell value** (an
+/// unrecognized enum wire string, a malformed `contract_id`/`underlying`, a
+/// `run_id` echo) interpolated into a [`BundleError`] message. A valid value is a
+/// handful of chars, so a longer one is clamped on a `char` boundary with an
+/// ellipsis so the error stays bounded regardless of bundle input
+/// (`docs/SECURITY.md` §6). Shared by the typed decoders (#31,
+/// `src/replay/tables.rs`) and the validation chain (#32, `src/replay/validate.rs`).
+const MAX_ECHO_CHARS: usize = 64;
+
+/// Clamp an attacker-supplied `value` to [`MAX_ECHO_CHARS`] characters, appending
+/// a single `…` marker when it was longer. Operates on **`char` boundaries**, so a
+/// multi-byte UTF-8 value never panics on a byte split and the result is bounded.
+/// Shared by the decoders and the validation chain (both children of this module).
+fn clamp_echo(value: &str) -> String {
+    if value.chars().count() <= MAX_ECHO_CHARS {
+        return value.to_owned();
+    }
+    let mut clamped: String = value.chars().take(MAX_ECHO_CHARS).collect();
+    clamped.push('…');
+    clamped
+}
+
 /// Convert a Parquet footer `i64` (a row count or byte size) into a `u64` via a
 /// **checked** conversion — never an `as` cast. A negative (corrupt or lying)
 /// footer value is [`BundleError::TooLarge`], not a wrapped giant.
@@ -949,21 +974,29 @@ impl BundleReader {
     /// this batched, budget-measured loop: each decoded batch is accounted against
     /// the working-set budget first, then mapped onto the #29 row types and
     /// appended into the eager `Vec` the budget measures. Rows stay in **file
-    /// order** — the reader never sorts; the stated sort-key ordering is a writer
-    /// guarantee the cross-table validation chain (#32) verifies (`Invariant` on
-    /// violation).
+    /// order** — the reader never sorts. After decode, the **cross-table validation
+    /// chain** (#32, `src/replay/validate.rs`) runs over the four tables in the
+    /// documented §5 order — ordering/uniqueness, the equity + attribution
+    /// identities, the contiguous step domain, referential integrity, the
+    /// delimiter-safe `contract_id` grammar, and the value-domain rules — turning
+    /// every stated-sort-key / cross-table violation into `Invariant`.
     ///
     /// # Errors
     ///
-    /// - [`BundleError::Cancelled`] if `cancelled` trips at a batch boundary;
+    /// - [`BundleError::Cancelled`] if `cancelled` trips at a batch boundary (or
+    ///   before the post-decode validation chain);
     /// - [`BundleError::TooLarge`] if any of the three ceilings is exceeded;
     /// - [`BundleError::MissingTable`] / [`BundleError::Io`] on a filesystem
     ///   failure, [`BundleError::Parquet`] on a decode failure;
     /// - [`BundleError::Schema`] if a required column is missing or wrong-typed;
     /// - [`BundleError::Invariant`] on a footer/`row_counts` disagreement, a
-    ///   decoded-rows/footer disagreement, or a per-cell decode violation (a
-    ///   negative unsigned value, a NULL in a non-nullable column, a non-finite
-    ///   `drawdown`, or an unrecognized enum wire string).
+    ///   decoded-rows/footer disagreement, a per-cell decode violation (a negative
+    ///   unsigned value, a NULL in a non-nullable column, a non-finite `drawdown`,
+    ///   or an unrecognized enum wire string), **or** a validation-chain violation
+    ///   (an out-of-order/duplicate sort key, a broken equity/attribution identity,
+    ///   a missing/negative `capital_cents`, a step-domain gap or `ts_ns`
+    ///   disagreement, a `run_id`/`contract_id` referential failure, an
+    ///   out-of-grammar `underlying`, a zero quantity, or a positive `drawdown`).
     pub fn load_cancellable(
         &self,
         cancelled: &dyn Fn() -> bool,
@@ -1024,6 +1057,13 @@ impl BundleReader {
             &mut |b| tables::read_greeks(b, &mut greeks),
         )?;
 
+        // A cancellation requested during/after the decode aborts before the O(n)
+        // validation passes — the chain is bounded by the ceilings but need not run
+        // once the caller has asked to stop.
+        if cancelled() {
+            return Err(BundleError::Cancelled);
+        }
+
         // Rows stay in FILE order — the reader never sorts. The stated sort-key
         // ordering (§2.2) is a WRITER guarantee the #32 validation chain VERIFIES
         // (non-decreasing on its sort key, else `Invariant`); repairing it here
@@ -1031,13 +1071,21 @@ impl BundleReader {
         // monotonic check vacuous — and cost O(n log n) on up to 5M conformant
         // rows. Downstream consumers (#33 timeline) rely on the ordering only once
         // #32 has verified it.
-        Ok(LoadedBundle {
+        let loaded = LoadedBundle {
             manifest: self.manifest.clone(),
             fills,
             equity,
             positions,
             greeks,
-        })
+        };
+
+        // The full §5 post-decode validation chain (#32): ordering/uniqueness, the
+        // equity + attribution identities, the step domain, referential integrity,
+        // the delimiter-safe `contract_id` grammar, and the value-domain rules. A
+        // malformed bundle is a typed `BundleError::Invariant`, never a partial read.
+        validate::run_validation_chain(&loaded)?;
+
+        Ok(loaded)
     }
 
     /// Stat, footer-gate, and measure-decode one table under the three ceilings,
@@ -2083,6 +2131,26 @@ mod tests {
             .iter()
             .map(|&s| 1_700_000_000_000_000_000 + i64::from(s))
             .collect();
+        // `residual` absorbs the remainder so the CONFORMANT fixture satisfies the
+        // #32 attribution identity `theta+delta+vega+spread-fees+residual ==
+        // step_pnl`, where `step_pnl` is the `equity_batch` step-over-step equity
+        // delta (`equity_cents = 988_500 + step`), and step 0 is measured against
+        // the manifest's `capital_cents = 1_000_000` (see `manifest_json_with`).
+        // The other terms are constant, so `base_terms = 40-120+15+10-30 = -85`.
+        const CAPITAL: i64 = 1_000_000;
+        const BASE_TERMS: i64 = 40 - 120 + 15 + 10 - 30;
+        let equity_of = |s: i32| -> i64 { 988_500 + i64::from(s) };
+        let residual: Vec<i64> = steps
+            .iter()
+            .map(|&s| {
+                let step_pnl = if s == 0 {
+                    equity_of(0) - CAPITAL
+                } else {
+                    equity_of(s) - equity_of(s - 1)
+                };
+                step_pnl - BASE_TERMS
+            })
+            .collect();
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("step", DataType::Int32, false),
@@ -2102,7 +2170,7 @@ mod tests {
             Arc::new(Int64Array::from(vec![15_i64; n])),
             Arc::new(Int64Array::from(vec![10_i64; n])),
             Arc::new(Int64Array::from(vec![30_i64; n])),
-            Arc::new(Int64Array::from(vec![1_i64; n])),
+            Arc::new(Int64Array::from(residual)),
         ];
         match RecordBatch::try_new(schema, cols) {
             Ok(b) => b,
@@ -2874,6 +2942,10 @@ mod tests {
             })
             .collect();
 
+        // `residual` absorbs the remainder so the conformant fixture satisfies the
+        // #32 attribution identity: step 0 is measured against `capital_cents`
+        // (`988_500 − 1_000_000 = −11_500`, minus `base_terms = −85` ⇒ `−11_415`),
+        // later steps against the +1/step equity delta (`1 − (−85) = 86`).
         let expected_greeks: Vec<GreeksAttribution> = (0..3_u32)
             .map(|s| GreeksAttribution {
                 step: s,
@@ -2883,7 +2955,7 @@ mod tests {
                 vega_pnl_cents: 15,
                 spread_capture_cents: 10,
                 fees_cents: 30,
-                residual_cents: 1,
+                residual_cents: if s == 0 { -11_415 } else { 86 },
             })
             .collect();
 

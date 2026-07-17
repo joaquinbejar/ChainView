@@ -68,26 +68,9 @@ use optionstratlib::OptionStyle;
 
 use crate::error::BundleError;
 
-use super::{EquityPoint, ExecMode, Fill, GreeksAttribution, PositionRow, PositionSide};
-
-/// Maximum characters retained from an attacker-supplied **cell value** (an
-/// unrecognized enum wire string) echoed into a [`BundleError`] message. A valid
-/// value is a handful of chars, so a longer one is clamped on a `char` boundary
-/// with an ellipsis so the error stays bounded regardless of bundle input
-/// (`docs/SECURITY.md` §6). Mirrors `mod.rs`'s schema-tag clamp.
-const MAX_ECHO_CHARS: usize = 64;
-
-/// Clamp an attacker-supplied `value` to [`MAX_ECHO_CHARS`] characters, appending
-/// a single `…` marker when it was longer. Operates on **`char` boundaries**, so a
-/// multi-byte UTF-8 value never panics on a byte split and the result is bounded.
-fn clamp_echo(value: &str) -> String {
-    if value.chars().count() <= MAX_ECHO_CHARS {
-        return value.to_owned();
-    }
-    let mut clamped: String = value.chars().take(MAX_ECHO_CHARS).collect();
-    clamped.push('…');
-    clamped
-}
+use super::{
+    EquityPoint, ExecMode, Fill, GreeksAttribution, PositionRow, PositionSide, clamp_echo,
+};
 
 // --- Error constructors (cold; bounded, non-secret messages) ----------------
 
