@@ -14,6 +14,43 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- **Replay domain types and the manifest schema** (`src/replay/mod.rs`, issue #29;
+  `docs/01-domain-model.md` §9, `docs/04-replay-mode.md` §2, ADR-0004). Opens v0.3
+  (replay mode) by fixing ChainView's typed, **read-only** views of the IronCondor
+  result bundle — the shapes the reader (#30), the Parquet decoders (#31), and the
+  validation chain (#32) are all written against. Types + serde + docs + tests
+  only; **no I/O, no Parquet decode, no validation** (open/load are stubs).
+  - **`BundleManifest`** — `schema`, opaque `run_id` (an uninterpreted `String`
+    with no recompute helper), `created_utc`, `code_version`, `lockfile_sha256`,
+    `seed: u64`, opaque `config`/`strategy`/`data_source`/`metrics` as
+    `serde_json::Value`, and typed `row_counts: BTreeMap<String, u64>`. Parsing is
+    **permissive** (no `deny_unknown_fields`) so a newer minor still opens.
+  - **`CapitalConfig { capital_cents: i64 }`** — the one narrow typed projection of
+    the `config.capital_cents` field, reachable via `BundleManifest::capital_config`;
+    an absent field errors rather than silently defaulting to `0`.
+  - **The four typed rows** — `Fill`, `EquityPoint`, `PositionRow`,
+    `GreeksAttribution` — with every money field as integer cents (`i64`/`u64`);
+    the **only** `f64` is `EquityPoint::drawdown` (an analytic ratio), asserted by
+    a module grep test. Their `deny_unknown_fields` is scoped to the JSON
+    round-trip/test path — the #31 Parquet decode reads by column projection and
+    stays permissive toward unknown extra columns (`docs/04` §3), so the bundle
+    contract is not narrowed.
+  - **Closed-set enums** `PositionSide { Long, Short }` / `ExecMode { Naive,
+    Realistic }` with `snake_case` wire strings; `style` reuses
+    `optionstratlib::OptionStyle` mapped to the bundle's `call`/`put` wire form. An
+    unknown enum string is a deserialization error, never a silent fallback.
+  - **`contract_id` grammar constants** — `CONTRACT_ID_FORMAT`,
+    `CONTRACT_ID_VERSION_PREFIX`, `CONTRACT_ID_UNDERLYING_PATTERN` — the fixed
+    format the round-trip check (#32) enforces; the parser is #32's work.
+  - **`BundleReader`/`LoadedBundle`** signatures so #30/#31/#32 compile against a
+    stable surface: `open` records the bundle root with no filesystem access
+    (read-only by construction), `load` returns the typed `BundleError::NotImplemented`
+    placeholder — **no reachable panic**, `todo!()`, or `unimplemented!()`.
+  - **Dependency:** promotes `serde_json` (`version = "1"`) to a **direct**
+    dependency for the opaque manifest blobs. Supply-chain audit note: **no new
+    surface** — `serde_json` (currently `1.0.150`) is already in the transitive tree
+    via `deribit-http`/`deribit-websocket`; this only names an existing crate
+    directly (ADR-0007).
 - **v0.2 acceptance gate — payoff goldens, break-even / max-P&L parity, and the
   computed-Greeks tolerance fixture** (`src/ui/payoff.rs`, `src/ui/chain.rs`,
   `src/providers/deribit.rs`, `tests/render/golden/payoff/`, issue #28; docs

@@ -124,6 +124,12 @@ pub enum BundleError {
     /// A Parquet decode error, summarized without leaking file internals.
     #[error("parquet: {0}")]
     Parquet(String),
+    /// The reader body is not yet wired: [`crate::BundleReader::load`] returns
+    /// this placeholder until issue #30 implements the open/decode path. It is a
+    /// **pending-reader** marker, **not** a data-integrity failure — no caller
+    /// should treat it as one — and it is removed when #30 lands.
+    #[error("reader not yet implemented (issue #30)")]
+    NotImplemented,
 }
 
 /// A configuration failure surfaced at startup.
