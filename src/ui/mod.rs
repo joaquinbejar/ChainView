@@ -137,7 +137,10 @@ pub fn render(app: &App, view: &ViewState, frame: &mut Frame) {
             LiveScreen::Payoff => payoff::draw(state, view.payoff(), frame, root.body, theme),
         },
         Mode::Replay(state) => match state.screen {
-            ReplayScreen::Replay => replay::draw(state, frame, root.body),
+            // The replay body reads the resolved theme (so `NO_COLOR` degrades to
+            // markers) and the tick counter (so its loading spinner advances) — both
+            // `Copy`, so the draw stays pure over the borrowed state.
+            ReplayScreen::Replay => replay::draw(state, frame, root.body, theme, app.tick_count),
             ReplayScreen::Payoff => payoff::draw_replay(state, frame, root.body),
         },
     }

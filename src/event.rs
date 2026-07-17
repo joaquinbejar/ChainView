@@ -4,10 +4,12 @@
 //! [`AppEvent`] is the **single** closed event set the synchronous render loop
 //! folds: terminal input ([`Key`](AppEvent::Key) / [`Resize`](AppEvent::Resize)),
 //! the render/animation [`Tick`](AppEvent::Tick), a normalized provider
-//! [`Market`](AppEvent::Market) update, and a replay
-//! [`ReplaySeek`](AppEvent::ReplaySeek). Producers are independent tokio tasks
-//! that all push into one `mpsc::Receiver<AppEvent>` (§4); the fan-in that folds
-//! them into state is [`App::on_event`](crate::App::on_event).
+//! [`Market`](AppEvent::Market) update, a replay
+//! [`ReplaySeek`](AppEvent::ReplaySeek) / [`ReplayControl`](AppEvent::ReplayControl),
+//! and the off-thread replay-bundle-load result
+//! ([`BundleLoaded`](AppEvent::BundleLoaded)). Producers are independent tokio
+//! tasks that all push into one `mpsc::Receiver<AppEvent>` (§4); the fan-in that
+//! folds them into state is [`App::on_event`](crate::App::on_event).
 //!
 //! `AppEvent` is a ChainView **closed set**, matched exhaustively with **no
 //! wildcard `_` arm** (`CLAUDE.md` "Key Decisions"), so adding a variant forces
@@ -27,6 +29,7 @@ use crossterm::event::KeyEvent;
 use optionstratlib::ExpirationDate;
 
 use crate::chain::MarketUpdate;
+use crate::replay::LoadedBundle;
 
 /// Every input to the synchronous render loop, as one closed set (§4).
 ///
@@ -51,8 +54,55 @@ pub enum AppEvent {
     /// A normalized provider update to fold into the live chain store (§4).
     Market(MarketUpdate),
     /// A replay-timeline scrub, in replay mode only
-    /// (`docs/04-replay-mode.md` §4).
+    /// (`docs/04-replay-mode.md` §4). Folds directly into the in-memory timeline
+    /// cursor (the whole bundle is loaded, #33), so it performs no I/O.
     ReplaySeek(SeekTo),
+    /// A replay playback control (play/pause/speed), in replay mode only
+    /// (`docs/04-replay-mode.md` §4). Folds into the [`Playback`](crate::Playback)
+    /// state; the tick timer advances the cursor while playing.
+    ReplayControl(ReplayControl),
+    /// The result of the off-thread replay-bundle load (loaded or failed),
+    /// delivered by the replay load worker (`docs/04-replay-mode.md` §3,
+    /// `docs/02-tui-architecture.md` §12). Folds the replay
+    /// [`BundleLoad`](crate::BundleLoad) state machine from `Loading` to `Ready`
+    /// or `Error`; the render loop never blocks on the load.
+    BundleLoaded(BundleLoadResult),
+}
+
+/// A replay playback control produced by a play/pause/speed key on the replay
+/// screen and folded into the [`Playback`](crate::Playback) state
+/// (`docs/04-replay-mode.md` §4).
+///
+/// A ChainView closed set matched exhaustively with no wildcard arm, so a new
+/// control forces every fold site to be revisited by the compiler. Fieldless, so
+/// `#[repr(u8)]` per the ruleset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ReplayControl {
+    /// Toggle play / pause (`Space`).
+    PlayPause,
+    /// Increase the playback speed one step, clamped at the fastest (`+`).
+    SpeedFaster,
+    /// Decrease the playback speed one step, clamped at the slowest (`-`).
+    SpeedSlower,
+}
+
+/// The outcome of an off-thread replay-bundle load, delivered to the render loop
+/// as an [`AppEvent::BundleLoaded`] by the replay load worker
+/// (`docs/04-replay-mode.md` §3, `docs/02-tui-architecture.md` §12).
+///
+/// The load runs on a blocking worker, never the render thread, so a multi-second
+/// decode of a large bundle can never freeze a frame; its result is what folds the
+/// replay [`BundleLoad`](crate::BundleLoad) state from `Loading` to `Ready`/`Error`.
+/// The success payload is boxed so it does not bloat the event, and the failure
+/// carries only the non-secret, ChainView-authored
+/// [`BundleError`](crate::BundleError) text (`R` retries).
+#[derive(Debug, Clone)]
+pub enum BundleLoadResult {
+    /// The bundle opened, decoded, and validated — the materialised tables.
+    Loaded(Box<LoadedBundle>),
+    /// The load failed with an actionable, non-secret message.
+    Failed(String),
 }
 
 /// A replay-timeline seek, expressed against the one integer replay clock — the
@@ -98,10 +148,10 @@ pub enum Command {
     Reconnect,
     /// Live: mode reload — re-run discover + fetch for the active provider (`R`).
     Rediscover,
-    /// Replay: advance/rewind the table indices by the given seek
-    /// (`docs/04-replay-mode.md` §4).
-    SeekBundle(SeekTo),
-    /// Replay: re-open and revalidate the bundle at the directory (`R`).
+    /// Replay: re-open and revalidate the bundle at the directory (`R`). Seeking
+    /// is **not** a command: with the whole bundle loaded (#33) a scrub is an
+    /// in-memory cursor move folded directly by [`AppEvent::ReplaySeek`], never a
+    /// round-trip to the data layer.
     ReloadBundle(PathBuf),
 }
 
@@ -112,7 +162,7 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use optionstratlib::prelude::Positive;
 
-    use super::{AppEvent, Command, SeekTo};
+    use super::{AppEvent, BundleLoadResult, Command, ReplayControl, SeekTo};
     use crate::chain::{MarketUpdate, ProviderId, StreamHealth};
 
     // --- Test constructors (no unwrap/expect/indexing per the ruleset) -------
@@ -215,14 +265,26 @@ mod tests {
     }
 
     #[test]
-    fn test_command_seek_bundle_and_reload_bundle_construct() {
-        match Command::SeekBundle(SeekTo::Step(5)) {
-            Command::SeekBundle(SeekTo::Step(5)) => {}
-            other => panic!("expected SeekBundle(Step(5)), got {other:?}"),
-        }
+    fn test_command_reload_bundle_constructs() {
+        // Reload is the ONLY replay command: seeking folds into the in-memory
+        // cursor (#33), so no `SeekBundle` command exists.
         match Command::ReloadBundle(PathBuf::from("/bundle")) {
             Command::ReloadBundle(dir) => assert_eq!(dir, PathBuf::from("/bundle")),
             other => panic!("expected ReloadBundle, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_app_event_replay_control_and_bundle_loaded_construct() {
+        match AppEvent::ReplayControl(ReplayControl::PlayPause) {
+            AppEvent::ReplayControl(ReplayControl::PlayPause) => {}
+            other => panic!("expected ReplayControl(PlayPause), got {other:?}"),
+        }
+        match AppEvent::BundleLoaded(BundleLoadResult::Failed("bad bundle".to_owned())) {
+            AppEvent::BundleLoaded(BundleLoadResult::Failed(message)) => {
+                assert_eq!(message, "bad bundle");
+            }
+            other => panic!("expected BundleLoaded(Failed), got {other:?}"),
         }
     }
 
@@ -240,8 +302,28 @@ mod tests {
                 AppEvent::Tick => "tick",
                 AppEvent::Market(_) => "market",
                 AppEvent::ReplaySeek(_) => "seek",
+                AppEvent::ReplayControl(_) => "control",
+                AppEvent::BundleLoaded(_) => "loaded",
             }
         }
         assert_eq!(label(&AppEvent::Tick), "tick");
+    }
+
+    #[test]
+    fn test_replay_control_match_is_wildcard_free() {
+        // `ReplayControl` is a ChainView closed set (like `AppEvent`): this
+        // exhaustive, wildcard-free match mirrors every fold site (`apply_control`),
+        // so adding a control variant breaks THIS match at compile time and forces
+        // every fold site to be revisited.
+        fn label(control: ReplayControl) -> &'static str {
+            match control {
+                ReplayControl::PlayPause => "playpause",
+                ReplayControl::SpeedFaster => "faster",
+                ReplayControl::SpeedSlower => "slower",
+            }
+        }
+        assert_eq!(label(ReplayControl::PlayPause), "playpause");
+        assert_eq!(label(ReplayControl::SpeedFaster), "faster");
+        assert_eq!(label(ReplayControl::SpeedSlower), "slower");
     }
 }

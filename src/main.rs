@@ -39,15 +39,16 @@
 #![forbid(unsafe_code)]
 
 use std::io::{self, Stdout};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chainview::config::{CliOverrides, Config, ModeSelect};
 use chainview::{
-    AliasCatalog, App, ChainFetch, ChainSource, ChainStore, ChainViewApp, ChainViewError,
-    EventBridge, ExitCause, ExpirySource, GuardTeardown, Instrument, LiveState, Mode, Resolved,
-    SourceBinding, Supervisor, TerminalGuard, TokioTask, event_channel, install_panic_hook,
-    run_render_loop, spawn_input_reader, spawn_supervised_subscription, spawn_tick_task,
+    AliasCatalog, App, BundleError, ChainFetch, ChainSource, ChainStore, ChainViewApp,
+    ChainViewError, EventBridge, ExitCause, ExpirySource, GuardTeardown, Instrument, LiveState,
+    Mode, Resolved, SourceBinding, Supervisor, TerminalGuard, TokioTask, event_channel,
+    install_panic_hook, run_render_loop, spawn_input_reader, spawn_supervised_subscription,
+    spawn_tick_task,
 };
 use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand};
@@ -143,9 +144,19 @@ fn main() -> Result<(), ChainViewError> {
     let _ = dotenvy::dotenv();
 
     let overrides = Cli::parse().into_overrides();
-    // `ConfigError` folds into `ChainViewError::Config` via `#[from]`, so an early
-    // `?` here returns before any terminal setup — stderr is safe.
+    // `ConfigError` folds into `ChainViewError::Config` via `#[from]`, so an
+    // early `?` here returns before any terminal setup — stderr is safe.
     let config = Config::load(overrides)?;
+
+    // Replay pre-flight: a bundle directory that does not exist is almost always a
+    // typo, so fail fast with a friendly CLI error on the NORMAL terminal, BEFORE
+    // entering the alternate screen (`docs/07-configuration.md` §4.1). A malformed
+    // but present bundle is NOT rejected here — it becomes a retryable
+    // `BundleLoad::Error` inside the TUI (`docs/05-views-and-ux.md` §6), so only a
+    // missing/not-a-directory path is a pre-TUI error.
+    if let ModeSelect::Replay(dir) = &config.mode {
+        validate_replay_dir(dir)?;
+    }
 
     // Install the panic hook BEFORE entering the alternate screen so a panic at any
     // later point restores the terminal before the backtrace prints
@@ -361,4 +372,121 @@ fn now_utc() -> DateTime<Utc> {
         .unwrap_or(Duration::ZERO);
     let secs = i64::try_from(since.as_secs()).unwrap_or(i64::MAX);
     DateTime::<Utc>::from_timestamp(secs, since.subsec_nanos()).unwrap_or(DateTime::<Utc>::MIN_UTC)
+
+/// Validate a replay bundle directory before the TUI starts: it must exist and be
+/// a directory (`docs/07-configuration.md` §4.1). A missing or non-directory path
+/// is a friendly, pre-TUI [`ChainViewError::Bundle`] naming only the path the user
+/// passed — never any other filesystem detail. A present-but-malformed bundle is
+/// handled inside the TUI as a retryable load error, not here.
+fn validate_replay_dir(dir: &Path) -> Result<(), ChainViewError> {
+    match std::fs::metadata(dir) {
+        Ok(meta) if meta.is_dir() => Ok(()),
+        Ok(_) => Err(
+            BundleError::Io(format!("replay path is not a directory: {}", dir.display())).into(),
+        ),
+        Err(_) => Err(BundleError::Io(format!(
+            "replay bundle directory not found: {}",
+            dir.display()
+        ))
+        .into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, validate_replay_dir};
+    use chainview::ChainViewError;
+    use chainview::config::ModeSelect;
+    use clap::Parser;
+    use std::path::PathBuf;
+
+    /// Parse an argv into the lowered [`ModeSelect`], or a clap error.
+    fn mode_of(args: &[&str]) -> Result<ModeSelect, clap::Error> {
+        Cli::try_parse_from(args).map(|cli| cli.into_overrides().mode)
+    }
+
+    #[test]
+    fn test_cli_no_subcommand_selects_live() {
+        match mode_of(&["chainview"]) {
+            Ok(mode) => assert_eq!(mode, ModeSelect::Live),
+            Err(e) => panic!("expected Live, got parse error: {e}"),
+        }
+    }
+
+    #[test]
+    fn test_cli_replay_subcommand_selects_replay_with_dir() {
+        match mode_of(&["chainview", "replay", "./run-2026-07-01/"]) {
+            Ok(mode) => assert_eq!(mode, ModeSelect::Replay(PathBuf::from("./run-2026-07-01/"))),
+            Err(e) => panic!("expected Replay, got parse error: {e}"),
+        }
+    }
+
+    #[test]
+    fn test_cli_replay_ignores_live_only_flags() {
+        // The live-only flags parse alongside `replay` but are lowered as a no-op
+        // (the config layer drops them) — never a live/replay hybrid.
+        match mode_of(&[
+            "chainview",
+            "--provider",
+            "ig",
+            "--underlying",
+            "SPY",
+            "replay",
+            "./bundle/",
+        ]) {
+            Ok(mode) => assert_eq!(mode, ModeSelect::Replay(PathBuf::from("./bundle/"))),
+            Err(e) => panic!("expected Replay, got parse error: {e}"),
+        }
+    }
+
+    #[test]
+    fn test_cli_replay_requires_a_directory() {
+        // `replay` with no positional is a clap error, not a silent Live fallback.
+        assert!(mode_of(&["chainview", "replay"]).is_err());
+    }
+
+    #[test]
+    fn test_cli_replay_rejects_extra_positional() {
+        assert!(mode_of(&["chainview", "replay", "./a", "./b"]).is_err());
+    }
+
+    #[test]
+    fn test_validate_replay_dir_accepts_an_existing_directory() {
+        let dir = match tempfile::tempdir() {
+            Ok(d) => d,
+            Err(e) => panic!("failed to make a temp dir: {e}"),
+        };
+        assert!(validate_replay_dir(dir.path()).is_ok());
+    }
+
+    #[test]
+    fn test_validate_replay_dir_rejects_a_missing_directory() {
+        let dir = match tempfile::tempdir() {
+            Ok(d) => d,
+            Err(e) => panic!("failed to make a temp dir: {e}"),
+        };
+        let missing = dir.path().join("does-not-exist");
+        match validate_replay_dir(&missing) {
+            Err(ChainViewError::Bundle(_)) => {}
+            other => panic!("expected a friendly Bundle error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_validate_replay_dir_rejects_a_file() {
+        use std::io::Write;
+        let dir = match tempfile::tempdir() {
+            Ok(d) => d,
+            Err(e) => panic!("failed to make a temp dir: {e}"),
+        };
+        let file_path = dir.path().join("manifest.json");
+        match std::fs::File::create(&file_path).and_then(|mut f| f.write_all(b"{}")) {
+            Ok(()) => {}
+            Err(e) => panic!("failed to write a temp file: {e}"),
+        }
+        match validate_replay_dir(&file_path) {
+            Err(ChainViewError::Bundle(_)) => {}
+            other => panic!("expected a friendly Bundle error for a file, got {other:?}"),
+        }
+    }
 }

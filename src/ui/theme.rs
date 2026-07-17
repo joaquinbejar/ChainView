@@ -40,11 +40,12 @@ use ratatui::widgets::{Block, Clear, Paragraph};
 
 use crate::app::keymap::{Binding, help_sections};
 use crate::app::{
-    App, BundleLoad, LiveScreen, LiveState, Mode, Playback, ReplayScreen, ReplayState, ScreenLoad,
+    App, BundleLoad, LiveScreen, LiveState, Mode, ReplayScreen, ReplayState, ScreenLoad,
     is_replay_screen_reachable, live_screen_name, replay_screen_name,
 };
 use crate::chain::{StreamHealth, TickDir};
 use crate::config::ThemeChoice;
+use crate::replay::Playback;
 
 // ===========================================================================
 // Theme + palette (auto/dark/light, NO_COLOR fallback).
@@ -502,15 +503,28 @@ fn live_in_motion(live: &LiveState) -> bool {
         || matches!(live.source.health, StreamHealth::Reconnecting { .. })
 }
 
-/// Whether the replay view is in a motion state (bundle loading or playing).
+/// The replay playback badge for the status bar, or `None` when there is nothing to
+/// show (a loading/failed bundle that is not playing). Distinct from the loading
+/// spinner (which is reserved for [`BundleLoad::Loading`]) so "playing" and "loading"
+/// never share a glyph: `▶ ×N` while [`Playback::Playing`] at speed `N`, and `⏸`
+/// while [`Playback::Paused`] over a **loaded** bundle. The `▶`/`⏸`/`×` are text
+/// glyphs, so the badge survives a monochrome terminal (`NO_COLOR`).
 #[must_use]
-fn replay_in_motion(replay: &ReplayState) -> bool {
-    matches!(replay.bundle, BundleLoad::Loading) || matches!(replay.play, Playback::Playing { .. })
+fn playback_badge(replay: &ReplayState) -> Option<String> {
+    match replay.play {
+        Playback::Playing { speed } => Some(format!("▶ ×{}", speed.multiplier())),
+        Playback::Paused => match replay.bundle {
+            BundleLoad::Ready(_) => Some("⏸".to_owned()),
+            // Nothing to pause yet: the loading spinner / error body carries the state.
+            BundleLoad::Loading | BundleLoad::Error { .. } => None,
+        },
+    }
 }
 
-/// A short label for the loaded bundle directory (its final path component).
+/// A short label for the loaded bundle directory (its final path component). Shared
+/// with the replay screen's loading body (`src/ui/replay.rs`).
 #[must_use]
-fn run_label(replay: &ReplayState) -> String {
+pub(crate) fn run_label(replay: &ReplayState) -> String {
     replay
         .dir
         .file_name()
@@ -544,12 +558,19 @@ pub fn draw_status(app: &App, frame: &mut Frame, area: Rect, theme: Theme) {
             spans.push(Span::styled("replay", theme.dim()));
             spans.push(Span::raw("  "));
             spans.push(Span::raw(sanitize(&run_label(replay))));
-            if replay_in_motion(replay) {
+            // The spinner animates ONLY while the bundle is loading (the §7 loading
+            // idiom); playback carries a distinct `▶ ×N` / `⏸` badge below, so the
+            // two states never share a glyph.
+            if matches!(replay.bundle, BundleLoad::Loading) {
                 spans.push(Span::raw(" "));
                 spans.push(Span::styled(
                     spinner_frame(app.tick_count).to_string(),
                     theme.accent(),
                 ));
+            }
+            if let Some(badge) = playback_badge(replay) {
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled(badge, theme.accent()));
             }
         }
     }
@@ -745,8 +766,9 @@ pub fn draw_help_overlay(app: &App, frame: &mut Frame, area: Rect, theme: Theme)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::tests_support::{live_app_caps, live_app_on, replay_app_on};
+    use crate::app::tests_support::{live_app_caps, live_app_on, ready_replay_app, replay_app_on};
     use crate::app::{LiveScreen, ReplayScreen, ScreenLoad};
+    use crate::event::{AppEvent, ReplayControl};
     use crate::providers::{ChainCapability, GreeksCapability, ProviderCapabilities};
     use crate::ui::view::ViewState;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -967,6 +989,44 @@ mod tests {
             Ok(_) => {}
             Err(e) => panic!("draw failed: {e}"),
         }
+    }
+
+    #[test]
+    fn test_status_bar_playback_badge_shows_speed_and_pause() {
+        // SF-02: the replay status bar carries a distinct, NO_COLOR-safe playback
+        // badge — `▶ ×N` while playing, `⏸` while paused over a loaded bundle —
+        // never reusing the loading spinner glyph for playback.
+        let (mut app, _rx) = ready_replay_app(6);
+        // Space (play) then `+` (faster) → Playing ×2.
+        app.on_event(AppEvent::ReplayControl(ReplayControl::PlayPause));
+        app.on_event(AppEvent::ReplayControl(ReplayControl::SpeedFaster));
+        let playing = rendered_frame(&app, 80, 24);
+        assert!(playing.contains("▶ ×2"), "playing shows ▶ ×2: {playing:?}");
+        // Space again → paused; a loaded bundle shows the pause badge, no play badge.
+        app.on_event(AppEvent::ReplayControl(ReplayControl::PlayPause));
+        let paused = rendered_frame(&app, 80, 24);
+        assert!(
+            paused.contains('⏸'),
+            "paused-with-bundle shows ⏸: {paused:?}"
+        );
+        assert!(!paused.contains("▶ ×"), "paused shows no play badge");
+    }
+
+    #[test]
+    fn test_status_bar_loading_shows_spinner_not_playback_badge() {
+        // While the bundle is still loading, the spinner animates and no playback
+        // badge appears (paused + not-yet-loaded → no `⏸`).
+        let app = replay_app_on(ReplayScreen::Replay, false);
+        let text = rendered_frame(&app, 80, 24);
+        assert!(text.contains('⠋'), "loading shows the spinner (tick 0)");
+        assert!(
+            !text.contains('⏸'),
+            "an unloaded bundle shows no pause badge"
+        );
+        assert!(
+            !text.contains("▶ ×"),
+            "an unloaded bundle shows no play badge"
+        );
     }
 
     #[test]

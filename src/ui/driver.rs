@@ -238,6 +238,8 @@ fn fold_event(app: &mut App, event: AppEvent) {
         AppEvent::Tick => app.on_event(AppEvent::Tick),
         AppEvent::Market(update) => app.on_event(AppEvent::Market(update)),
         AppEvent::ReplaySeek(seek) => app.on_event(AppEvent::ReplaySeek(seek)),
+        AppEvent::ReplayControl(control) => app.on_event(AppEvent::ReplayControl(control)),
+        AppEvent::BundleLoaded(result) => app.on_event(AppEvent::BundleLoaded(result)),
     }
 }
 
@@ -424,9 +426,9 @@ mod tests {
         StepOutcome, event_channel, fold_event, run_render_loop, spawn_tick_task, step,
         to_app_event,
     };
-    use crate::app::tests_support::{live_app, replay_app};
-    use crate::app::{EventBridge, LiveScreen, Mode, ReplayScreen, ScreenLoad};
-    use crate::event::{AppEvent, Command, SeekTo};
+    use crate::app::tests_support::{live_app, ready_replay_app};
+    use crate::app::{BundleLoad, EventBridge, LiveScreen, Mode, ScreenLoad};
+    use crate::event::{AppEvent, Command};
     use crate::ui::view::ViewState;
 
     #[track_caller]
@@ -592,26 +594,47 @@ mod tests {
     }
 
     #[test]
-    fn test_fold_event_unbound_key_forwarded_to_replay_screen_emits_seek() {
-        // An unbound key (`Left`) is forwarded to the active replay screen, which
-        // returns `ReplaySeek(StepBy(-1))`; `App::on_event` folds it into a
-        // `SeekBundle` command — the full two-level dispatch end to end.
-        let (mut app, mut rx) = replay_app(ReplayScreen::Replay, false);
-        fold_event(&mut app, AppEvent::Key(key(KeyCode::Left)));
-        match rx.try_recv() {
-            Ok(Command::SeekBundle(SeekTo::StepBy(-1))) => {}
-            other => panic!("expected SeekBundle(StepBy(-1)), got {other:?}"),
+    fn test_fold_event_unbound_key_forwarded_to_replay_screen_moves_cursor() {
+        // An unbound key (`Right`) is forwarded to the active replay screen, which
+        // returns `ReplaySeek(StepBy(1))`; `App::on_event` folds it into the
+        // in-memory cursor (no command, #33) — the full two-level dispatch end to
+        // end.
+        let (mut app, mut rx) = ready_replay_app(6);
+        fold_event(&mut app, AppEvent::Key(key(KeyCode::Right)));
+        assert!(
+            app.dirty,
+            "the scrub moved the play-head, so the frame redraws"
+        );
+        match &app.mode {
+            Mode::Replay(replay) => match &replay.bundle {
+                BundleLoad::Ready(loaded) => assert_eq!(loaded.cursor.position, 1),
+                other => panic!("expected a Ready bundle, got {other:?}"),
+            },
+            Mode::Live(_) => panic!("expected a replay app"),
         }
+        assert!(rx.try_recv().is_err(), "a scrub emits no command (#33)");
     }
 
     #[test]
     fn test_fold_event_modal_help_swallows_forwarded_key() {
         // With help open, the modal intercept swallows the scrub key — it never
-        // reaches the screen, so no command is emitted.
-        let (mut app, mut rx) = replay_app(ReplayScreen::Replay, true);
-        fold_event(&mut app, AppEvent::Key(key(KeyCode::Left)));
+        // reaches the screen, so the cursor does not move.
+        let (mut app, _rx) = ready_replay_app(6);
+        app.help_open = true;
+        fold_event(&mut app, AppEvent::Key(key(KeyCode::Right)));
         assert!(app.help_open, "help stays open");
-        assert!(rx.try_recv().is_err(), "the modal overlay swallows the key");
+        match &app.mode {
+            Mode::Replay(replay) => match &replay.bundle {
+                BundleLoad::Ready(loaded) => {
+                    assert_eq!(
+                        loaded.cursor.position, 0,
+                        "the modal overlay swallows the key"
+                    );
+                }
+                other => panic!("expected a Ready bundle, got {other:?}"),
+            },
+            Mode::Live(_) => panic!("expected a replay app"),
+        }
     }
 
     #[test]
