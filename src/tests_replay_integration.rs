@@ -698,6 +698,66 @@ fn test_replay_empty_golden() {
     assert_golden("replay", "empty.txt", &render_replay_frame(&app));
 }
 
+#[test]
+fn test_replay_payoff_head_golden() {
+    // The #50 replay payoff-at-head golden (the #49 RECONCILED scope: the OPEN
+    // position's EXPIRATION payoff curve + the mark-based MTM reference level, with the
+    // honest "not a bit-exact reprice" caveat — NOT a t+0 curve). The conformance
+    // fixture's last step carries an open (short-call) position that the panel prices;
+    // the current mark P&L is formatted from integer cents at the render edge.
+    let (mut app, _rx) = replay_app_from_fixture("valid");
+    // Switch to the payoff panel and jump to the last step (the fixture's open set is
+    // deterministic there).
+    match app.dispatch_key_global(press('2')) {
+        KeyRoute::Consumed => {}
+        KeyRoute::ToScreen => panic!("a screen-switch number key is a consumed global"),
+    }
+    assert_eq!(replay_screen(&app), ReplayScreen::Payoff);
+    app.on_event(AppEvent::ReplaySeek(SeekTo::Step(u32::MAX)));
+    let text = render_replay_frame(&app);
+
+    // An OPEN position renders a real curve with the honest caveat — NOT the flat state,
+    // and NO bit-exact-reprice claim beyond the "current MTM" reference.
+    assert!(
+        text.contains("expiration payoff") && text.contains("not a bit-exact reprice"),
+        "the panel names the expiration curve + the honest no-reprice caveat: {text:?}",
+    );
+    assert!(
+        !text.contains("flat at this step"),
+        "an open position at the head is not the flat state: {text:?}",
+    );
+    // Money is formatted from integer cents (the net mark P&L, +600c -> +$6.00), never
+    // recomputed as f64: the three short 60k calls mark +200c each.
+    assert!(
+        text.contains("+$6.00"),
+        "the head mark P&L renders from integer cents as +$6.00: {text:?}",
+    );
+
+    assert_golden("replay", "payoff_head.txt", &text);
+}
+
+#[test]
+fn test_replay_payoff_head_flat_state_renders() {
+    // The companion "flat at this step" empty render, exercised in the same module
+    // (`docs/TESTING.md` §4, the states-first rule). Step 0's only position closed at
+    // expiry, so the head is flat: the deliberate empty state, never a fabricated
+    // curve. No golden — the populated `payoff_head` golden pins the layout; this only
+    // proves the empty body is reached and honest.
+    let (mut app, _rx) = replay_app_from_fixture("valid");
+    let _ = app.dispatch_key_global(press('2'));
+    assert_eq!(replay_screen(&app), ReplayScreen::Payoff);
+    app.on_event(AppEvent::ReplaySeek(SeekTo::Step(0)));
+    let text = render_replay_frame(&app);
+    assert!(
+        text.contains("flat at this step"),
+        "step 0 (closed at expiry) renders the flat empty state: {text:?}",
+    );
+    assert!(
+        text.contains("scrub to an open step"),
+        "the flat state names its recovery affordance: {text:?}",
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Section: the REAL supervised startup seam (#37 review) — the load arrives
 // through `spawn_bundle_load` -> the event channel -> the fold, never a

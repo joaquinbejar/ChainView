@@ -780,7 +780,7 @@ fn replay_payoff_header(theme: Theme, head: &ReplayPayoffHead) -> Vec<Line<'stat
         Span::raw(fmt_break_evens(head.break_even_points())),
     ]);
     let caveat = Line::from(Span::styled(
-        "expiration payoff · mark = current MTM (not a bit-exact reprice)",
+        "expiration payoff (per contract) · mark = current MTM (not a bit-exact reprice)",
         theme.dim(),
     ));
     vec![summary, marks, caveat]
