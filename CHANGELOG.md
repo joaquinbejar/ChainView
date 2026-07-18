@@ -14,6 +14,67 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- **The CLI / config / keybinding surface freeze and the SemVer CI machinery**
+  (issue #55; `docs/SEMVER.md`, `docs/05-views-and-ux.md` §1/§3,
+  `docs/07-configuration.md` §4, `.env.example`, `scripts/check-changelog.sh`,
+  `scripts/surface-diff.sh`, `.github/workflows/ci.yml`, `docs/ROADMAP.md`,
+  `docs/specs/providers.md`). Audits and freezes the three ChainView-owned public
+  surfaces — the CLI, the config, and the documented keybinding map — as
+  stable-with-additive-only growth from `v1.0.0`, and wires the SemVer + CHANGELOG
+  CI enforcement. Docs + CI + scripts only; **no production source change**.
+  - **The three surfaces enumerated and frozen against their source.** The CLI
+    grammar (the `replay <dir>` subcommand, the nine live/global flags, exit codes
+    `0`/`1`, and the built-in provider ids — `src/main.rs`), the config
+    environment variables and `CLI > env > file > default` precedence
+    (`src/config.rs`), and the keybinding map (`src/app/keymap.rs` `KEYMAP` ->
+    `docs/05-views-and-ux.md` §3) each match their `docs/` page cell-for-cell; the
+    frozen set and the audit are recorded in a new `docs/SEMVER.md`
+    "v1.0 surface-stability audit (#55)" section. `RESERVED_PROVIDER_IDS` is
+    confirmed to hold **exactly** the five built-ins
+    (`deribit`/`tastytrade`/`dxlink`/`ig`/`alpaca`), and the provider-port types
+    (`ProviderCapabilities` + `ChainCapability`/`GreeksCapability`/
+    `OptionStreamCapability`/`ChainPollCapability`/`AuthKind`) are confirmed
+    `#[non_exhaustive]` + builder-shaped, so an optional capability dimension stays
+    a source-compatible **minor** bump (proven by the #44
+    `capabilities_source_compat` `trybuild` gate this references, does not
+    duplicate).
+  - **Three doc<->code drifts fixed.** The keybinding-map source of truth moved to
+    the application layer at #14 but three pages still named `src/ui/theme.rs`:
+    `docs/SEMVER.md` (the surface table), `docs/05-views-and-ux.md` §1 and §3 now
+    name `src/app/keymap.rs` (the `KEYMAP`) with `src/ui/theme.rs` as the overlay
+    renderer. `.env.example` advertised the **superseded** `ProviderId` grammar
+    (`^[a-z][a-z0-9_-]{1,31}$`); it is corrected to the tightened ADR-0008 form
+    (`^[a-z][a-z0-9]*(?:[_-][a-z0-9]+)*$`, 2-32 chars, isolated separators) that
+    `src/chain/identity.rs` and `docs/07` §5.1 already use.
+  - **`changelog-check` — the CHANGELOG gate** (`scripts/check-changelog.sh` +
+    the CI job). A user-visible PR must add a new line under `## [Unreleased]`;
+    the gate skips on the `chore:`/`refactor:`/`test:`/`docs:`/`ci:`/`bench:`
+    title prefixes and the `[skip changelog]` token, and fails closed otherwise.
+    The comparison is **section-scoped** (only the `[Unreleased]` block is
+    diffed) so unrelated edits neither satisfy nor break it. A `--self-test`
+    proves the gate is non-vacuous (an added line passes; a no-added-line diff
+    fails; both skip paths skip) with no git and no dependency.
+  - **`surface-diff` — the public-surface change reminder**
+    (`scripts/surface-diff.sh` + the CI job). Informational: it flags a PR
+    touching a frozen public-surface source (`src/main.rs`, `src/config.rs`,
+    `src/app/keymap.rs`, `src/ui/theme.rs`, `src/providers/mod.rs`,
+    `src/chain/identity.rs`, `src/lib.rs`) with a reviewer classification
+    checklist, so a rename/removal is caught in review rather than shipped
+    silently under a minor bump. It never fails on a mere touch; its `--self-test`
+    (flags a surface touch, ignores an internal-only change) runs as the BLOCKING
+    proof-of-liveness step. Both jobs are `pull_request`-scoped and bounded, so an
+    unrelated PR never flakes.
+  - **`[package].version` v1.0.0-cut discipline recorded.** The crate stays at its
+    pre-1.0 `[package].version`; the release-cut rule (rename `[Unreleased]`, bump
+    `[package].version` to `1.0.0`) is documented in `docs/SEMVER.md`. This issue
+    does **not** bump the version.
+  - **Routed #54 fold-in: `docs/specs/providers.md` §0 pin refresh.** The §0
+    provenance table had drifted from `Cargo.lock` ground truth — refreshed per
+    the file's own procedure: `alpaca-websocket` `0.4.0` -> **`0.6.0`** and
+    `optionstratlib` `0.17.2` -> **`0.18.0`** (the versions `Cargo.lock` resolves
+    and `Cargo.toml` pins), each commit cell marked unverified against the new
+    version; and the stale "unapproved in `Cargo.toml`" preamble is reconciled
+    (the deps are approved and in `Cargo.toml` now).
 - **Fuzzing the parser surfaces — the v1.0 security gate** (issue #53; the
   `fuzz/` cargo-fuzz crate, `src/fuzz_support.rs`, `src/providers/deribit.rs`,
   `.github/workflows/ci.yml`, `docs/TESTING.md` §13.4, `docs/SECURITY.md` §7,
