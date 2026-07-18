@@ -25,6 +25,30 @@
 //! adapter reaches parity using only the port with **no built-in special-casing**
 //! (`docs/TESTING.md` §7, `docs/03-data-providers.md` §11, §12).
 //!
+//! Section 5 (issue #51) adds the v0.5 **behavioural** acceptance the #50 goldens
+//! cannot prove: the depth `change_id` gap → resync flows (driven through the REAL
+//! `App::on_event` fan-in fold + render), the coalescing burst → no-frozen-frame,
+//! the depth-unavailable capability gate, the vol-smile parity against
+//! `optionstratlib`'s own `VolatilitySmile::smile()`, and the surface fallible
+//! `Err`/degenerate → honest empty-state render. These need `pub(crate)` internals
+//! (`fixture_btc_depth_ladder`, `ui::depth::draw`, `ui::surface::draw`) the public
+//! `tests/` crate cannot reach, so they live in-crate beside Section 4's goldens.
+//!
+//! **Spec-text vs reconciled gap semantics.** The 051 spec's scripted "a delta
+//! whose `change_id` skips the expected next value triggers a resync" line predates
+//! the #48 reconcile. The Deribit adapter subscribes the GROUPED full-snapshot book
+//! channel (`book.{i}.none.20.100ms`), where every frame is a complete aggregated
+//! book, so under the RECONCILED model (`src/chain/depth.rs` `depth_continues` + its
+//! module docs / the #48 hand-off note) a forward `change_id` **skip is BENIGN** (a
+//! coalesced snapshot the channel dropped by design) and stays `Fresh`; only a
+//! `change_id` **regression** (venue re-seed) or a **lost** sequence (`Some`→`None`)
+//! flips `ResyncNeeded` → the "resyncing" badge + the dimmed ladder. Section 5
+//! implements the gap tests per the reconciled model, NOT the stale spec line. The
+//! 051 spec's other stale line — "a `CurveError`/`SurfaceError` … renders the
+//! insufficient-IV empty state" — is likewise reconciled to the #47 refinement
+//! (P3-01): an IV-sparse expiry renders "insufficient IV" (`NoData`), a hard build
+//! `Err` renders the DISTINGUISHABLE "degenerate geometry" (`Degenerate`).
+//!
 //! Every test here is deterministic (recorded fixtures + fixed instants, no
 //! socket, no wall-clock wait) and finishes far under the 10 s integration bound
 //! (`docs/TESTING.md` §7).
@@ -37,24 +61,30 @@ use chrono::{DateTime, Utc};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use optionstratlib::chains::OptionData;
 use optionstratlib::chains::chain::OptionChain;
-use optionstratlib::prelude::Positive;
+use optionstratlib::prelude::{Decimal, Positive, VolatilitySmile};
+use optionstratlib::visualization::{GraphData, Series2D, Surface3D};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
+use ratatui::buffer::Buffer;
+use ratatui::style::Modifier;
 use tokio::sync::mpsc;
 
-use crate::app::{App, EventBridge, LiveScreen, LiveState, Mode, ScreenLoad, SourceBinding};
+use crate::app::{
+    App, EventBridge, LiveScreen, LiveState, Mode, ScreenLoad, SourceBinding, is_screen_reachable,
+};
 use crate::chain::{
-    AliasCatalog, ChainFetch, ChainSource, ChainStore, ExpirySource, MarketUpdate, ProviderId,
-    StreamHealth,
+    AliasCatalog, ChainFetch, ChainSource, ChainStore, DepthLadder, DepthLevel, DepthStatus,
+    ExpirySource, InstrumentKey, MarketUpdate, ProviderId, StreamHealth, depth_continues,
 };
 use crate::config::ThemeChoice;
-use crate::event::Command;
+use crate::event::{AppEvent, Command};
 use crate::providers::deribit::{
     fixture_btc_chain_fetch_named, fixture_btc_depth_ladder, fixture_btc_stream_updates,
 };
 use crate::providers::{ChainCapability, GreeksCapability, ProviderCapabilities};
 use crate::ui::chain::draw as draw_chain;
 use crate::ui::golden::{GOLDEN_HEIGHT, GOLDEN_WIDTH, assert_golden, buffer_to_text};
+use crate::ui::graph::{EmptyReason, GraphProjection, project};
 use crate::ui::render;
 use crate::ui::theme::Theme;
 use crate::ui::view::ViewState;
@@ -561,4 +591,677 @@ fn test_depth_unavailable_golden() {
         "the unavailable body names itself: {text:?}",
     );
     assert_golden("depth", "depth_unavailable.txt", &text);
+}
+
+// =============================================================================
+// 5. The #51 v0.5 acceptance-gate BEHAVIOURAL flows (`docs/TESTING.md` §7,
+//    `docs/03-data-providers.md` §8/§5, ROADMAP §v0.5). Distinct from Section 4's
+//    snapshot goldens: these assert BEHAVIOUR — a change_id discontinuity resyncs
+//    (no torn book), a book burst never freezes a frame, the depth screen is
+//    capability-gated, the vol smile passes `VolatilitySmile::smile()` through, and
+//    the surface fallible path degrades to an honest empty state. Every flow drives
+//    the REAL fan-in fold (`App::on_event`) and/or the REAL draw; no socket, no wall
+//    clock, each far under the 10 s integration bound.
+//
+//    RECONCILED gap semantics (binding — the spec text is stale, see the module
+//    header): the adapter subscribes the GROUPED full-snapshot book channel, so a
+//    forward change_id SKIP is a benign coalesced snapshot (stays Fresh); only a
+//    change_id REGRESSION (venue re-seed) or a LOST sequence (Some→None) resyncs.
+// =============================================================================
+
+/// A depth-capable Live state on the [`LiveScreen::Depth`] screen (Ready), with the
+/// 60 000 call contract focused but **no book yet** — the scripted-gap tests fold the
+/// book sequence through the real fan-in from this starting point.
+fn depth_focused_state() -> LiveState {
+    let mut live = LiveState::new(
+        SourceBinding::new(pid("deribit"), caps(), StreamHealth::Live),
+        seed_store(depth_chain()),
+    );
+    live.screen = LiveScreen::Depth;
+    live.load = ScreenLoad::Ready;
+    live.selection.focused_row = Some(0);
+    live
+}
+
+/// Wrap a Live `state` in an [`App`] (Live mode) whose command channel needs no
+/// runtime — the fan-in fold ([`App::on_event`]) and the pure draw never touch it.
+fn depth_app(state: LiveState) -> App {
+    let (tx, _rx) = mpsc::channel::<Command>(16);
+    App::new(Mode::Live(state), ThemeChoice::Auto, tx)
+}
+
+/// A full grouped-snapshot book ladder for `key` at `change_id`, assembled from the
+/// committed grouped fixture through the REAL [`fixture_btc_depth_ladder`] /
+/// `normalize_book` (so the ladder shape is the adapter's output), with the sequence
+/// number scripted.
+fn depth_ladder_cid(key: &InstrumentKey, change_id: Option<u64>) -> DepthLadder {
+    let mut ladder = fixture_btc_depth_ladder(key.clone(), utc(AS_OF));
+    ladder.change_id = change_id;
+    ladder
+}
+
+/// A grouped-snapshot book ladder for `key` at `change_id` with **distinctive**
+/// hand-authored levels (best-first) — used to prove a wholesale snapshot swap, never
+/// a delta stitched across a gap.
+fn depth_ladder_levels(
+    key: &InstrumentKey,
+    change_id: Option<u64>,
+    bids: &[(f64, f64)],
+    asks: &[(f64, f64)],
+) -> DepthLadder {
+    let mut ladder = fixture_btc_depth_ladder(key.clone(), utc(AS_OF));
+    ladder.change_id = change_id;
+    ladder.bids = bids
+        .iter()
+        .map(|&(p, s)| DepthLevel {
+            price: pos(p),
+            size: pos(s),
+        })
+        .collect();
+    ladder.asks = asks
+        .iter()
+        .map(|&(p, s)| DepthLevel {
+            price: pos(p),
+            size: pos(s),
+        })
+        .collect();
+    ladder
+}
+
+/// Fold one grouped book frame for `key` at `change_id` through the REAL fan-in
+/// (`AppEvent::Market(MarketUpdate::Depth(..))` → `on_market` → `apply_depth` →
+/// `DepthStore::apply`).
+fn fold_depth(app: &mut App, key: &InstrumentKey, change_id: Option<u64>) {
+    app.on_event(AppEvent::Market(MarketUpdate::Depth(depth_ladder_cid(
+        key, change_id,
+    ))));
+}
+
+/// The selected-contract key of a depth state (the tests focus a real strike, so it
+/// resolves).
+#[track_caller]
+fn depth_key(state: &LiveState) -> InstrumentKey {
+    match state.selected_depth_key() {
+        Some(key) => key,
+        None => panic!("the focused depth state resolves a selected contract"),
+    }
+}
+
+/// Render the Depth screen for `live` through the REAL [`crate::ui::depth::draw`] into
+/// the fixed 120x40 backend and return the cloned buffer (for a modifier/dim probe the
+/// row-major text projection cannot carry).
+#[track_caller]
+fn render_depth_buffer(live: &LiveState) -> Buffer {
+    let mut term = terminal(GOLDEN_WIDTH, GOLDEN_HEIGHT);
+    match term.draw(|frame| crate::ui::depth::draw(live, frame, frame.area(), theme(), 0)) {
+        Ok(_) => {}
+        Err(e) => panic!("depth draw failed: {e}"),
+    }
+    term.backend().buffer().clone()
+}
+
+/// The row-major text of a depth-screen buffer.
+fn depth_text(live: &LiveState) -> String {
+    buffer_to_text(&render_depth_buffer(live))
+}
+
+/// Whether any digit-bearing cell in the ladder BODY band (below the `y=1` header,
+/// above the always-dim spread footer) is `DIM`-styled — the honest stale/resync dim
+/// (#48 P2-01). Mirrors the proven `src/ui/depth.rs` probe: the band `2..height/2`
+/// excludes the unconditionally-dim footer so it never false-positives.
+fn body_has_dimmed_digit(buffer: &Buffer, height: u16) -> bool {
+    let width = buffer.area().width;
+    for y in 2..(height / 2) {
+        for x in 0..width {
+            if let Some(cell) = buffer.cell((x, y))
+                && cell.symbol().chars().any(|c| c.is_ascii_digit())
+                && cell.modifier.contains(Modifier::DIM)
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Render an [`App`] full-frame through the REAL public [`render`] entry (ui view
+/// cache synced off the draw path) into the fixed 120x40 backend, as golden text —
+/// the render loop's own path.
+#[track_caller]
+fn render_app_text(app: &App) -> String {
+    let mut view = ViewState::new();
+    view.sync(app);
+    let mut term = terminal(GOLDEN_WIDTH, GOLDEN_HEIGHT);
+    match term.draw(|frame| render(app, &view, frame)) {
+        Ok(_) => {}
+        Err(e) => panic!("full-frame render failed: {e}"),
+    }
+    buffer_to_text(term.backend().buffer())
+}
+
+// --- 5a. A change_id REGRESSION resyncs: badge + dimmed ladder, no torn book ---
+
+#[test]
+fn test_depth_regression_flips_resync_badge_and_dims_ladder() {
+    // Seed a grouped snapshot (change_id 10), then fold a REGRESSING frame
+    // (change_id 3 — a venue re-seed) through the REAL fan-in. Under the reconciled
+    // grouped-snapshot model that is a genuine discontinuity, so the visible book
+    // flips ResyncNeeded: the "resyncing" badge renders and the ladder body dims.
+    let mut app = depth_app(depth_focused_state());
+    let key = depth_key(live_of(&app));
+    fold_depth(&mut app, &key, Some(10));
+    fold_depth(&mut app, &key, Some(3));
+
+    let live = live_of(&app);
+    let book = match live.depth_store.book(&key) {
+        Some(b) => b,
+        None => panic!("the folded book is retrievable by the selected key"),
+    };
+    assert_eq!(
+        book.status(),
+        DepthStatus::ResyncNeeded,
+        "a change_id regression flips the visible book to ResyncNeeded",
+    );
+
+    let buffer = render_depth_buffer(live);
+    let text = buffer_to_text(&buffer);
+    assert!(
+        text.contains("resyncing"),
+        "the resync badge renders through the real draw: {text:?}",
+    );
+    assert!(
+        body_has_dimmed_digit(&buffer, GOLDEN_HEIGHT),
+        "the ladder body dims under resync — never a bright, trusted-looking book",
+    );
+    // Not a frozen/blank frame: the last snapshot is still rendered (badged), so the
+    // side labels remain on-screen.
+    assert!(
+        text.contains("bid") && text.contains("ask"),
+        "the dimmed ladder still renders both sides: {text:?}",
+    );
+}
+
+#[test]
+fn test_depth_lost_sequence_flips_resync() {
+    // A tracked sequence that goes Some→None (the feed lost its change_id) is a resync
+    // boundary too (`depth_continues(Some(_), None) == false`).
+    let mut app = depth_app(depth_focused_state());
+    let key = depth_key(live_of(&app));
+    fold_depth(&mut app, &key, Some(10));
+    fold_depth(&mut app, &key, None);
+
+    let live = live_of(&app);
+    match live.depth_store.book(&key) {
+        Some(book) => assert_eq!(
+            book.status(),
+            DepthStatus::ResyncNeeded,
+            "losing the change_id sequence flags a resync",
+        ),
+        None => panic!("book present"),
+    }
+    assert!(
+        depth_text(live).contains("resyncing"),
+        "the lost-sequence resync badges the ladder",
+    );
+}
+
+// --- 5b. A forward SKIP is BENIGN (the reconciled model) ----------------------
+
+#[test]
+fn test_depth_forward_skip_stays_fresh_and_bright() {
+    // THE spec-text divergence, made executable. The 051 spec's stale line says "a
+    // delta whose change_id skips the expected next value triggers a resync". Under
+    // the RECONCILED grouped-snapshot semantics a forward skip is a benign coalesced
+    // full snapshot (the channel dropped intermediate books by design), so it stays
+    // Fresh: NO resync badge, and the ladder stays bright (trusted).
+    //
+    // Bind the reconciled classifier directly so the intent is unambiguous.
+    assert!(
+        depth_continues(Some(10), Some(50)),
+        "a forward skip continues (benign coalesced snapshot) — the reconciled model",
+    );
+    assert!(
+        !depth_continues(Some(10), Some(9)),
+        "only a regression is a discontinuity",
+    );
+    assert!(
+        !depth_continues(Some(10), None),
+        "only a lost sequence is a discontinuity",
+    );
+
+    let mut app = depth_app(depth_focused_state());
+    let key = depth_key(live_of(&app));
+    fold_depth(&mut app, &key, Some(10));
+    fold_depth(&mut app, &key, Some(50)); // a big forward skip
+
+    let live = live_of(&app);
+    match live.depth_store.book(&key) {
+        Some(book) => assert_eq!(
+            book.status(),
+            DepthStatus::Fresh,
+            "a forward change_id skip stays Fresh — no false resync",
+        ),
+        None => panic!("book present"),
+    }
+    let buffer = render_depth_buffer(live);
+    let text = buffer_to_text(&buffer);
+    assert!(
+        !text.contains("resyncing"),
+        "a benign skip shows no resync badge: {text:?}",
+    );
+    assert!(
+        !body_has_dimmed_digit(&buffer, GOLDEN_HEIGHT),
+        "a benign skip leaves the ladder body bright (only the footer is dim)",
+    );
+}
+
+// --- 5c. A gap swaps a WHOLE snapshot — never a delta stitched across the gap ---
+
+#[test]
+fn test_depth_gap_never_renders_a_torn_book() {
+    // The grouped channel delivers a COMPLETE aggregated book every frame; the store
+    // overwrites its slot wholesale and never merges a delta. So even across a
+    // change_id regression the rendered book is exactly ONE venue snapshot (the latest
+    // full frame), badged resyncing — never A's levels stitched onto B's. This is the
+    // "never a torn book from a delta applied across the gap" acceptance, proven under
+    // the reconciled grouped model (where no delta-merge exists to tear a book).
+    let mut app = depth_app(depth_focused_state());
+    let key = depth_key(live_of(&app));
+
+    // Frame A: change_id 10, distinctive levels around 60 000.
+    app.on_event(AppEvent::Market(MarketUpdate::Depth(depth_ladder_levels(
+        &key,
+        Some(10),
+        &[(60_000.0, 1.0), (59_990.0, 2.0)],
+        &[(60_010.0, 1.0)],
+    ))));
+    // Frame B: a REGRESSING change_id 3, a completely different book around 50 000.
+    app.on_event(AppEvent::Market(MarketUpdate::Depth(depth_ladder_levels(
+        &key,
+        Some(3),
+        &[(50_000.0, 3.0)],
+        &[(50_010.0, 4.0)],
+    ))));
+
+    let live = live_of(&app);
+    let book = match live.depth_store.book(&key) {
+        Some(b) => b,
+        None => panic!("book present"),
+    };
+    let ladder = book.ladder();
+    // The shown book is EXACTLY frame B, wholesale — none of A's levels survive.
+    assert_eq!(ladder.bids.len(), 1, "the book is B's complete snapshot");
+    assert_eq!(
+        ladder.bids.first().map(|l| l.price),
+        Some(pos(50_000.0)),
+        "the best bid is B's, not A's 60 000 (no stitch)",
+    );
+    assert_eq!(ladder.asks.first().map(|l| l.price), Some(pos(50_010.0)));
+    assert!(
+        !ladder.bids.iter().any(|l| l.price == pos(60_000.0)),
+        "A's levels are gone — the frame is not torn across the gap",
+    );
+    assert!(
+        book.needs_resync(),
+        "the discontinuity is honestly flagged for the badge/dim, not silently trusted",
+    );
+    // And the rendered ladder shows B's price, badged resyncing.
+    let text = depth_text(live);
+    assert!(text.contains("50000.00"), "B's best bid renders: {text:?}");
+    assert!(text.contains("resyncing"), "badged resyncing");
+}
+
+// --- 5d. No-frozen-frame: the render loop keeps producing frames through resync -
+
+#[test]
+fn test_depth_resync_state_keeps_rendering_frames() {
+    // Through a resync-needed state the full-frame render keeps producing frames —
+    // never a stale-bright frame (the badge is present), never a blank or a panic (the
+    // #48 ux fix, pinned). Interleaving regressing folds and renders shows the draw
+    // path never blocks on the update path: each fold keeps the book discontinuous
+    // (a strictly decreasing change_id re-seed), and each render still succeeds.
+    let mut app = depth_app(depth_focused_state());
+    let key = depth_key(live_of(&app));
+    fold_depth(&mut app, &key, Some(1_000)); // seed, Fresh
+
+    for round in 0..5u64 {
+        // Each fold regresses from the previous stored change_id → stays ResyncNeeded.
+        let cid = 1_000 - (round + 1) * 10; // 990, 980, 970, 960, 950
+        fold_depth(&mut app, &key, Some(cid));
+        // Advance the tick (the spinner counter) between draws — the loop is alive.
+        app.on_event(AppEvent::Tick);
+        let text = render_app_text(&app);
+        assert!(
+            text.contains("resyncing"),
+            "round {round}: the resync badge is never dropped for a stale-bright frame: {text:?}",
+        );
+        assert!(
+            text.contains("bid") && text.contains("ask"),
+            "round {round}: the ladder still renders (never blank): {text:?}",
+        );
+    }
+}
+
+// --- 5e. A book burst folds without freezing a frame, memory stays bounded ------
+
+#[test]
+fn test_depth_burst_through_the_real_bridge_coalesces_latest_value_wins() {
+    // The SAME burst driven through the REAL bounded coalescing path - the
+    // producer sink staging -> the bounded market channel -> EventBridge::pump ->
+    // the fold - instead of direct on_event folds, so a regression in the actual
+    // bridge/coalescing machinery is caught here (the #111 review point). Under
+    // saturation the coalescing collapses intermediates latest-value-wins: after
+    // the pump the store holds ONE bounded book at the NEWEST change_id, and a
+    // frame still renders.
+    let mut app = depth_app(depth_focused_state());
+    let key = depth_key(live_of(&app));
+
+    let (mut bridge, senders) = EventBridge::new(64);
+    let mut sink = senders.market_update_sink();
+    const BURST: u64 = 512; // deliberately above the channel capacity
+    for cid in 1..=BURST {
+        // publish_coalesced never blocks: overflow stages latest-value-wins.
+        let _ = sink.publish_coalesced(MarketUpdate::Depth(depth_ladder_cid(&key, Some(cid))));
+    }
+    let _ = sink.flush();
+    bridge.pump(&mut app, |_command| {});
+    // A saturated burst may leave the freshest value staged behind a full
+    // channel; one more flush+pump drains it (the production tick does this).
+    let _ = sink.flush();
+    bridge.pump(&mut app, |_command| {});
+
+    let live = live_of(&app);
+    assert_eq!(
+        live.depth_store.len(),
+        1,
+        "one bounded book after the real-path burst"
+    );
+    match live.depth_store.book(&key) {
+        Some(book) => assert_eq!(
+            book.ladder().change_id,
+            Some(BURST),
+            "coalescing is latest-value-wins: the newest change_id survives the saturation",
+        ),
+        None => panic!("the burst book exists"),
+    }
+    let text = render_app_text(&app);
+    assert!(
+        !text.is_empty(),
+        "a frame renders after the real-path burst"
+    );
+}
+
+#[test]
+fn test_depth_burst_folds_without_freezing_a_frame_and_stays_bounded() {
+    // A bursty feed folds a stream of grouped snapshots for ONE contract; each fold
+    // overwrites the slot latest-value-wins (the coalescing discipline), so the store
+    // stays bounded at one book while the render loop keeps producing frames. Proven
+    // by interleaving folds and full-frame renders — not a wall-clock latency
+    // measurement (that is a BENCH.md concern).
+    let mut app = depth_app(depth_focused_state());
+    let key = depth_key(live_of(&app));
+
+    const BURST: u64 = 128;
+    for cid in 1..=BURST {
+        fold_depth(&mut app, &key, Some(cid)); // advancing → stays Fresh
+        let text = render_app_text(&app);
+        assert!(
+            !text.is_empty(),
+            "cid {cid}: a frame renders during the burst — the draw never stalls",
+        );
+    }
+
+    let live = live_of(&app);
+    assert_eq!(
+        live.depth_store.len(),
+        1,
+        "the bounded store holds ONE book for the single contract — memory does not grow",
+    );
+    match live.depth_store.book(&key) {
+        Some(book) => {
+            assert_eq!(
+                book.status(),
+                DepthStatus::Fresh,
+                "an advancing burst stays Fresh (no false resync)",
+            );
+            assert_eq!(
+                book.ladder().change_id,
+                Some(BURST),
+                "latest-value-wins: the newest frame is shown",
+            );
+        }
+        None => panic!("book present"),
+    }
+    assert!(
+        !body_has_dimmed_digit(&render_depth_buffer(live), GOLDEN_HEIGHT),
+        "a continuous burst renders bright (dim is reserved for the honest resync)",
+    );
+}
+
+// --- 5f. The Depth screen is capability-gated, never fabricated ----------------
+
+#[test]
+fn test_depth_screen_is_capability_gated_and_unavailable_renders_honestly() {
+    // Reachability reads the declared caps ONLY (the gate signature takes `&caps`,
+    // never a ProviderId): depth:false → unreachable; depth:true → reachable.
+    assert!(
+        !is_screen_reachable(LiveScreen::Depth, &no_depth_caps()),
+        "a depth-less venue cannot reach the Depth screen",
+    );
+    assert!(
+        is_screen_reachable(LiveScreen::Depth, &caps()),
+        "a depth-capable venue reaches the Depth screen",
+    );
+
+    // `set_screen` honours the gate: a depth-less state on the default Chain screen
+    // refuses the switch to Depth, so the screen is genuinely unreachable, not just
+    // hidden.
+    let mut depthless = LiveState::new(
+        SourceBinding::new(pid("deribit"), no_depth_caps(), StreamHealth::Live),
+        seed_store(depth_chain()),
+    );
+    assert_eq!(depthless.screen, LiveScreen::Chain);
+    assert!(
+        !depthless.set_screen(LiveScreen::Depth),
+        "set_screen refuses the unreachable Depth screen (capability-gated)",
+    );
+    assert_eq!(
+        depthless.screen,
+        LiveScreen::Chain,
+        "the screen never switched to the gated Depth",
+    );
+
+    // The defensive draw (if reached) renders the honest state, never a fabricated
+    // ladder: no bid/ask side labels, no spread footer.
+    let text = render_live_frame(depth_unavailable_state());
+    assert!(
+        text.contains("not available"),
+        "the unavailable body names itself: {text:?}",
+    );
+    assert!(
+        !text.contains("resyncing") && !text.contains("spread"),
+        "no fabricated ladder machinery leaks into the unavailable state: {text:?}",
+    );
+}
+
+// --- 5g. The vol smile passes optionstratlib's VolatilitySmile::smile() through -
+
+/// A parity smile chain: strikes carrying a reliable per-strike venue IV but NO
+/// quotes. With no premium the #24 sidecar inverts nothing (its IV clears to `None`),
+/// so `build_smile`'s IV overlay resolves each strike to the chain's OWN set IV — the
+/// same `(strike, IV)` pairs `OptionChain::smile()` reads. That makes
+/// `store.chain().smile()` an EXACT oracle for the panel's built geometry (the panel's
+/// only transform, the frozen-`Days` re-stamp, does not touch the smile's inputs).
+fn parity_smile_chain() -> OptionChain {
+    const SKEW: [(f64, f64); 5] = [
+        (56_000.0, 0.72),
+        (58_000.0, 0.66),
+        (60_000.0, 0.60),
+        (62_000.0, 0.55),
+        (64_000.0, 0.58),
+    ];
+    let mut chain = OptionChain::new("BTC", pos(60_000.0), "2025-06-27".to_owned(), None, None);
+    for (strike, iv) in SKEW {
+        let _ = chain.options.insert(OptionData {
+            strike_price: pos(strike),
+            implied_volatility: pos(iv),
+            ..Default::default()
+        });
+    }
+    chain
+}
+
+/// The `(x, y)` decimal vectors of a `GraphData::Series` (the smile geometry) — panics
+/// on any other shape so a regression cannot slip through as a different variant.
+#[track_caller]
+fn series_xy(graph: &GraphData) -> (Vec<Decimal>, Vec<Decimal>) {
+    match graph {
+        GraphData::Series(series) => (series.x.clone(), series.y.clone()),
+        other => panic!("expected a smile Series, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_surface_smile_renders_optionstratlib_smile_output() {
+    // The parity acceptance (`docs/TESTING.md` §9, ROADMAP §v0.5): ChainView RENDERS
+    // `VolatilitySmile::smile()`'s output — it does not recompute or "improve" it. The
+    // panel's built smile GraphData (the geometry BEFORE the ratatui projection) must
+    // equal `optionstratlib`'s own `chain.smile()` output for a known chain. ChainView
+    // deliberately does NOT re-test the smile MATH — only that it passes it through.
+    let store = seed_store(parity_smile_chain());
+    let live = LiveState::new(
+        SourceBinding::new(pid("deribit"), caps(), StreamHealth::Live),
+        store,
+    );
+
+    // ChainView's built smile (the Smile view is the panel default).
+    let built = live.surface.active_graph_data();
+    let (built_x, built_y) = series_xy(built);
+    assert!(
+        !built_x.is_empty(),
+        "the parity chain builds a non-empty smile (not two compared empties)",
+    );
+
+    // The upstream oracle: optionstratlib's own smile() over the SAME chain, wrapped by
+    // the SAME `GraphData::from` conversion ChainView uses.
+    let oracle: GraphData = live.store.chain().smile().into();
+    let (oracle_x, oracle_y) = series_xy(&oracle);
+
+    // Bit-exact Decimal parity — both sides pass through the identical `to_dec()` path,
+    // so the "stated exactness" is exact equality (a pure pass-through, no recompute).
+    assert_eq!(
+        built_x, oracle_x,
+        "the rendered smile's strike axis is exactly smile()'s x",
+    );
+    assert_eq!(
+        built_y, oracle_y,
+        "the rendered smile's IV axis is exactly smile()'s y (pass-through, not recomputed)",
+    );
+    assert_eq!(
+        built_x.len(),
+        5,
+        "one smile point per reliable strike (the five seeded)",
+    );
+}
+
+// --- 5h. The surface fallible path degrades to an honest empty state -----------
+
+#[test]
+fn test_surface_insufficient_iv_renders_empty_state_off_the_draw_path() {
+    // An IV-sparse expiry (one strike, zero IV) has no reliable IV to build from, so
+    // `build_smile` yields the empty series and the projection routes to
+    // `Empty(NoData)` OFF the draw path — the deliberate "insufficient IV" state, never
+    // a fabricated curve.
+    let state = surface_state(empty_iv_chain(), 0);
+    assert_eq!(
+        project(state.surface.active_graph_data()).empty_reason(),
+        Some(EmptyReason::NoData),
+        "the IV-sparse expiry routes to the insufficient-IV empty projection",
+    );
+    let text = render_live_frame(state);
+    assert!(
+        text.contains("insufficient IV"),
+        "the empty state names the insufficient-IV cause: {text:?}",
+    );
+}
+
+/// The production degenerate `Series` sentinel shape (`src/app/surface_build.rs`
+/// `degenerate_series`): a single `x`, no `y` (mismatched lengths). A hard
+/// `CurveError` produces exactly this, and the #23 adapter projects it to
+/// `Empty(Degenerate)`.
+fn degenerate_series() -> GraphData {
+    GraphData::Series(Series2D {
+        x: vec![Decimal::ZERO],
+        y: Vec::new(),
+        ..Series2D::default()
+    })
+}
+
+/// The production degenerate `GraphSurface` sentinel shape (`degenerate_surface`): a
+/// single `x`, no `y`/`z`. A hard `SurfaceError` produces exactly this.
+fn degenerate_surface() -> GraphData {
+    GraphData::GraphSurface(Surface3D {
+        x: vec![Decimal::ZERO],
+        y: Vec::new(),
+        z: Vec::new(),
+        ..Surface3D::default()
+    })
+}
+
+/// Render the surface screen for `state` with an injected `projection` through the
+/// REAL [`crate::ui::surface::draw`] at 120x40, returning the frame as text.
+#[track_caller]
+fn render_surface_with(state: &LiveState, projection: &GraphProjection) -> String {
+    let mut term = terminal(GOLDEN_WIDTH, GOLDEN_HEIGHT);
+    match term.draw(|frame| {
+        crate::ui::surface::draw(state, projection, frame, frame.area(), theme(), 0);
+    }) {
+        Ok(_) => {}
+        Err(e) => panic!("surface draw failed: {e}"),
+    }
+    buffer_to_text(term.backend().buffer())
+}
+
+#[test]
+fn test_surface_curve_err_renders_degenerate_state_not_a_corrupt_chart() {
+    // A hard `CurveError` build produces the degenerate series sentinel, which the REAL
+    // `project()` routes to `Empty(Degenerate)`. The REAL surface draw must render the
+    // DISTINGUISHABLE "degenerate geometry" body — never a corrupt chart, never a panic,
+    // never folded into the insufficient-IV state (the #47 P3-01 refinement; a spec-text
+    // divergence, see the module header).
+    let projection = project(&degenerate_series());
+    assert_eq!(
+        projection.empty_reason(),
+        Some(EmptyReason::Degenerate),
+        "the curve-Err sentinel projects degenerate geometry",
+    );
+    let state = surface_state(smile_chain(), 1); // the Curve view
+    let text = render_surface_with(&state, &projection);
+    assert!(
+        text.contains("degenerate geometry"),
+        "the Err path renders the distinguishable degenerate-geometry state: {text:?}",
+    );
+    assert!(
+        !text.contains("insufficient IV"),
+        "the Err path is NOT folded into the insufficient-IV state (P3-01)",
+    );
+}
+
+#[test]
+fn test_surface_surface_err_renders_degenerate_state_not_a_corrupt_chart() {
+    // The 3D analogue: a hard `SurfaceError` (the degenerate surface sentinel) on a
+    // non-Volatility axis renders the honest degenerate-geometry state through the REAL
+    // draw — never a fabricated heat map.
+    let projection = project(&degenerate_surface());
+    assert_eq!(
+        projection.empty_reason(),
+        Some(EmptyReason::Degenerate),
+        "the surface-Err sentinel projects degenerate geometry",
+    );
+    let state = surface_state(smile_chain(), 2); // the Surface view (Delta axis)
+    let text = render_surface_with(&state, &projection);
+    assert!(
+        text.contains("degenerate geometry"),
+        "the surface Err path renders the degenerate-geometry state: {text:?}",
+    );
 }

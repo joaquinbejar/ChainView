@@ -14,6 +14,42 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- **Depth sequence-gap and surface fallible-path behavioural tests** (issue #51;
+  `docs/TESTING.md` §3/§7/§9, `docs/03-data-providers.md` §8/§5, ROADMAP §v0.5). The
+  v0.5 acceptance-gate BEHAVIOURAL flows the #50 snapshot goldens cannot prove, added
+  as Section 5 of the in-crate `src/tests_integration.rs` (they drive `pub(crate)`
+  internals — `fixture_btc_depth_ladder`, `ui::depth::draw`, `ui::surface::draw` — the
+  public `tests/` crate cannot reach). Tests only — **no production change**.
+  - **Depth `change_id` gap → resync, driven through the REAL fan-in.** Each flow
+    folds scripted grouped-book frames through `App::on_event(AppEvent::Market(
+    MarketUpdate::Depth(..)))` → `apply_depth` → `DepthStore::apply`, then renders: a
+    `change_id` **regression** (venue re-seed) and a **lost** sequence (`Some`→`None`)
+    both flip the visible book `ResyncNeeded` → the "resyncing" badge renders and the
+    ladder body dims; a forward **skip stays `Fresh`** and bright; and across a gap the
+    store swaps a WHOLE snapshot (never a delta stitched across the gap — a torn book).
+  - **RECONCILED gap semantics vs the stale spec text.** The 051 spec's scripted "a
+    skip triggers a resync" line predates the #48 reconcile: under the GROUPED
+    full-snapshot book channel a forward skip is a benign coalesced snapshot, so only a
+    regression/lost sequence resyncs (`src/chain/depth.rs` `depth_continues`, the #48
+    hand-off note). The tests implement the reconciled model and the divergence is
+    documented in the module header and the test bodies.
+  - **No-frozen-frame + bounded memory (coalescing).** A resync-needed state keeps
+    producing frames (never a stale-bright frame, never a blank/panic), and a 128-frame
+    book burst for one contract interleaves folds with full-frame renders — the store
+    stays bounded at one book (latest-value-wins) while the render loop keeps drawing,
+    proving the update path never blocks the draw path.
+  - **Depth capability gate.** The Depth screen reachability reads the declared caps
+    only (never a `ProviderId`): `depth: false` → unreachable and `set_screen` refuses
+    it; the defensive unavailable render is the honest state, with no fabricated ladder.
+  - **Vol-smile parity + surface fallible states.** The panel's built smile geometry
+    (before the ratatui projection) equals `optionstratlib` `VolatilitySmile::smile()`
+    output bit-exactly for a known chain (ChainView passes the upstream output through,
+    it does not recompute it — `docs/TESTING.md` §9); an IV-sparse expiry renders the
+    "insufficient IV" (`NoData`) empty state off the draw path, and a hard
+    `CurveError`/`SurfaceError` renders the DISTINGUISHABLE "degenerate geometry"
+    (`Degenerate`) state — never a corrupt chart, never a panic (the spec's "renders the
+    insufficient-IV state" line reconciled to the #47 P3-01 refinement).
+
 - **Surface / depth render goldens + the IG option-epic depth fixture** (issue #50;
   `docs/TESTING.md` §4/§5, `docs/03-data-providers.md` §8, v0.5). Locks the populated
   **and** degraded states of the three screens this milestone adds, all rendered
