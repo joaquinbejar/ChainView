@@ -334,7 +334,12 @@ release cycle without a breaking change before promotion.
       malformed Parquet footer schema (deferred to `replay-expert`: a
       `catch_unwind`/upstream-bump mitigation in `src/replay/*` + regression
       fixture — see `fuzz/README.md`).
-- [ ] #54 — Add the vulnerability-report channel and finalize supply-chain gates (S; depends on #20)
+- [~] #54 — Add the vulnerability-report channel and finalize supply-chain gates (S; depends on #20) —
+      root `SECURITY.md` intake channel added (GitHub private vulnerability
+      reporting + email fallback + 90-day disclosure window); `deny.toml`
+      license/source/ban allow-lists + the three transitive advisory ignores
+      frozen as the reviewed v1.0 gate; `cargo audit` / `cargo deny` proven to
+      fail closed on a dry-run breach and on the un-ignored advisories.
 - [ ] #55 — Freeze the CLI/config/keybinding surfaces and SemVer discipline (M; depends on #3, #14, #43)
 - [ ] #56 — Freeze bundle compatibility against the IronCondor schema (M; depends on #32, #36)
 - [ ] #57 — Run the polish pass on states, theme, and keybindings (M; depends on #18, #27, #35, #47, #48, #49)

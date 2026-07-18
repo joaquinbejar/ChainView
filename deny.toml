@@ -1,4 +1,19 @@
-# cargo-deny configuration — ChainView supply-chain gate (issue #20).
+# cargo-deny configuration — ChainView supply-chain gate (issue #20; FROZEN as
+# the reviewed v1.0 set at issue #54).
+#
+# This is the REVIEWED, FROZEN v1.0 supply-chain policy: the license allow-list,
+# the crates.io-only source allow-list, the duplicate/ban rules, and the
+# advisory-ignore set below were finalized as a whole for the v1.0 stability
+# commitment (issue #54). Each advisory ignore is per-entry justified with a
+# pull path, a reason, and a lift trigger; none is added or dropped without a
+# written justification here AND in docs/SECURITY.md §7.1. The intake channel for
+# a vulnerability against this tree is the repo-root SECURITY.md (GitHub private
+# vulnerability reporting), with the fuller posture in docs/SECURITY.md.
+#
+# The gate is proven to FAIL CLOSED on a breach: a dry-run that drops a license
+# from the allow-list, bans an in-tree crate, or empties the source allow-list
+# each fails `cargo deny check`, and `cargo audit` without the documented
+# `--ignore` flags fails on exactly the advisories recorded below.
 #
 # Runs in CI from v0.1 alongside `cargo audit` and the four non-negotiable
 # commands (docs/SECURITY.md §7, docs/TESTING.md §13.5). `cargo deny check`
