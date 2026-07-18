@@ -131,7 +131,17 @@ pub fn render(app: &App, view: &ViewState, frame: &mut Frame) {
                 chain::draw(state, frame, root.body, theme, app.tick_count, app.now)
             }
             LiveScreen::Depth => depth::draw(state, frame, root.body),
-            LiveScreen::Surface => surface::draw(state, frame, root.body),
+            // The surface line reads only the cached projection the view synced off
+            // the draw path — this paint builds no `GraphData` (#47). The tick counter
+            // advances its loading spinner (a `Copy` read; the draw stays pure).
+            LiveScreen::Surface => surface::draw(
+                state,
+                view.surface(),
+                frame,
+                root.body,
+                theme,
+                app.tick_count,
+            ),
             // The payoff line reads only the cached projection the view synced off
             // the draw path — this paint builds no `GraphData` (#27).
             LiveScreen::Payoff => payoff::draw(state, view.payoff(), frame, root.body, theme),

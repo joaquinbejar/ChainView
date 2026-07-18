@@ -53,22 +53,31 @@
 //! This gate is the enforced invariant for the ratatui dataset and for the future
 //! `f64`-sourced curves/surfaces that route through it.
 //!
-//! # Extension point for v0.5 (#47)
+//! # The three projected shapes (#27 payoff, #47 surface)
 //!
 //! [`project`] matches **every** `GraphData` variant with no wildcard, so adding an
-//! upstream variant forces this module to be revisited by the compiler. The
-//! `MultiSeries` (overlaid Greek curves) and `GraphSurface` (single-expiry vol
-//! surface) variants are deferred to v0.5 (#47): they resolve to a deliberate
-//! [`Empty(Unsupported)`](EmptyReason::Unsupported) today, and #47 replaces those
-//! arms with real projections without touching the `Series` path.
+//! upstream variant forces this module to be revisited by the compiler. A
+//! `GraphData::Series` projects to a [`ProjectedSeries`] (payoff, the vol smile, one
+//! Greek curve). A `GraphData::GraphSurface` projects to a [`ProjectedSurface`] — the
+//! #47 single-expiry Greek/Price-over-(strike, volatility) heat map (the `Series`
+//! projection path is untouched by that arm). `GraphData::MultiSeries` (overlaid
+//! Greek curves) stays a deliberate [`Empty(Unsupported)`](EmptyReason::Unsupported):
+//! #47 cycles **one** Greek curve at a time (`g`/`G`), so the overlay shape is not
+//! needed and is never fabricated.
 //!
 //! [ADR-0001]: https://github.com/joaquinbejar/ChainView/blob/main/docs/adr/0001-ratatui-crossterm.md
 //! [`Chart`]: ratatui::widgets::Chart
 
 use optionstratlib::prelude::{Decimal, ToPrimitive};
-use optionstratlib::visualization::{GraphData, Series2D};
+use optionstratlib::visualization::{GraphData, Series2D, Surface3D};
 
 use crate::ui::theme::sanitize;
+
+/// The maximum number of volatility rows / strike columns a surface grid retains
+/// off the draw path. A single-expiry surface is `strikes × vol-samples`, both
+/// small (the vol vector is deliberately tiny), so this cap is a defensive ceiling
+/// on a pathological chain, keeping the grid bounded regardless of strike count.
+const MAX_SURFACE_CELLS: usize = 4096;
 
 // ===========================================================================
 // The projected dataset shape a ratatui chart consumes.
@@ -274,6 +283,97 @@ impl ProjectedSeries {
     }
 }
 
+/// A `GraphData::GraphSurface` projected into a character-grid heat map — the
+/// v0.5 (#47) single-expiry Greek/Price-over-(strike, volatility) surface.
+///
+/// The upstream [`Surface3D`] is a scattered `(strike, vol, z)` point set on a
+/// strike × vol grid, where **`z` is a Greek or a Price — never IV**
+/// (`BasicSurfaces` rejects the volatility axis; the only true IV artifact is the
+/// 2D smile). This projection bins those points into a dense row-major intensity
+/// grid the surface screen paints as a glyph ramp: the top row is the **highest**
+/// volatility and the left column the **lowest** strike, so the layout matches a
+/// chart's `y`-up / `x`-right convention. Each cell is the `z` value normalized to
+/// `[0, 1]` across the surface's `z` range, so the screen maps it to a
+/// `NO_COLOR`-safe glyph (light → dense) whose intensity survives a monochrome
+/// terminal. Every contributing point passed the same finite gate the `Series` path
+/// uses, so no `NaN`/`Inf` coordinate or `z` reaches the grid.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProjectedSurface {
+    /// Row-major normalized-`z` grid: `rows[r][c]` is the `z` intensity in
+    /// `[0, 1]` for vol-row `r` (row `0` = the **highest** vol) and strike-column
+    /// `c` (ascending strike), or `None` when that `(strike, vol)` cell produced no
+    /// finite `z` (a gap the screen paints blank, never a fabricated `0`).
+    rows: Vec<Vec<Option<f64>>>,
+    /// The strike (`x`) axis range.
+    x: AxisBounds,
+    /// The volatility (`y`) axis range (a fraction; the screen formats it as a
+    /// percent at the edge).
+    y: AxisBounds,
+    /// The `z` (Greek / Price) value range — the legend scale for the glyph ramp.
+    z: AxisBounds,
+    /// Precomputed strike-axis endpoint labels.
+    x_labels: Vec<String>,
+    /// Precomputed vol-axis endpoint labels (raw fractions; the screen renders the
+    /// percent form).
+    y_labels: Vec<String>,
+    /// Precomputed `z`-axis endpoint labels (the Greek/Price legend).
+    z_labels: Vec<String>,
+    /// The surface name (sanitized for the render edge).
+    name: String,
+}
+
+impl ProjectedSurface {
+    /// The row-major normalized-`z` grid (`[0, 1]` per cell, `None` for a gap) —
+    /// row `0` is the highest vol, column `0` the lowest strike. A borrow, so the
+    /// screen allocates nothing at draw time.
+    #[must_use]
+    pub fn rows(&self) -> &[Vec<Option<f64>>] {
+        &self.rows
+    }
+
+    /// The strike-axis bounds `[min, max]`.
+    #[must_use]
+    pub fn x_bounds(&self) -> [f64; 2] {
+        self.x.to_array()
+    }
+
+    /// The volatility-axis bounds `[min, max]` (a fraction).
+    #[must_use]
+    pub fn y_bounds(&self) -> [f64; 2] {
+        self.y.to_array()
+    }
+
+    /// The `z` (Greek / Price) value bounds `[min, max]` — the glyph-ramp legend.
+    #[must_use]
+    pub fn z_bounds(&self) -> [f64; 2] {
+        self.z.to_array()
+    }
+
+    /// The precomputed `[min, mid, max]` strike-axis labels.
+    #[must_use]
+    pub fn x_labels(&self) -> &[String] {
+        &self.x_labels
+    }
+
+    /// The precomputed `[min, mid, max]` vol-axis labels (raw fractions).
+    #[must_use]
+    pub fn y_labels(&self) -> &[String] {
+        &self.y_labels
+    }
+
+    /// The precomputed `[min, mid, max]` `z`-axis (Greek/Price) labels.
+    #[must_use]
+    pub fn z_labels(&self) -> &[String] {
+        &self.z_labels
+    }
+
+    /// The surface name (sanitized).
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
 /// Why a `GraphData` produced no renderable series — the reason attached to
 /// [`GraphProjection::Empty`], so a screen can pick the right empty-state message
 /// and a diagnostic can distinguish the causes.
@@ -288,9 +388,11 @@ pub enum EmptyReason {
     /// non-finite after the `finite_xy` guard — nothing trustworthy to plot. The
     /// screen renders its error/empty state rather than an invented series.
     Degenerate,
-    /// A `GraphData` variant this adapter does not project yet (`MultiSeries` /
-    /// `GraphSurface`) — the v0.5 (#47) overlaid-Greek-curve and single-expiry
-    /// vol-surface extension point.
+    /// A `GraphData` variant this adapter does not project (`MultiSeries` — the
+    /// overlaid-Greek-curve overlay). #47 renders one Greek curve at a time
+    /// (`g`/`G` cycles the axis) so the overlaid `MultiSeries` shape is not needed;
+    /// it stays a deliberate `Unsupported` rather than a fabricated overlay. The
+    /// single-expiry `GraphSurface` **is** projected now (to [`ProjectedSurface`]).
     Unsupported,
 }
 
@@ -302,9 +404,11 @@ pub enum EmptyReason {
 /// §4, §6), not an exceptional failure.
 #[derive(Debug, Clone, PartialEq)]
 pub enum GraphProjection {
-    /// A renderable single series.
+    /// A renderable single series (payoff / smile / one Greek curve).
     Ready(ProjectedSeries),
-    /// No renderable series — render the screen's empty/error state.
+    /// A renderable single-expiry surface heat map (the #47 Greek/Price surface).
+    ReadySurface(ProjectedSurface),
+    /// No renderable geometry — render the screen's empty/error state.
     Empty(EmptyReason),
 }
 
@@ -315,7 +419,17 @@ impl GraphProjection {
     pub fn ready(&self) -> Option<&ProjectedSeries> {
         match self {
             Self::Ready(series) => Some(series),
-            Self::Empty(_) => None,
+            Self::ReadySurface(_) | Self::Empty(_) => None,
+        }
+    }
+
+    /// The [`ProjectedSurface`] when [`ReadySurface`](Self::ReadySurface), else
+    /// `None` — the surface-screen accessor (#47).
+    #[must_use]
+    pub fn ready_surface(&self) -> Option<&ProjectedSurface> {
+        match self {
+            Self::ReadySurface(surface) => Some(surface),
+            Self::Ready(_) | Self::Empty(_) => None,
         }
     }
 
@@ -324,7 +438,7 @@ impl GraphProjection {
     pub fn empty_reason(&self) -> Option<EmptyReason> {
         match self {
             Self::Empty(reason) => Some(*reason),
-            Self::Ready(_) => None,
+            Self::Ready(_) | Self::ReadySurface(_) => None,
         }
     }
 }
@@ -344,20 +458,19 @@ impl GraphProjection {
 /// not inside `terminal.draw` (`docs/02-tui-architecture.md` §7).
 ///
 /// The match is wildcard-free over all `GraphData` variants, so an upstream variant
-/// addition forces this function to be revisited by the compiler; `MultiSeries` and
-/// `GraphSurface` are the v0.5 (#47) extension point.
+/// addition forces this function to be revisited by the compiler. `Series` and
+/// `GraphSurface` project to real geometry (#27/#47); `MultiSeries` stays the
+/// deliberate `Empty(Unsupported)` (#47 cycles one curve at a time, no overlay).
 #[must_use]
 pub fn project(graph: &GraphData) -> GraphProjection {
     match graph {
         GraphData::Series(series) => project_series(series),
-        // v0.5 (#47) extension point: overlaid Greek curves (`MultiSeries`) and the
-        // single-expiry vol surface (`GraphSurface`). Deferred deliberately — a
-        // first-class `Empty(Unsupported)`, never a panic or a fabricated series.
-        // #47 replaces these arms with real projections; the `Series` path above is
-        // untouched by that work.
-        GraphData::MultiSeries(_) | GraphData::GraphSurface(_) => {
-            GraphProjection::Empty(EmptyReason::Unsupported)
-        }
+        // The #47 single-expiry Greek/Price surface — a real heat-map projection.
+        // The `Series` path above is untouched by this arm.
+        GraphData::GraphSurface(surface) => project_surface(surface),
+        // Overlaid Greek curves: not built (#47 cycles one curve at a time via
+        // `g`/`G`), so a deliberate `Empty(Unsupported)`, never a fabricated overlay.
+        GraphData::MultiSeries(_) => GraphProjection::Empty(EmptyReason::Unsupported),
     }
 }
 
@@ -405,6 +518,101 @@ fn project_series(series: &Series2D) -> GraphProjection {
         y_labels,
         name: sanitize(&series.name),
     })
+}
+
+/// Project a [`Surface3D`] (the #47 single-expiry Greek/Price-over-(strike, vol)
+/// surface) into the character-grid [`ProjectedSurface`].
+///
+/// **Pure and fallible**, exactly like [`project_series`]: mismatched `x`/`y`/`z`
+/// lengths are [`Degenerate`](EmptyReason::Degenerate), an empty surface is
+/// [`NoData`](EmptyReason::NoData), and a surface whose every point is non-finite
+/// (or that collapses to no axis) is [`Degenerate`](EmptyReason::Degenerate) — never
+/// a panic and never a fabricated cell. The `z` values are normalized to `[0, 1]`
+/// across the surface `z` range for the screen's glyph ramp.
+#[must_use]
+fn project_surface(surface: &Surface3D) -> GraphProjection {
+    if surface.x.len() != surface.y.len() || surface.x.len() != surface.z.len() {
+        return GraphProjection::Empty(EmptyReason::Degenerate);
+    }
+    if surface.x.is_empty() {
+        return GraphProjection::Empty(EmptyReason::NoData);
+    }
+    // Keep only fully-finite triples (the belt-and-suspenders finite gate: every
+    // coordinate is a `Decimal` and finite by construction, but a Decimal outside
+    // the `f64` range maps to `NaN` and is dropped here rather than painted).
+    let mut points: Vec<(f64, f64, f64)> = Vec::with_capacity(surface.x.len());
+    for ((x, y), z) in surface.x.iter().zip(&surface.y).zip(&surface.z) {
+        let (xf, yf, zf) = (coord(x), coord(y), coord(z));
+        if xf.is_finite() && yf.is_finite() && zf.is_finite() {
+            points.push((xf, yf, zf));
+        }
+    }
+    if points.is_empty() {
+        return GraphProjection::Empty(EmptyReason::Degenerate);
+    }
+    // The distinct strike (x) and volatility (y) coordinates — the grid axes.
+    let strikes = distinct_sorted(points.iter().map(|p| p.0));
+    let vols = distinct_sorted(points.iter().map(|p| p.1));
+    // A checked cell-count guard (no banned `saturating_*`): an overflow — or a grid
+    // above the ceiling — degrades to the empty state rather than allocating unbounded.
+    let too_large = strikes
+        .len()
+        .checked_mul(vols.len())
+        .is_none_or(|cells| cells > MAX_SURFACE_CELLS);
+    if strikes.is_empty() || vols.is_empty() || too_large {
+        return GraphProjection::Empty(EmptyReason::Degenerate);
+    }
+    let (Some(x), Some(y), Some(z)) = (
+        AxisBounds::from_values(strikes.iter().copied()),
+        AxisBounds::from_values(vols.iter().copied()),
+        AxisBounds::from_values(points.iter().map(|p| p.2)),
+    ) else {
+        return GraphProjection::Empty(EmptyReason::Degenerate);
+    };
+    // Rows top-to-bottom = highest vol first (the chart `y`-up convention).
+    let vols_desc: Vec<f64> = vols.iter().rev().copied().collect();
+    let span = z.max - z.min;
+    let mut rows: Vec<Vec<Option<f64>>> = vec![vec![None; strikes.len()]; vols_desc.len()];
+    for (px, py, pz) in &points {
+        let col = strikes.iter().position(|s| s == px);
+        let row = vols_desc.iter().position(|v| v == py);
+        if let (Some(col), Some(row)) = (col, row)
+            && let Some(cell) = rows.get_mut(row).and_then(|r| r.get_mut(col))
+        {
+            // Normalize `z` into the glyph-ramp band; a flat surface reads mid.
+            let norm = if span > 0.0 {
+                ((pz - z.min) / span).clamp(0.0, 1.0)
+            } else {
+                0.5
+            };
+            *cell = Some(norm);
+        }
+    }
+    let x_labels = x.endpoint_labels();
+    let y_labels = y.endpoint_labels();
+    let z_labels = z.endpoint_labels();
+    GraphProjection::ReadySurface(ProjectedSurface {
+        rows,
+        x,
+        y,
+        z,
+        x_labels,
+        y_labels,
+        z_labels,
+        name: sanitize(&surface.name),
+    })
+}
+
+/// The distinct, ascending finite values of an iterator — the grid axis coordinates.
+/// Uses [`f64::total_cmp`] (a total order over the finite inputs, so no `NaN`
+/// handling) and exact dedup: the surface's repeated strike / vol coordinates come
+/// from the same `Decimal` set, so equal values collapse exactly.
+#[must_use]
+fn distinct_sorted(values: impl Iterator<Item = f64>) -> Vec<f64> {
+    let mut out: Vec<f64> = values.collect();
+    out.sort_by(f64::total_cmp);
+    out.dedup();
+    out
 }
 
 /// Convert a `Decimal` coordinate to plot `f64`. A value that cannot be represented
@@ -605,12 +813,13 @@ mod tests {
         );
     }
 
-    // --- The Curve/Surface (v0.5 #47) extension point, deferred honestly -----
+    // --- MultiSeries stays Unsupported; GraphSurface now projects (#47) -------
 
     #[test]
     fn test_project_multiseries_variant_yields_empty_unsupported() {
-        // MultiSeries (overlaid Greek curves) is the #47 extension point: deferred to
-        // a deliberate Empty(Unsupported), not a fabricated series.
+        // MultiSeries (overlaid Greek curves) is NOT built — #47 cycles one Greek
+        // curve at a time (g/G), so the overlay shape stays a deliberate
+        // Empty(Unsupported), never a fabricated overlay.
         let graph = GraphData::MultiSeries(vec![series("a", &[dec(1, 0)], &[dec(2, 0)])]);
         assert_eq!(
             project(&graph).empty_reason(),
@@ -619,17 +828,66 @@ mod tests {
     }
 
     #[test]
-    fn test_project_graphsurface_variant_yields_empty_unsupported() {
-        // GraphSurface (single-expiry vol surface) is the #47 extension point.
+    fn test_project_graphsurface_builds_a_normalized_grid() {
+        // A 2 strike × 2 vol GraphSurface projects to a 2×2 normalized-z heat map:
+        // z ∈ {1, 2, 3, 4} → normalized {0, 1/3, 2/3, 1}. Row 0 is the HIGHEST vol
+        // (chart y-up), column 0 the lowest strike.
+        // Points (strike, vol, z): (10,0.2,1) (20,0.2,2) (10,0.4,3) (20,0.4,4).
         let graph = GraphData::GraphSurface(Surface3D {
-            x: vec![dec(1, 0)],
-            y: vec![dec(2, 0)],
-            z: vec![dec(3, 0)],
-            name: "surface".to_owned(),
+            x: vec![dec(10, 0), dec(20, 0), dec(10, 0), dec(20, 0)],
+            y: vec![dec(2, 1), dec(2, 1), dec(4, 1), dec(4, 1)],
+            z: vec![dec(1, 0), dec(2, 0), dec(3, 0), dec(4, 0)],
+            name: "delta".to_owned(),
+        });
+        let projection = project(&graph);
+        let surface = match projection.ready_surface() {
+            Some(s) => s,
+            None => panic!("expected a ReadySurface, got {projection:?}"),
+        };
+        assert_eq!(surface.rows().len(), 2, "two vol rows");
+        // Row 0 = highest vol (0.4): z = {3, 4} → normalized {2/3, 1}.
+        let top = surface.rows().first().cloned().unwrap_or_default();
+        assert_close(
+            top.first().copied().flatten().unwrap_or_default(),
+            2.0 / 3.0,
+        );
+        assert_close(top.get(1).copied().flatten().unwrap_or_default(), 1.0);
+        // Row 1 = lowest vol (0.2): z = {1, 2} → normalized {0, 1/3}.
+        let bottom = surface.rows().get(1).cloned().unwrap_or_default();
+        assert_close(bottom.first().copied().flatten().unwrap_or_default(), 0.0);
+        assert_close(
+            bottom.get(1).copied().flatten().unwrap_or_default(),
+            1.0 / 3.0,
+        );
+        assert_close(surface.x_bounds()[0], 10.0);
+        assert_close(surface.x_bounds()[1], 20.0);
+        assert_close(surface.z_bounds()[0], 1.0);
+        assert_close(surface.z_bounds()[1], 4.0);
+        assert_eq!(surface.name(), "delta");
+    }
+
+    #[test]
+    fn test_project_empty_graphsurface_yields_empty_no_data() {
+        let graph = GraphData::GraphSurface(Surface3D::default());
+        assert_eq!(
+            project(&graph).empty_reason(),
+            Some(EmptyReason::NoData),
+            "an empty surface projects Empty(NoData)",
+        );
+    }
+
+    #[test]
+    fn test_project_mismatched_graphsurface_yields_empty_degenerate() {
+        // Mismatched x/y/z lengths are malformed geometry, never a truncated grid.
+        let graph = GraphData::GraphSurface(Surface3D {
+            x: vec![dec(1, 0), dec(2, 0)],
+            y: vec![dec(1, 0)],
+            z: vec![dec(1, 0)],
+            name: "bad".to_owned(),
         });
         assert_eq!(
             project(&graph).empty_reason(),
-            Some(EmptyReason::Unsupported),
+            Some(EmptyReason::Degenerate),
         );
     }
 
@@ -944,6 +1202,40 @@ mod tests {
                 }
                 prop_assert!(s.x_bounds()[0] <= s.x_bounds()[1], "x min <= max");
                 prop_assert!(s.y_bounds()[0] <= s.y_bounds()[1], "y min <= max");
+            }
+        }
+
+        /// Projecting an ARBITRARY `Surface3D` (arbitrary decimals, possibly
+        /// mismatched lengths) never panics, and a ReadySurface is well-formed: a
+        /// rectangular grid, every cell in `[0, 1]` (or a gap), and `min <= max` on
+        /// all three axes.
+        #[test]
+        fn test_project_arbitrary_surface_never_panics_and_is_well_formed(
+            xs in proptest::collection::vec((0i32..8, 0u32..3), 0..24),
+            ys in proptest::collection::vec((0i32..4, 0u32..2), 0..24),
+            zs in proptest::collection::vec((any::<i32>(), 0u32..3), 0..24),
+        ) {
+            let to_decimals = |raw: &[(i32, u32)]| -> Vec<Decimal> {
+                raw.iter().map(|(m, s)| Decimal::new(i64::from(*m), *s)).collect()
+            };
+            let graph = GraphData::GraphSurface(Surface3D {
+                x: to_decimals(&xs),
+                y: to_decimals(&ys),
+                z: to_decimals(&zs),
+                name: "prop".to_owned(),
+            });
+            let projection = project(&graph);
+            if let GraphProjection::ReadySurface(s) = &projection {
+                let cols = s.rows().first().map_or(0, Vec::len);
+                for row in s.rows() {
+                    prop_assert_eq!(row.len(), cols, "the grid is rectangular");
+                    for v in row.iter().flatten() {
+                        prop_assert!((0.0..=1.0).contains(v), "z normalized into [0,1]");
+                    }
+                }
+                prop_assert!(s.x_bounds()[0] <= s.x_bounds()[1], "x min <= max");
+                prop_assert!(s.y_bounds()[0] <= s.y_bounds()[1], "y min <= max");
+                prop_assert!(s.z_bounds()[0] <= s.z_bounds()[1], "z min <= max");
             }
         }
     }

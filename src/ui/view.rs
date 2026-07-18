@@ -32,6 +32,8 @@ use optionstratlib::visualization::{GraphData, Series2D};
 pub struct ViewState {
     /// The payoff screen's projection cache (#27).
     payoff: PayoffView,
+    /// The vol smile / Greek-curve / surface projection cache (#47).
+    surface: SurfaceViewCache,
     /// The replay equity-curve projection cache (#35).
     replay: ReplayView,
 }
@@ -43,13 +45,14 @@ impl Default for ViewState {
 }
 
 impl ViewState {
-    /// A fresh view cache: the payoff and replay-equity projections seeded from an
-    /// empty series, so the first frame renders the deliberate empty state ("add a
-    /// leg" / "no equity rows") rather than a blank.
+    /// A fresh view cache: the payoff, surface, and replay-equity projections seeded
+    /// from an empty series, so the first frame renders the deliberate empty state
+    /// ("add a leg" / "insufficient IV" / "no equity rows") rather than a blank.
     #[must_use]
     pub fn new() -> Self {
         Self {
             payoff: PayoffView::new(),
+            surface: SurfaceViewCache::new(),
             replay: ReplayView::new(),
         }
     }
@@ -66,9 +69,16 @@ impl ViewState {
     /// resets the cache to the empty projection, so a fresh bundle always re-projects.
     pub fn sync(&mut self, app: &App) {
         match &app.mode {
-            Mode::Live(live) => self.payoff.sync(live.payoff_builder.graph_revision(), || {
-                live.payoff_builder.active_graph_data().clone()
-            }),
+            Mode::Live(live) => {
+                self.payoff.sync(live.payoff_builder.graph_revision(), || {
+                    live.payoff_builder.active_graph_data().clone()
+                });
+                // The Surface screen's active geometry (smile / curve / surface) —
+                // re-project only when the panel's graph revision moved (#47).
+                self.surface.sync(live.surface.graph_revision(), || {
+                    live.surface.active_graph_data().clone()
+                });
+            }
             Mode::Replay(replay) => match replay.loaded() {
                 Some(loaded) => self
                     .replay
@@ -85,6 +95,15 @@ impl ViewState {
     #[must_use]
     pub fn payoff(&self) -> &GraphProjection {
         self.payoff.cache.projection()
+    }
+
+    /// The cached surface [`GraphProjection`] — the only geometry the surface
+    /// screen's `draw` reads (a borrow), so the paint builds no `GraphData` (#47). It
+    /// is a `Ready` series (smile / curve), a `ReadySurface` (the surface heat map),
+    /// or an `Empty` (the "insufficient IV" state).
+    #[must_use]
+    pub fn surface(&self) -> &GraphProjection {
+        self.surface.cache.projection()
     }
 
     /// The cached replay equity [`GraphProjection`] — the only geometry the replay
@@ -120,6 +139,40 @@ impl PayoffView {
     /// Re-project the payoff series when `revision` differs from the last projected
     /// one, pulling the fresh `GraphData` from `source` (a closure so the clone
     /// happens only on a change). Off the draw path.
+    fn sync(&mut self, revision: u64, source: impl FnOnce() -> GraphData) {
+        if self.projected_for != Some(revision) {
+            self.cache.update(source());
+            self.projected_for = Some(revision);
+        }
+    }
+}
+
+/// The Surface screen's projection cache (#47): the [`GraphCache`] plus the
+/// [`graph_revision`](crate::app::SurfacePanel::graph_revision) it was last projected
+/// for, so a re-project fires only when the active smile / curve / surface geometry
+/// actually changed (a market move, an axis cycle, or a view toggle).
+#[derive(Debug, Clone)]
+struct SurfaceViewCache {
+    /// The projected surface geometry (the #23 cache, projected off the draw path).
+    cache: GraphCache,
+    /// The panel graph revision the cache was projected for, or `None` before the
+    /// first sync.
+    projected_for: Option<u64>,
+}
+
+impl SurfaceViewCache {
+    /// A surface view seeded with an empty series → `Empty(NoData)` → the
+    /// "insufficient IV" empty state on the first frame.
+    fn new() -> Self {
+        Self {
+            cache: GraphCache::new(GraphData::Series(Series2D::default())),
+            projected_for: None,
+        }
+    }
+
+    /// Re-project the active surface geometry when `revision` differs from the last
+    /// projected one, pulling the fresh `GraphData` from `source` (a closure so the
+    /// clone happens only on a change). Off the draw path.
     fn sync(&mut self, revision: u64, source: impl FnOnce() -> GraphData) {
         if self.projected_for != Some(revision) {
             self.cache.update(source());

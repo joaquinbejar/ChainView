@@ -14,6 +14,43 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- **The vol surface and smile screen** (issue #47; `docs/05-views-and-ux.md` §4,
+  opens v0.5). The Live `Surface` screen renders three `optionstratlib`-sourced
+  views, all built and cached in the application layer and projected **off** the
+  draw path — `draw` builds no `GraphData` and prices nothing.
+  - **The app-side builds** (`src/app/surface_build.rs`, new). The **vol smile**
+    (`VolatilitySmile::smile()` — infallible, IV vs strike), a **Greek / IV / Price
+    curve** (`BasicCurves::curve`, the `g`/`G` axis vs strike), and the
+    **single-expiry surface** (`BasicSurfaces::surface`, the axis Greek/Price over
+    strike × volatility — the `z` is honestly labeled a Greek/Price, never an "IV
+    surface"). Reliable per-strike IV is overlaid from the #24 Greeks sidecar before
+    `smile()` so a zero-IV strike never craters the wings, and a strike with no
+    reliable IV is dropped (the #25 plausibility gate). Every Greek/Price build
+    re-stamps the cloned chain to `ExpirationDate::Days(dte)` — a deterministic day
+    count from the stored `last_full_poll`, never `Utc::now()` — resolving the #24
+    clock trap so a curve/surface is a pure function of `(chain, sidecar, as_of)`
+    (a determinism test asserts it).
+  - **The `GraphSurface` projection arm** (`src/ui/graph.rs`). `Surface3D` projects
+    to a new `ProjectedSurface` — a row-major normalized-`z` grid the screen paints
+    as a `NO_COLOR`-safe glyph ramp (light → dense) — with strike / vol / `z` axis
+    bounds and precomputed labels. The `Series` path is byte-untouched (its tests
+    still hold); `MultiSeries` stays a deliberate `Empty(Unsupported)` (the screen
+    cycles one Greek curve at a time, so no overlay shape is needed).
+  - **The screen** (`src/ui/surface.rs`) with its states first (loading spinner,
+    provider error, the deliberate "insufficient IV" empty state, and a
+    distinguishable "degenerate geometry" state when a hard curve/surface build
+    `Err` cannot price), then the smile / curve / surface views. `g`/`G` cycle the
+    Greek/IV/Price axis, `x` cycles the view `smile → curve → surface`; both keys are
+    un-deferred in the one keybinding map and appear in the help overlay — the `g`/`G`
+    entry reads "Cycle axis (curve/surf)" (IV and price are not Greeks, and the axis
+    applies to the curve/surface views). In the **smile** view the pending axis renders
+    as a dim `axis: <axis> (curve/surface)` hint in the title, so `g`/`G` visibly moves
+    the title without implying the smile depends on the axis. The smile / IV-curve
+    `y`-axis is formatted as a percent at the render edge (IV is a fraction upstream);
+    the surface honestly reports that the IV axis has no surface projection, and in the
+    refused-axis state the title annotates `IV (n/a)` rather than reading as an IV
+    surface. The heat-map ramp is all ink (starts at `·`), reserving a blank space
+    strictly for a data gap, and its header marks the vol direction (top = high vol).
 - **The v0.4 provider fixtures, the overlay pair, and the capability-matrix
   reconcile** (issue #46; `docs/TESTING.md` §5, `docs/03-data-providers.md` §8,
   `docs/specs/providers.md`). The v0.4 acceptance gate — fixture normalization

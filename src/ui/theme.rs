@@ -1049,8 +1049,8 @@ mod tests {
         let text = rendered_frame(&app, 80, 24);
         assert!(text.contains("Move strike"), "a Chain key is visible");
         assert!(
-            text.contains("Cycle Greek axis"),
-            "a Surface key is visible"
+            text.contains("Cycle axis"),
+            "a Surface key is visible (SF-04: relabeled from \"Greek axis\")",
         );
         assert!(
             text.contains("Commit strategy"),

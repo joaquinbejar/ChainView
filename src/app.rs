@@ -46,7 +46,7 @@ use chrono::{DateTime, Utc};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use optionstratlib::chains::chain::OptionChain;
 use optionstratlib::model::Position;
-use optionstratlib::prelude::{Decimal, Positive};
+use optionstratlib::prelude::{BasicAxisTypes, Decimal, Positive};
 use optionstratlib::visualization::GraphData;
 use optionstratlib::{ExpirationDate, OptionStyle};
 use tokio::sync::mpsc;
@@ -69,6 +69,7 @@ mod registry;
 mod replay_load;
 mod replay_view;
 mod supervisor;
+mod surface_build;
 
 use replay_view::EquityGeometry;
 
@@ -756,6 +757,9 @@ pub struct LiveState {
     pub selection: Selection,
     /// The multi-leg payoff-builder state (v0.2, `docs/05-views-and-ux.md` §3).
     pub payoff_builder: PayoffBuilder,
+    /// The vol smile / Greek-curve / single-expiry-surface panel state and its
+    /// cached geometry (v0.5, #47, `docs/05-views-and-ux.md` §4).
+    pub surface: SurfacePanel,
     /// The screen's load lifecycle (loading / ready / error).
     pub load: ScreenLoad,
     /// The cached ATM strike-row index (ascending strike order) — the chain
@@ -787,6 +791,7 @@ impl LiveState {
         // Seed the cached ATM index off-draw from the initial chain, so the first
         // frame reads it without rescanning the ladder.
         let atm_index = atm_index_of(store.chain());
+        let surface = SurfacePanel::new(&store);
         Self {
             source,
             overlay: None,
@@ -794,6 +799,7 @@ impl LiveState {
             store,
             selection: Selection::default(),
             payoff_builder: PayoffBuilder::new(),
+            surface,
             load: ScreenLoad::Loading,
             atm_index,
         }
@@ -885,8 +891,22 @@ impl LiveState {
         // `CustomStrategy` (#27, off the draw path).
         if changed {
             self.refresh_committed_tplus0();
+            // Rebuild the active Surface geometry (the smile / curve / surface the
+            // screen shows) from the just-updated snapshot, off the draw path. It
+            // bumps the panel's graph revision only when the geometry actually moved,
+            // so the view cache re-projects only on a real change (#47).
+            self.refresh_surface();
         }
         changed
+    }
+
+    /// Rebuild the Surface panel's active geometry against the current store snapshot
+    /// (the smile / Greek curve / surface for the active view + axis) — off the draw
+    /// path, on a data-changing market fold. Disjoint field borrows (`store` read,
+    /// `surface` mutated) so no clone and no I/O.
+    fn refresh_surface(&mut self) {
+        let LiveState { store, surface, .. } = self;
+        surface.refresh(store);
     }
 
     /// Re-price the committed strategy's t+0 curve against the current store
@@ -1734,6 +1754,284 @@ impl PayoffBuilder {
     /// wrapping to `0` on the (practically unreachable) `u64` overflow.
     fn bump_graph(&mut self) {
         self.graph_revision = self.graph_revision.checked_add(1).unwrap_or(0);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SurfacePanel: the vol smile / Greek-curve / single-expiry-surface screen state.
+// ---------------------------------------------------------------------------
+
+/// Which of the three Surface-screen views is shown (#47,
+/// `docs/05-views-and-ux.md` §4), cycled by `x`.
+///
+/// The screen spec calls `x` a smile ⇄ surface **toggle**; because #47 renders
+/// **three** view families (the smile, a Greek curve, and the surface) the coherent
+/// binding is a 3-step cycle `Smile → Curve → Surface → Smile`, whose two endpoints
+/// are the smile and the surface. The #47 map's correction — that the 3D surface
+/// `z`-axis is a Greek/Price, **never** IV — means the smile and the surface cannot
+/// be two states of one axis; they are distinct views. A ChainView closed set,
+/// fieldless, so `#[repr(u8)]`; defaults to [`Smile`](SurfaceView::Smile), the IV
+/// artifact shown on the first frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum SurfaceView {
+    /// The interpolated vol smile (IV vs strike).
+    #[default]
+    Smile,
+    /// A single Greek / IV / Price curve vs strike (`g`/`G` selects the axis).
+    Curve,
+    /// The single-expiry Greek/Price surface over strike × volatility.
+    Surface,
+}
+
+impl SurfaceView {
+    /// The next view in the `Smile → Curve → Surface → Smile` cycle (`x`). Exhaustive
+    /// with no wildcard arm.
+    #[must_use]
+    fn next(self) -> Self {
+        match self {
+            Self::Smile => Self::Curve,
+            Self::Curve => Self::Surface,
+            Self::Surface => Self::Smile,
+        }
+    }
+
+    /// The short, color-independent label for the status/title.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Smile => "smile",
+            Self::Curve => "curve",
+            Self::Surface => "surface",
+        }
+    }
+}
+
+/// The Greek / IV / Price axis the Surface screen's curve and surface use (#47,
+/// `docs/05-views-and-ux.md` §4), cycled by `g` (forward) / `G` (back). Maps to
+/// `optionstratlib`'s [`BasicAxisTypes`].
+///
+/// A ChainView closed set, fieldless, so `#[repr(u8)]`; defaults to
+/// [`Delta`](SurfaceAxis::Delta), the primary Greek. `Volatility` is a valid **curve**
+/// axis (the per-leg IV curve) but not a **surface** axis — the 3D `z` is a
+/// Greek/Price, never IV (the #47 map), so the surface build refuses it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum SurfaceAxis {
+    /// Delta — the primary Greek.
+    #[default]
+    Delta,
+    /// Gamma.
+    Gamma,
+    /// Theta.
+    Theta,
+    /// Vega.
+    Vega,
+    /// Implied volatility (a valid curve axis; refused for the surface).
+    Volatility,
+    /// The option price (Black-Scholes).
+    Price,
+}
+
+impl SurfaceAxis {
+    /// The cycle order for `g`/`G` (`docs/05-views-and-ux.md` §4).
+    const ORDER: [SurfaceAxis; 6] = [
+        SurfaceAxis::Delta,
+        SurfaceAxis::Gamma,
+        SurfaceAxis::Theta,
+        SurfaceAxis::Vega,
+        SurfaceAxis::Volatility,
+        SurfaceAxis::Price,
+    ];
+
+    /// The next (`forward`) or previous axis in [`ORDER`](Self::ORDER), wrapping.
+    /// `g` advances, `G` steps back — the concrete chord chooses, as the payoff
+    /// `+`/`-` quantity chord does.
+    #[must_use]
+    fn cycled(self, forward: bool) -> Self {
+        next_in_cycle(&Self::ORDER, self, forward).unwrap_or(self)
+    }
+
+    /// The `optionstratlib` [`BasicAxisTypes`] this axis maps to. Exhaustive with no
+    /// wildcard arm.
+    #[must_use]
+    pub(crate) fn to_basic(self) -> BasicAxisTypes {
+        match self {
+            Self::Delta => BasicAxisTypes::Delta,
+            Self::Gamma => BasicAxisTypes::Gamma,
+            Self::Theta => BasicAxisTypes::Theta,
+            Self::Vega => BasicAxisTypes::Vega,
+            Self::Volatility => BasicAxisTypes::Volatility,
+            Self::Price => BasicAxisTypes::Price,
+        }
+    }
+
+    /// The short glyph/label for the screen title & axis (`Δ`/`Γ`/`Θ`/`ν`/`IV`/`price`).
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Delta => "Δ",
+            Self::Gamma => "Γ",
+            Self::Theta => "Θ",
+            Self::Vega => "ν",
+            Self::Volatility => "IV",
+            Self::Price => "price",
+        }
+    }
+
+    /// The ASCII metric name used to label the built `GraphData` (the chart legend),
+    /// so the legend reads on a plain terminal without a Greek glyph.
+    #[must_use]
+    pub(crate) fn metric_name(self) -> &'static str {
+        match self {
+            Self::Delta => "delta",
+            Self::Gamma => "gamma",
+            Self::Theta => "theta",
+            Self::Vega => "vega",
+            Self::Volatility => "IV",
+            Self::Price => "price",
+        }
+    }
+}
+
+/// The Surface screen's state and its **cached active geometry** (#47,
+/// `docs/05-views-and-ux.md` §4): which view is shown, the active Greek axis, and the
+/// one `GraphData` the screen currently renders — the smile, a Greek curve, or the
+/// surface. Owned by [`LiveState`] and driven only by the in-crate UI
+/// (`surface::handle_key`) and the market fold, never by an external lib consumer, so
+/// the mutators are `pub(crate)`.
+///
+/// It mirrors [`PayoffBuilder`]'s two-revision scheme: [`revision`](Self::revision)
+/// (bumped on any key that changes view/axis) is diffed by the render loop's view
+/// signature to schedule a redraw, and [`graph_revision`](Self::graph_revision)
+/// (bumped only when the active `GraphData` actually changes) is diffed by the ui view
+/// cache to re-project **off** the draw path. The geometry is built by the off-draw
+/// surface builder, never in `draw`.
+#[derive(Debug, Clone)]
+pub struct SurfacePanel {
+    /// Which of the three views is shown (`x` cycles).
+    view: SurfaceView,
+    /// The active Greek/IV/Price axis (`g`/`G` cycles).
+    axis: SurfaceAxis,
+    /// The cached active `GraphData` — the smile / curve / surface the screen draws.
+    /// Built off the draw path; the ui view cache projects it, `draw` never builds it.
+    active: GraphData,
+    /// The redraw revision the render loop's view signature diffs (bumped on a
+    /// view/axis key).
+    revision: u64,
+    /// The projection-cache invalidation revision the ui view cache diffs (bumped only
+    /// when [`active`](Self::active) actually changes).
+    graph_revision: u64,
+}
+
+impl SurfacePanel {
+    /// A panel seeded on the default [`SurfaceView::Smile`] / [`SurfaceAxis::Delta`],
+    /// with the smile built once from the seeded `store` (off the draw path) so the
+    /// first frame renders real geometry or the deliberate "insufficient IV" state,
+    /// never a blank.
+    #[must_use]
+    fn new(store: &ChainStore) -> Self {
+        let view = SurfaceView::default();
+        let axis = SurfaceAxis::default();
+        let active = build_active(view, axis, store);
+        Self {
+            view,
+            axis,
+            active,
+            revision: 0,
+            graph_revision: 0,
+        }
+    }
+
+    /// The active view (`x` cycles).
+    #[must_use]
+    pub fn view(&self) -> SurfaceView {
+        self.view
+    }
+
+    /// The active Greek/IV/Price axis (`g`/`G` cycles).
+    #[must_use]
+    pub fn axis(&self) -> SurfaceAxis {
+        self.axis
+    }
+
+    /// The cached active `GraphData` the ui view cache projects off the draw path;
+    /// `draw` never builds it (#47).
+    #[must_use]
+    pub fn active_graph_data(&self) -> &GraphData {
+        &self.active
+    }
+
+    /// The redraw revision the render loop's view signature diffs.
+    #[must_use]
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// The projection-cache invalidation revision the ui view cache diffs to
+    /// re-project the surface geometry off the draw path (#47).
+    #[must_use]
+    pub fn graph_revision(&self) -> u64 {
+        self.graph_revision
+    }
+
+    /// Cycle the Greek axis (`g` forward / `G` back) and rebuild the active geometry
+    /// against `store` — off the draw path. In the Smile view the axis is not shown,
+    /// but it is still advanced so switching to the curve/surface reflects it.
+    pub(crate) fn cycle_axis(&mut self, forward: bool, store: &ChainStore) {
+        self.axis = self.axis.cycled(forward);
+        self.bump();
+        self.rebuild(store);
+    }
+
+    /// Step the view `Smile → Curve → Surface → Smile` (`x`) and rebuild the active
+    /// geometry against `store` — off the draw path.
+    pub(crate) fn cycle_view(&mut self, store: &ChainStore) {
+        self.view = self.view.next();
+        self.bump();
+        self.rebuild(store);
+    }
+
+    /// Rebuild the active geometry against the current `store` snapshot on a
+    /// data-changing market fold (off the draw path). Bumps the graph revision only
+    /// when the geometry moved.
+    pub(crate) fn refresh(&mut self, store: &ChainStore) {
+        self.rebuild(store);
+    }
+
+    /// Rebuild `active` from the current `(view, axis, store)` and bump the graph
+    /// revision only when it changed, so the view cache re-projects only on a real
+    /// geometry change (the #27/#35 cache discipline).
+    fn rebuild(&mut self, store: &ChainStore) {
+        let next = build_active(self.view, self.axis, store);
+        if next != self.active {
+            self.active = next;
+            self.bump_graph();
+        }
+    }
+
+    /// Advance the redraw revision, wrapping to `0` on the (practically unreachable)
+    /// `u64` overflow.
+    fn bump(&mut self) {
+        self.revision = self.revision.checked_add(1).unwrap_or(0);
+    }
+
+    /// Advance the projection-cache invalidation revision, wrapping to `0` on the
+    /// (practically unreachable) `u64` overflow.
+    fn bump_graph(&mut self) {
+        self.graph_revision = self.graph_revision.checked_add(1).unwrap_or(0);
+    }
+}
+
+/// Build the active `GraphData` for a `(view, axis)` against `store`, dispatching to
+/// the [`surface_build`] builders — off the draw path. Exhaustive over
+/// [`SurfaceView`] with no wildcard arm.
+#[must_use]
+fn build_active(view: SurfaceView, axis: SurfaceAxis, store: &ChainStore) -> GraphData {
+    match view {
+        SurfaceView::Smile => surface_build::build_smile(store),
+        SurfaceView::Curve => surface_build::build_curve(store, axis),
+        SurfaceView::Surface => surface_build::build_surface(store, axis),
     }
 }
 
