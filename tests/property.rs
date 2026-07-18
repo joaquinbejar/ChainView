@@ -21,9 +21,13 @@
 //! directory as the first line of defence against a regression of the same
 //! shape.
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
-use chainview::config::{CliOverrides, Config, EnvSource, decode_segment, encode_segment};
+use chainview::config::{
+    CliOverrides, Config, EnvSource, Secret, decode_segment, encode_segment, provider_env_var,
+    require_credentials,
+};
 use chainview::{
     AuthKind, ChainCapability, ChainPollCapability, ConfigError, GreeksCapability,
     OptionStreamCapability, ProviderCapabilities, ProviderId,
@@ -37,6 +41,15 @@ struct EmptyEnv;
 impl EnvSource for EmptyEnv {
     fn get(&self, _key: &str) -> Option<String> {
         None
+    }
+}
+
+/// A map-backed environment for deterministic per-provider credential resolution.
+struct MapEnv(BTreeMap<String, String>);
+
+impl EnvSource for MapEnv {
+    fn get(&self, key: &str) -> Option<String> {
+        self.0.get(key).cloned()
     }
 }
 
@@ -135,6 +148,28 @@ proptest! {
                 .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
         );
         prop_assert!(matches!(segment.chars().next(), Some(c) if c.is_ascii_uppercase()));
+    }
+
+    /// An external (non-reserved) id resolves its credentials through the SAME
+    /// `CHAINVIEW_<SEG>_*` bijection a built-in uses (issue #43,
+    /// `docs/03-data-providers.md` §11.3): the loader reads exactly the variable
+    /// [`provider_env_var`] builds, for EVERY valid id, using only the public
+    /// `chainview::config` surface.
+    #[test]
+    fn prop_external_id_credentials_resolve_through_bijection(
+        id in VALID_ID,
+        token in "[A-Za-z0-9._-]{1,24}",
+    ) {
+        let provider = match ProviderId::new(&id) {
+            Ok(p) => p,
+            Err(e) => return Err(TestCaseError::fail(format!("valid id rejected: {e}"))),
+        };
+        let var = provider_env_var(&id, "token");
+        let env = MapEnv([(var, token.clone())].into_iter().collect());
+        match require_credentials(&env, &provider, &["token"]) {
+            Ok(map) => prop_assert_eq!(map.get("TOKEN").map(Secret::expose), Some(token.as_str())),
+            Err(e) => prop_assert!(false, "external id `{}` credentials failed to resolve: {}", id, e),
+        }
     }
 
     /// `serde` round-trips a valid `ProviderId` through its string form and
