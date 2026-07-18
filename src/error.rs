@@ -110,7 +110,14 @@ pub enum RegistryError {
 /// **clamped to a bounded length at construction** (so a length-unbounded junk
 /// tag cannot bloat the message), and further sanitized at the render edge before
 /// it reaches the terminal.
+///
+/// `#[non_exhaustive]`: with the bundle contract frozen at
+/// `ironcondor.bundle.v1` (issue #56, `docs/04-replay-mode.md` §2), a future
+/// reject reason (a new schema tag, a new integrity check) must be able to land
+/// as a **source-compatible addition** post-1.0. In-crate match sites still
+/// exhaustiveness-check; any downstream match must carry a wildcard arm.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum BundleError {
     /// A required Parquet table (or manifest) was absent from the bundle
     /// directory.
