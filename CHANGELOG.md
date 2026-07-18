@@ -14,6 +14,34 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- **Release packaging and the zero-config headline-acceptance procedure** (issue
+  #58; `Cargo.toml` `[package.metadata.binstall]`, `.github/workflows/release.yml`,
+  `scripts/changelog-section.sh`, `docs/RELEASE-PROCESS.md` §6/§12, `BENCH.md` §7).
+  Adds the `cargo binstall chainview` packaging config (well-formed and validated
+  against the binstall spec via `cargo metadata`; the release-artifact naming
+  `chainview-<target>.tar.gz` matches the new tag-triggered release workflow) and
+  a `Release` workflow that, at a `v*` tag cut, builds the four native target
+  binaries, smokes `--version`/`--help` and `cargo install --path .`, publishes to
+  crates.io, and attaches the prebuilt archives to the GitHub Release. No new
+  runtime dependency — the binstall block is metadata only.
+  - **The clean-machine zero-config acceptance is documented as a POST-PUBLISH
+    release-cut step** (`docs/RELEASE-PROCESS.md` §12), not a CI job against a live
+    venue: on a fresh host with no `CHAINVIEW_*` env and no config file,
+    `cargo install chainview && chainview` renders a live Deribit BTC chain
+    ([ADR-0003](docs/adr/0003-zero-config-first-run.md)). It is underwritten
+    offline by the #22 live-path integration test in CI and by the operator's
+    `#[ignore]` Deribit live smoke (`docs/TESTING.md` §8, no credentials).
+  - **The three NFR figures ship as measured facts where measurable** (`BENCH.md`
+    §7). NFR-14 (frame budget) re-confirmed on the baseline host — HP-1 p99
+    254.335 us, within the committed gate ceiling, ~1.6 % of the 16 ms budget;
+    NFR-15 (bounded memory) stands on the committed HP-3 staging probe. NFR-16
+    (startup-to-first-chain) is recorded HONESTLY as a release-cut distribution to
+    be measured on the clean machine post-publish — never fabricated, never a hard
+    live-venue CI gate.
+  - **Honesty note.** The crate on crates.io is still the `v0.0.1` name-reservation
+    placeholder, so `cargo binstall`/`cargo install` end-to-end and the live-venue
+    startup measurement are release-cut steps proven at the actual v1.0 cut, not
+    claimed as verified here. `[package].version` stays pre-1.0.
 - **The cross-screen v1.0 polish pass on states, theme, and keybindings** (issue
   #57; `src/ui/depth.rs`, `src/ui/replay.rs`, `src/ui/surface.rs`,
   `src/ui/payoff.rs`, `src/tests_integration.rs`, `src/tests_replay_integration.rs`,

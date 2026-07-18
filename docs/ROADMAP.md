@@ -354,7 +354,19 @@ release cycle without a breaking change before promotion.
       recorded, not executed). Docs + CI + scripts only.
 - [ ] #56 — Freeze bundle compatibility against the IronCondor schema (M; depends on #32, #36)
 - [ ] #57 — Run the polish pass on states, theme, and keybindings (M; depends on #18, #27, #35, #47, #48, #49)
-- [ ] #58 — Verify packaging and the zero-config headline acceptance (M; depends on #22, #52, #54)
+- [~] #58 — Verify packaging and the zero-config headline acceptance (M; depends on #22, #52, #54) —
+      `[package.metadata.binstall]` packaging config (validated well-formed via
+      `cargo metadata`, matching the release-artifact naming) + a tag-triggered
+      `.github/workflows/release.yml` (build the four native targets, smoke
+      `--version`/`--help` + `cargo install --path .`, publish, attach the
+      `cargo binstall` archives) + `scripts/changelog-section.sh` (the shared
+      release-notes extractor) landed. `docs/RELEASE-PROCESS.md` §6/§12 documents
+      the clean-machine zero-config acceptance as a POST-PUBLISH release-cut step
+      (not a live-venue CI gate); `BENCH.md` §7 ships NFR-14 (re-confirmed p99
+      254.335 us, within the gate ceiling) + NFR-15 (committed HP-3 staging probe)
+      as measured facts and records NFR-16 HONESTLY as a release-cut distribution
+      pending first publish. Packaging + docs + CI only; `[package].version` stays
+      pre-1.0 (the v1.0.0 cut is the human's release action).
 
 Full per-issue specs: `milestones/v1.0-stability/` (local).
 
