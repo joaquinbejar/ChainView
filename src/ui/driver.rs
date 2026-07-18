@@ -66,19 +66,20 @@ use std::time::Duration;
 use crossterm::event::{self, Event, KeyEvent};
 use ratatui::Terminal;
 use ratatui::backend::Backend;
+use ratatui::layout::Rect;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 
-use super::render;
+use super::{layout_root, render};
 use crate::app::{
     App, EventBridge, KeyRoute, LiveScreen, LoadedReplay, Mode, ReplayScreen, Selection,
 };
 use crate::error::ChainViewError;
 use crate::event::{AppEvent, Command};
 use crate::ui::view::ViewState;
-use crate::ui::{chain, depth, payoff, replay, surface};
+use crate::ui::{chain, depth, payoff, replay, surface, theme};
 
 /// Capacity of the bounded `AppEvent` channel the render loop parks on
 /// (`docs/02-tui-architecture.md` §5). The channel carries only the
@@ -208,20 +209,46 @@ where
 /// (`docs/02-tui-architecture.md` §7, §8).
 ///
 /// The draw closure borrows `app` and `view` **immutably**, so [`render`] stays a
-/// pure function of `&App` + `&ViewState`; [`mark_drawn`](crate::App::mark_drawn)
-/// runs after the borrow ends. The view was already synced (off the draw path) by
-/// the caller.
+/// pure function of `&App` + `&ViewState`; [`mark_drawn`](crate::App::mark_drawn) and
+/// [`stash_depth_geometry`] run after the borrow ends. The view was already synced
+/// (off the draw path) by the caller.
 fn draw_frame<B: Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
     view: &ViewState,
 ) -> Result<(), ChainViewError> {
     let view_app: &App = app;
-    terminal
+    // The `CompletedFrame` carries the drawn area; copy it out (a `Copy` `Rect`) so the
+    // terminal borrow ends before mutating `app`.
+    let area = terminal
         .draw(|frame| render(view_app, view, frame))
-        .map_err(|e| ChainViewError::Terminal(e.to_string()))?;
+        .map_err(|e| ChainViewError::Terminal(e.to_string()))?
+        .area;
     app.mark_drawn();
+    // Stash the depth viewport height off the pure draw (mirrors `mark_drawn`), so the
+    // scroll clamp couples to geometry without the draw path mutating state (#48 P2-02).
+    stash_depth_geometry(app, area);
     Ok(())
+}
+
+/// Record the depth screen's last visible ladder-row count onto [`LiveState`] after a
+/// draw — the render loop owns geometry, so it stashes what the just-drawn frame's
+/// body height affords, **off** the pure draw (`docs/02-tui-architecture.md` §8). The
+/// depth `scroll` handler reads it to clamp the offset to the viewport so an at-limit
+/// (or fits-entirely) press changes nothing and forces no redraw (#48 P2-02).
+///
+/// A no-op unless the active screen is the live [`LiveScreen::Depth`]; a frame below
+/// the minimum size ([`theme::is_too_small`]) draws the "widen the terminal" state,
+/// not a ladder, so nothing is stashed.
+fn stash_depth_geometry(app: &mut App, area: Rect) {
+    let Mode::Live(live) = &mut app.mode else {
+        return;
+    };
+    if live.screen != LiveScreen::Depth || theme::is_too_small(area) {
+        return;
+    }
+    let body = layout_root(area).body;
+    live.depth_visible_rows = depth::body_visible_rows(body);
 }
 
 // ---------------------------------------------------------------------------
@@ -277,20 +304,21 @@ fn dispatch_key(app: &mut App, key: KeyEvent) {
 
 /// A `Copy` snapshot of the active screen's local mutable state that a screen key can
 /// change without emitting an `AppEvent` (`docs/02-tui-architecture.md` §8): in live
-/// mode the chain [`Selection`], the payoff-builder edit revision, and the Surface
-/// panel's view/axis revision (#47); in replay mode the drill-down selection key
-/// (`(step, order_id, fill_seq)`, or `None`). The diff basis that turns a screen-local
-/// change into a redraw request.
+/// mode the chain [`Selection`], the payoff-builder edit revision, the Surface
+/// panel's view/axis revision (#47), and the depth-ladder scroll offset (#48); in
+/// replay mode the drill-down selection key (`(step, order_id, fill_seq)`, or
+/// `None`). The diff basis that turns a screen-local change into a redraw request.
 ///
 /// The replay scrub (`←`/`→`/`Home`/`End`) does **not** flow through this — it returns
 /// an [`AppEvent::ReplaySeek`](crate::event::AppEvent) whose fold sets `dirty`
 /// directly — so this signature catches the direct `,` / `.` selection move (replay)
-/// and the payoff / surface screen-local edits (live).
+/// and the payoff / surface / depth screen-local edits (live).
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum ViewSig {
-    /// The live chain selection, the payoff-builder edit revision, and the Surface
-    /// panel revision.
-    Live(Selection, u64, u64),
+    /// The live chain selection, the payoff-builder edit revision, the Surface panel
+    /// revision, and the depth-ladder scroll offset (`None` before the first scroll,
+    /// so a dead-end press that leaves it `None` never flips the signature, #48 P2-02).
+    Live(Selection, u64, u64, Option<usize>),
     /// The replay drill-down selection key (`None` when nothing is drilled).
     Replay(Option<(u32, u64, u32)>),
 }
@@ -302,6 +330,7 @@ fn view_sig(app: &App) -> ViewSig {
             live.selection,
             live.payoff_builder.revision(),
             live.surface.revision(),
+            live.depth_scroll,
         ),
         Mode::Replay(replay) => {
             ViewSig::Replay(replay.loaded().and_then(LoadedReplay::selection_key))
@@ -451,7 +480,7 @@ mod tests {
         to_app_event,
     };
     use crate::app::tests_support::{live_app, ready_replay_app, ready_replay_app_with_fills};
-    use crate::app::{BundleLoad, EventBridge, LiveScreen, Mode, ScreenLoad};
+    use crate::app::{App, BundleLoad, EventBridge, LiveScreen, Mode, ScreenLoad};
     use crate::event::{AppEvent, Command};
     use crate::ui::view::ViewState;
 
@@ -527,6 +556,71 @@ mod tests {
         assert!(outcome.redrawn, "a resize sets dirty, so the loop redraws");
         assert!(!app.dirty, "dirty is cleared after the draw");
         assert!(!outcome.quit);
+    }
+
+    #[test]
+    fn test_step_stashes_depth_viewport_off_the_pure_draw() {
+        // On the Depth screen a draw records the body's visible-row count onto
+        // `LiveState` AFTER `terminal.draw` returns — off the pure draw, mirroring
+        // `mark_drawn` — so the scroll clamp can couple to geometry without the paint
+        // mutating state (#48 P2-02). A resize forces the redraw.
+        let (mut app, _rx) = live_app(LiveScreen::Depth, ScreenLoad::Ready, false);
+        let depth_rows = |app: &App| match &app.mode {
+            Mode::Live(live) => live.depth_visible_rows,
+            Mode::Replay(_) => panic!("expected a live app"),
+        };
+        assert_eq!(
+            depth_rows(&app),
+            0,
+            "no viewport stashed before the first draw"
+        );
+        let (mut bridge, _senders) = EventBridge::new(64);
+        let mut view = ViewState::new();
+        let mut terminal = test_terminal(); // 80x24
+        let mut route = noop_route();
+        let outcome = match step(
+            &mut terminal,
+            &mut app,
+            &mut bridge,
+            &mut view,
+            AppEvent::Resize(80, 24),
+            &mut route,
+        ) {
+            Ok(o) => o,
+            Err(e) => panic!("step failed: {e}"),
+        };
+        assert!(outcome.redrawn, "the resize redrew the depth screen");
+        assert!(
+            depth_rows(&app) > 0,
+            "the depth draw stashed a positive viewport height off the draw: {}",
+            depth_rows(&app),
+        );
+    }
+
+    #[test]
+    fn test_step_does_not_stash_depth_viewport_off_the_depth_screen() {
+        // The stash is a no-op on a non-Depth screen — a Chain draw never touches the
+        // depth viewport (the guard reads the active screen, #48 P2-02).
+        let (mut app, _rx) = live_app(LiveScreen::Chain, ScreenLoad::Ready, false);
+        let (mut bridge, _senders) = EventBridge::new(64);
+        let mut view = ViewState::new();
+        let mut terminal = test_terminal();
+        let mut route = noop_route();
+        let _ = step(
+            &mut terminal,
+            &mut app,
+            &mut bridge,
+            &mut view,
+            AppEvent::Resize(80, 24),
+            &mut route,
+        );
+        match &app.mode {
+            Mode::Live(live) => assert_eq!(
+                live.depth_visible_rows, 0,
+                "a Chain draw leaves the depth viewport unstashed",
+            ),
+            Mode::Replay(_) => panic!("expected a live app"),
+        }
     }
 
     #[test]

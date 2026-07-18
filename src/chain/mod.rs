@@ -45,13 +45,22 @@
 //! direction ([`TickDir`]), the [`MergeOutcome`] of each fold, and the wired
 //! cross-provider overlay gate (`docs/01-domain-model.md` §5.1, §6,
 //! `docs/03-data-providers.md` §3, §4).
+//!
+//! Issue #48 landed the live order-book depth store in the [`depth`] submodule —
+//! the bounded per-instrument [`DepthStore`]/[`DepthBook`] that folds each
+//! [`DepthLadder`] into a slot keyed by [`InstrumentKey`], with the `change_id`
+//! continuity model ([`depth_continues`]) that drives the [`DepthStatus`]
+//! resync signal the depth screen renders (`docs/01-domain-model.md` §5,
+//! `docs/03-data-providers.md` §8).
 
+mod depth;
 mod events;
 mod fetch;
 mod greeks;
 mod identity;
 mod store;
 
+pub use depth::{DepthBook, DepthStatus, DepthStore, MAX_DEPTH_BOOKS, depth_continues};
 pub use events::{
     CHAIN_STALE_SLACK, ChainSnapshot, ChainSource, DIRECTION_DECAY, DepthLadder, DepthLevel,
     FEED_DELAY_WARN, GREEKS_STALE_AFTER, GreeksOrigin, GreeksRow, MarketUpdate, QUOTE_STALE_AFTER,

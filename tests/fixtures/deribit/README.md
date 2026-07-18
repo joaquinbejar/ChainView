@@ -10,9 +10,12 @@ DTO wire shape** at the pinned crate versions the adapter parses:
 
 - `deribit-http` **0.7.1** — `get_instruments` (`Vec<Instrument>`) and the ticker
   object (`TickerData`).
-- `deribit-websocket` **0.3.1** — the `ticker.{instrument}` and
-  `book.{instrument}.raw` subscription-notification `data` objects
-  (`TickerPayload` / `BookPayload`).
+- `deribit-websocket` **0.3.1** — the `ticker.{instrument}` and grouped
+  `book.{instrument}.{group}.{depth}.{interval}` subscription-notification `data`
+  objects (`TickerPayload` / `BookPayload`). The book leg the adapter subscribes is
+  the **grouped** full-snapshot channel (#48); the raw `book.{instrument}.raw` delta
+  fixtures below are retained only to prove the defensive decoder still parses that
+  legacy shape.
 
 Each field name/type mirrors those upstream structs exactly, so the fixture is a
 faithful stand-in for a captured payload. When the upstream client revises a wire
@@ -30,8 +33,9 @@ shape, refresh the affected fixture and the pin note in
 | `ticker/ticker_crossed.json` | `ticker.` `data` (degraded) | crossed quote → bid/ask dropped, prior kept |
 | `ticker/ticker_negative.json` | `ticker.` `data` (degraded) | negative bid dropped, ask kept |
 | `ticker/ticker_non_finite.json` | `ticker.` `data` (degraded) | JSON has no `NaN`/`Inf` literal — a non-numeric string field refuses the whole frame |
-| `book/book_snapshot.json` | `book.{inst}.raw` snapshot `data` → `BookPayload` | `normalize_book` ladder + `change_id` |
-| `book/book_delta.json` | `book.{inst}.raw` change `data` → `BookPayload` | delta ladder (`change`/`delete` actions), `change_id` |
+| `book/book_grouped_snapshot.json` | grouped `book.{inst}.{group}.{depth}.{interval}` snapshot `data` (`[price, amount]`) → `BookPayload` | **the subscribed shape**: `normalize_book` full ladder + `change_id` |
+| `book/book_snapshot.json` | legacy `book.{inst}.raw` snapshot `data` → `BookPayload` | defensive decode of the raw `[action, price, amount]` shape + `change_id` |
+| `book/book_delta.json` | legacy `book.{inst}.raw` change `data` → `BookPayload` | defensive decode of a raw delta (`change`/`delete` actions), `change_id` |
 
 ### The non-finite decision
 

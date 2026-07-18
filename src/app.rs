@@ -54,8 +54,8 @@ use tokio::sync::mpsc;
 use crate::app::keymap::{GlobalCommand, KeyChord, resolve_global};
 use crate::chain::quote_is_stale;
 use crate::chain::{
-    ChainFetch, ChainSnapshot, ChainStore, ExpirySource, InstrumentKey, MarketUpdate, MergeOutcome,
-    ProviderId, QuoteClocks, StreamHealth,
+    ChainFetch, ChainSnapshot, ChainStore, DepthLadder, DepthStore, ExpirySource, InstrumentKey,
+    MarketUpdate, MergeOutcome, ProviderId, QuoteClocks, StreamHealth,
 };
 use crate::config::ThemeChoice;
 use crate::event::{AppEvent, BundleLoadResult, Command, ReplayControl, SeekTo};
@@ -760,6 +760,22 @@ pub struct LiveState {
     /// The vol smile / Greek-curve / single-expiry-surface panel state and its
     /// cached geometry (v0.5, #47, `docs/05-views-and-ux.md` §4).
     pub surface: SurfacePanel,
+    /// The live order-book depth store (v0.5, #48, `docs/03-data-providers.md` §8):
+    /// a bounded per-instrument latest-ladder slot the [`LiveScreen::Depth`] screen
+    /// reads for the selected contract, folded from `MarketUpdate::Depth`.
+    pub depth_store: DepthStore,
+    /// The depth-ladder scroll offset (`↑↓ / kj` on the [`LiveScreen::Depth`] screen,
+    /// #48). `None` before the user has scrolled — the draw then centers the inside
+    /// market (#48 P3-02); `Some(start)` is the explicit first visible row. Clamped to
+    /// the viewport (`total − depth_visible_rows`) by the scroll handler and re-clamped
+    /// to the window at draw time, so a stored value never over-scrolls a shorter book.
+    pub depth_scroll: Option<usize>,
+    /// The depth body's last visible-row count, stashed by the render loop **after**
+    /// each draw (`src/ui/driver.rs`), off the pure draw — the render loop owns
+    /// geometry (#48 P2-02). The scroll handler reads it to clamp the offset to the
+    /// viewport so an at-limit (or fits-entirely) press changes nothing and forces no
+    /// redraw. `0` until the depth screen has drawn at least once.
+    pub depth_visible_rows: usize,
     /// The screen's load lifecycle (loading / ready / error).
     pub load: ScreenLoad,
     /// The cached ATM strike-row index (ascending strike order) — the chain
@@ -800,6 +816,9 @@ impl LiveState {
             selection: Selection::default(),
             payoff_builder: PayoffBuilder::new(),
             surface,
+            depth_store: DepthStore::new(),
+            depth_scroll: None,
+            depth_visible_rows: 0,
             load: ScreenLoad::Loading,
             atm_index,
         }
@@ -869,35 +888,94 @@ impl LiveState {
             .build()
     }
 
-    /// Fold one market update into the store, returning whether the fold changed
-    /// anything the screen would render (so the caller can set `dirty`).
+    /// Fold one market update into the appropriate store, returning whether the fold
+    /// changed anything the screen would render (so the caller can set `dirty`).
     ///
     /// Matched exhaustively over the [`MarketUpdate`] closed set with no wildcard
-    /// arm. `Depth` has no store path yet (the depth-ladder store lands with the
-    /// depth screen, v0.5) — folding it is a documented no-op here.
+    /// arm. A [`Depth`](MarketUpdate::Depth) fold goes into the depth-ladder store
+    /// and never touches the chain-derived surface/payoff geometry, so it is handled
+    /// apart from the chain-affecting folds (via [`fold_chain_update`]) and skips
+    /// their refresh — the busy book path stays off the surface/t+0 rebuild.
     fn apply_market(&mut self, update: MarketUpdate) -> bool {
-        let changed = match update {
-            MarketUpdate::Quote(quote) => merged(self.store.apply_quote(&quote)),
-            MarketUpdate::Greeks(greeks) => merged(self.store.apply_greeks(&greeks)),
-            MarketUpdate::Depth(_) => false,
-            MarketUpdate::Chain(snapshot) => self.apply_chain_snapshot(snapshot),
-            MarketUpdate::Health(provider, health) => self.apply_health(&provider, health),
-        };
-        // A data-changing fold may move the committed payoff's t+0 curve (its
-        // per-leg IV is re-read from the just-updated sidecar). The refresh runs
-        // **only** while the t+0 curve is the shown one — the hot quote path does
-        // nothing when the (IV-independent) expiration curve is displayed — and
-        // re-prices the committed legs directly, never reconstructing a
-        // `CustomStrategy` (#27, off the draw path).
+        match update {
+            MarketUpdate::Quote(quote) => {
+                let changed = merged(self.store.apply_quote(&quote));
+                self.fold_chain_update(changed)
+            }
+            MarketUpdate::Greeks(greeks) => {
+                let changed = merged(self.store.apply_greeks(&greeks));
+                self.fold_chain_update(changed)
+            }
+            MarketUpdate::Depth(ladder) => self.apply_depth(ladder),
+            MarketUpdate::Chain(snapshot) => {
+                let changed = self.apply_chain_snapshot(snapshot);
+                self.fold_chain_update(changed)
+            }
+            MarketUpdate::Health(provider, health) => {
+                let changed = self.apply_health(&provider, health);
+                self.fold_chain_update(changed)
+            }
+        }
+    }
+
+    /// Complete a **chain-affecting** fold: on a real change, refresh the committed
+    /// payoff's t+0 curve and the active Surface geometry **off the draw path**, then
+    /// report whether the screen should redraw.
+    ///
+    /// The t+0 refresh runs **only** while the t+0 curve is the shown one — the hot
+    /// quote path does nothing when the (IV-independent) expiration curve is
+    /// displayed — and re-prices the committed legs directly, never reconstructing a
+    /// `CustomStrategy` (#27). The Surface rebuild bumps the panel's graph revision
+    /// only when the geometry actually moved, so the view cache re-projects only on a
+    /// real change (#47). A depth fold never reaches here — it touches neither.
+    fn fold_chain_update(&mut self, changed: bool) -> bool {
         if changed {
             self.refresh_committed_tplus0();
-            // Rebuild the active Surface geometry (the smile / curve / surface the
-            // screen shows) from the just-updated snapshot, off the draw path. It
-            // bumps the panel's graph revision only when the geometry actually moved,
-            // so the view cache re-projects only on a real change (#47).
             self.refresh_surface();
         }
         changed
+    }
+
+    /// Fold an order-book [`DepthLadder`] into the per-instrument depth store
+    /// (#48, `docs/03-data-providers.md` §8), returning whether the frame should
+    /// redraw.
+    ///
+    /// The bounded store always folds the ladder (latest-value-wins, or a bounded
+    /// drop at capacity), but a redraw is requested **only** when the update is for
+    /// the currently **selected** contract *and* the [`LiveScreen::Depth`] screen is
+    /// active — a book burst for an off-screen contract, or any depth while another
+    /// screen is shown, folds silently and never wakes the render loop, keeping the
+    /// busiest provider path off the idle-redraw budget (`docs/06-performance.md`).
+    fn apply_depth(&mut self, ladder: DepthLadder) -> bool {
+        let visible = self.screen == LiveScreen::Depth
+            && self.selected_depth_key().as_ref() == Some(&ladder.instrument.key);
+        let applied = self.depth_store.apply(ladder);
+        applied && visible
+    }
+
+    /// The provider-agnostic [`InstrumentKey`] of the contract the depth screen shows
+    /// — the chain cursor's focused strike row and its focused call/put leg (#48).
+    ///
+    /// `None` when no strike row is focused yet (the depth screen renders its "select
+    /// a contract" empty state) or when a poll shrank the chain under a stale cursor
+    /// index — a `.get()`/`.nth()`-style bounded read, never an unchecked index. The
+    /// underlying and absolute-UTC expiry come from the store's canonical chain key,
+    /// so the key matches the one a [`DepthLadder`] carries.
+    #[must_use]
+    pub fn selected_depth_key(&self) -> Option<InstrumentKey> {
+        let row = self.selection.focused_row?;
+        let od = self.store.chain().options.iter().nth(row)?;
+        let (_, underlying, expiration) = self.store.chain_key();
+        let style = match self.selection.focused_leg {
+            LegFocus::Call => OptionStyle::Call,
+            LegFocus::Put => OptionStyle::Put,
+        };
+        Some(InstrumentKey {
+            underlying: underlying.clone(),
+            expiration_utc: *expiration,
+            strike: od.strike_price,
+            style,
+        })
     }
 
     /// Rebuild the Surface panel's active geometry against the current store snapshot
@@ -2982,8 +3060,9 @@ mod tests {
 
     use super::tests_support::{loaded_bundle, ready_replay_app};
     use super::{
-        App, BundleLoad, HINT_TICKS, KeyRoute, LiveScreen, LiveState, Mode, OverlayBinding,
-        Playback, ReplayScreen, ReplayState, ScreenLoad, SourceBinding, is_screen_reachable,
+        App, BundleLoad, HINT_TICKS, KeyRoute, LegFocus, LiveScreen, LiveState, Mode,
+        OverlayBinding, Playback, ReplayScreen, ReplayState, ScreenLoad, SourceBinding,
+        is_screen_reachable,
     };
     use crate::chain::{
         AliasCatalog, ChainFetch, ChainSnapshot, ChainSource, ChainStore, ExpirySource, Instrument,
@@ -3439,7 +3518,10 @@ mod tests {
     }
 
     #[test]
-    fn test_on_event_market_depth_is_noop_without_a_store_path() {
+    fn test_on_event_market_depth_folds_to_store_but_no_redraw_off_screen() {
+        // The store path exists: the ladder IS folded into the depth store. But the
+        // default screen is `Chain` (not `Depth`), so the update is not for the
+        // visible selected contract and must not force a redraw.
         let (mut app, _rx) = live_app(full_caps());
         let ladder = crate::chain::DepthLadder {
             instrument: instrument("deribit", 60_000.0, OptionStyle::Call),
@@ -3450,7 +3532,40 @@ mod tests {
             change_id: None,
         };
         app.on_event(AppEvent::Market(MarketUpdate::Depth(ladder)));
-        assert!(!app.dirty);
+        assert!(!app.dirty, "an off-screen depth fold does not redraw");
+        assert_eq!(
+            live(&app).depth_store.len(),
+            1,
+            "the ladder was still folded into the store (the store path exists)",
+        );
+    }
+
+    #[test]
+    fn test_on_event_market_depth_redraws_for_visible_selected_contract() {
+        // The positive counterpart: on the Depth screen with the 60000-strike call
+        // row focused, a depth update for that selected contract redraws.
+        let (mut app, _rx) = live_app(full_caps());
+        match &mut app.mode {
+            Mode::Live(live) => {
+                live.screen = LiveScreen::Depth;
+                live.selection.focused_row = Some(0);
+                live.selection.focused_leg = LegFocus::Call;
+            }
+            Mode::Replay(_) => panic!("expected a live app"),
+        }
+        let ladder = crate::chain::DepthLadder {
+            instrument: instrument("deribit", 60_000.0, OptionStyle::Call),
+            bids: Vec::new(),
+            asks: Vec::new(),
+            event_time: None,
+            received_time: utc(EXP + 100),
+            change_id: Some(1),
+        };
+        app.on_event(AppEvent::Market(MarketUpdate::Depth(ladder)));
+        assert!(
+            app.dirty,
+            "a depth update for the visible selected contract redraws",
+        );
     }
 
     // --- Per-side health: source and overlay degrade independently -----------

@@ -130,7 +130,10 @@ pub fn render(app: &App, view: &ViewState, frame: &mut Frame) {
             LiveScreen::Chain => {
                 chain::draw(state, frame, root.body, theme, app.tick_count, app.now)
             }
-            LiveScreen::Depth => depth::draw(state, frame, root.body),
+            // The depth ladder reads the resolved theme (so `NO_COLOR` degrades its
+            // bid/ask shading to text) and the tick counter (so its loading spinner
+            // advances) — both `Copy`, so the draw stays pure over borrowed state (#48).
+            LiveScreen::Depth => depth::draw(state, frame, root.body, theme, app.tick_count),
             // The surface line reads only the cached projection the view synced off
             // the draw path — this paint builds no `GraphData` (#47). The tick counter
             // advances its loading spinner (a `Copy` read; the draw stays pure).

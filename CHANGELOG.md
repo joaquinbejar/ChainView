@@ -14,6 +14,64 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- **The depth-ladder screen** (issue #48; `docs/05-views-and-ux.md` §2.1, §6,
+  `docs/03-data-providers.md` §8, v0.5). The Live `Depth` screen renders the
+  order-book bid/ask ladder for the **selected contract** — the chain cursor's
+  focused strike row and call/put leg — read from a new domain depth store. It is
+  **capability-gated on `depth`**, never a `ProviderId`, so it is reachable only
+  where depth is verified (Deribit option instruments today) and a depth-less venue
+  is skipped by `Tab` and flashes the number-key hint.
+  - **The domain depth store** (`src/chain/depth.rs`, new). A bounded, per-instrument
+    `DepthStore` of `DepthBook` slots keyed by `InstrumentKey`, folding each
+    `MarketUpdate::Depth(DepthLadder)` latest-value-wins and hard-capped at
+    `MAX_DEPTH_BOOKS` (a new instrument beyond the cap is dropped and counted, never
+    unbounded growth). The **`change_id` continuity model** (`depth_continues`) sets a
+    `DepthStatus`: an advancing (or repeating) sequence stays `Fresh`; a regression or
+    a lost `change_id` flips to `ResyncNeeded`, which the screen surfaces as the
+    "resyncing" state rather than trusting a discontinuous book. A forward skip is
+    continuous — correct because the Deribit adapter streams full-snapshot frames
+    (below), so a coalesced skip is never a gap. The **resync action** (re-fetching
+    the snapshot) stays the adapter's job for the Deribit book path (#51).
+  - **The Deribit depth subscription** (`src/providers/deribit.rs`). The book leg
+    subscribes the **grouped** full-snapshot channel
+    `book.{instrument}.{group}.{depth}.{interval}` (`group=none`, `depth=20`,
+    `interval=100ms`) — **not** the raw `book.{instrument}.raw` delta feed. Each
+    grouped frame is a *complete* aggregated snapshot, so the coalescing sink +
+    latest-value-wins overwrite fold to a correct book on every frame; the raw delta
+    feed would collapse through the coalescing overwrite to the last delta's one or
+    two changed levels — a torn book on every normal update, on the zero-config
+    venue. The `100ms` interval (never `raw`, which needs auth) keeps the
+    unauthenticated default working.
+  - `DepthLevel` now derives `PartialEq` (a public-surface addition on the
+    `src/chain` domain type).
+  - **The fold path** (`src/app.rs`). `LiveState` gains the `depth_store` slot and a
+    `depth_scroll` offset; `MarketUpdate::Depth` now folds into the store (apart from
+    the chain-affecting folds, so it skips the surface/t+0 rebuild) and requests a
+    redraw only when the update is for the currently selected contract while the Depth
+    screen is active — the busiest provider path stays off the idle-redraw budget.
+    `selected_depth_key` resolves the chain cursor to the instrument the ladder is
+    keyed by.
+  - **The screen** (`src/ui/depth.rs`, was a placeholder). States first — the honest
+    "depth not available on `<provider>`" body (a defensive capability check), the
+    loading spinner, the provider-error message, the "select a contract" and "no book
+    yet" empty states — then the ladder (asks worst-first down to best, then bids
+    best-first, a spread footer). The ladder **opens centered on the inside market**
+    (best bid/ask), so the tradeable levels are on-screen without scrolling; `↑↓ / kj`
+    scroll (the chain idiom) with the offset **clamped to the viewport** — an at-limit
+    or fits-entirely press changes nothing and triggers no phantom redraw. A `change_id`
+    gap **or** a non-live source health (stale / reconnecting) **dims the body** and
+    badges the title, mirroring the chain's stale idiom — never a bright, trusted-looking
+    ladder over a stale badge. Each row carries a `bid`/`ask` **text** label so the side
+    survives `NO_COLOR` (green/red only reinforce), a missing value renders `—` (never a
+    fabricated `0`), and the venue instrument name is sanitized at the render edge (inert
+    text, no cursor move or torn layout). The draw path is pure — no I/O, no `.await`; the
+    render loop stashes the depth viewport height off the pure draw so the scroll clamp
+    can couple to geometry.
+  - **Keys** (`src/app/keymap.rs`, `src/ui/theme.rs`). The depth scroll binding is
+    un-deferred (no longer `(v0.5)`), adds `k`/`j` alongside `↑`/`↓` (the chain idiom),
+    and resolves through the one keybinding map via `resolve_depth`, so dispatch and the
+    help overlay cannot drift. A new `Theme::book_side_style` gives the bid/ask sides
+    their `NO_COLOR`-safe color.
 - **The vol surface and smile screen** (issue #47; `docs/05-views-and-ux.md` §4,
   opens v0.5). The Live `Surface` screen renders three `optionstratlib`-sourced
   views, all built and cached in the application layer and projected **off** the
