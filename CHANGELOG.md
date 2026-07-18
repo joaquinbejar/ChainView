@@ -14,6 +14,71 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- **The standalone DXLink overlay adapter, behind a DISABLED-by-default feature
+  gate** (`src/providers/dxlink.rs`, `src/providers/mod.rs`, `src/app/registry.rs`,
+  issue #42; `docs/03-data-providers.md` §7.3, `docs/SECURITY.md` §2.4,
+  `CLAUDE.md`). The `Provider` for DXLink: an **overlay-only** quote/Greeks feed
+  with **no chain discovery** — `discover`/`fetch_chain` return
+  `ProviderError::Unsupported` (`chain: None`, `option_stream: SymbolOnly`), so it
+  is usable only as a symbol-level overlay onto **another** provider's chain. An
+  external chain source is therefore required to select `dxlink`; a chain-less
+  provider chosen as the live source is rejected by the capability-driven
+  composite-source guard (`ConfigError::InvalidValue`). Streaming is
+  `connect()` -> `create_feed_channel("AUTO")` -> `setup_feed(&[Quote,Greeks])` ->
+  `subscribe(...)`, drained over the adapter-owned bounded two-class
+  `MarketUpdateSink` behind a ChainView-owned reconnect/resubscribe loop (there is
+  no chain to re-fetch — the source owns the structure and its own backfill).
+  - **Shares the tastytrade dxfeed decode (the #38 second call site).** DXLink's
+    typed `MarketEvent::{Quote,Greeks}` (sizes are `f64`, and there is **no** venue
+    time field) is mapped onto the neutral `dxfeed_decode` views (`event_time:
+    None`; `received_time` stamped at the boundary) and decoded by the SAME shared
+    `decode_quote`/`decode_greeks` helpers the tastytrade adapter feeds — proving
+    the neutral node with **no** `dxlink -> tastytrade` import edge (both depend on
+    `dxfeed_decode`, neither on the other; enforced by the arch test). A
+    crossed-tick decode error is a benign per-tick drop and an unknown symbol is
+    dropped by the symbol guard — neither feeds reconnect/health.
+  - **The cross-provider overlay equivalence gate.** The adapter emits
+    `QuoteUpdate`/`GreeksRow` tagged `provider: dxlink` carrying the DXLink leg's
+    `ContractSpecFingerprint`; the store merges a leg **iff** its fingerprint
+    (multiplier, settlement, exercise, quote currency, venue product code) equals
+    the source leg's. On a match the overlay wins the quote/Greek fields; on a
+    mismatch the merge is a per-leg, non-fatal `OverlayError::SpecMismatch` — the
+    overlay is refused, the source leg kept, and the leg badged overlay-refused, so
+    two economically distinct contracts that merely share `(underlying, expiry,
+    strike, style)` are never silently merged (the `overlay_spec_gate` property).
+  - **Gated by construction, not discipline.** The whole adapter sits behind the
+    disabled `dxlink` Cargo feature and is **excluded from `with_builtins()`**;
+    it is reachable only via the explicit `with_gated_builtin`, which returns
+    `RegistryError::Gated` while the gate holds. A stock binary can never enable it
+    — a default `cargo build` does not even compile the adapter or pull the crate.
+    Provenance for the lifter is cited in-module (`dxlink/src/client.rs` /
+    `src/connection.rs`, commit `1c57a36`); the pinned `dxlink 0.2.0` already
+    **redacts** the serialized `AuthMessage` token (`redact_sensitive`) and its
+    `Debug` exposes only `has_token`, but — like the Alpaca gate — the gate stays
+    until `docs/SECURITY.md` records the captured-log proof and flips the matrix
+    cell; this issue does not lift it. It also inherits the tastytrade gate whenever
+    the DXLink token is minted there.
+  - **Auth injected programmatically, env-only.** `DXLinkClient::new(url, token)`
+    takes the URL and token as plain arguments, so `from_env` reads the
+    ChainView-namespaced `CHAINVIEW_DXLINK_TOKEN` / `CHAINVIEW_DXLINK_URL` (URL
+    defaults to the production dxfeed endpoint) and builds the client directly —
+    NO dotenv, NO foreign env namespace, NO global tracing subscriber. The token is
+    wrapped in `Secret`, exposed only at the single client hand-off, and never
+    logged or echoed in a `ProviderError` (redaction-safe by construction).
+  - **New dependency (ADR-0007 audit note):** `dxlink = "0.2"`, OPTIONAL and behind
+    the disabled `dxlink` feature (a normal build pulls nothing). It wraps the
+    DXLink WebSocket protocol (no REST); ChainView never reimplements it.
+    Supply-chain: adds `tokio-tungstenite` (native-tls) + `futures-util`, both
+    already in the tree under the gated tastytrade / deribit-websocket features.
+    Under `--all-features`, `dxlink` resolves at both 0.2.0 (this direct dep) and
+    0.1.5 (transitive via the gated tastytrade 0.3.0) — a deny.toml
+    `multiple-versions = "warn"` duplicate, never a failure. `cargo audit` + `cargo
+    deny check` remain clean with the feature on (the same three transitive-only
+    advisory ignores; no new source). The `dxfeed_decode` module-level `dead_code`
+    allow is narrowed from `not(feature = "tastytrade")` to `not(any(feature =
+    "tastytrade", feature = "dxlink"))` now that the second call site consumes the
+    shared decode entry points.
+
 - **The Alpaca adapter, behind a DISABLED-by-default feature gate**
   (`src/providers/alpaca.rs`, `src/providers/mod.rs`, `src/app/registry.rs`,
   issue #41; `docs/03-data-providers.md` §7.5, `docs/SECURITY.md` §2.4,

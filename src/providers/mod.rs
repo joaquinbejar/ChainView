@@ -71,18 +71,21 @@ pub(crate) mod deribit;
 /// provider-layer helper: no `Provider` impl, no upstream crate dependency, and
 /// it never `use`s a sibling adapter, `src/app.rs`, or `src/ui/*`.
 ///
-/// The first consumer wired in is the tastytrade adapter (#40), which decodes its
-/// bundled dxfeed `Quote`/`Greeks` events through `decode_quote` / `decode_greeks`
-/// and echoes an unknown streamer symbol through `clamp_symbol`. That adapter sits
-/// behind the DISABLED-by-default `tastytrade` feature, so the shared decode has a
-/// production caller ONLY when the feature is on. The `dead_code` allow is
-/// therefore **narrowed** (not removed) to `not(feature = "tastytrade")`: with the
-/// feature on every `pub(crate)` item here has a real caller (the #38 time-boxed
-/// blanket allow is gone); with the feature off — the default build, where the
-/// only consumer is compiled out — the helpers are exercised solely by this
-/// module's own fixture + property tests, so the allow keeps `-D warnings` clean.
-/// The standalone dxlink overlay (#42) will broaden this condition when it lands.
-#[cfg_attr(not(feature = "tastytrade"), allow(dead_code))]
+/// The consumers wired in are the tastytrade adapter (#40) and the standalone
+/// dxlink overlay (#42): both decode their dxfeed `Quote`/`Greeks` events through
+/// `decode_quote` / `decode_greeks`. Each sits behind its own DISABLED-by-default
+/// feature (`tastytrade` / `dxlink`), so the shared decode's entry points have a
+/// production caller when EITHER feature is on. The `dead_code` allow is therefore
+/// **narrowed** (not removed) to `not(any(feature = "tastytrade", feature =
+/// "dxlink"))`: with either feature on, `decode_quote` / `decode_greeks` and the
+/// neutral view fields they read have real callers (the #38 time-boxed blanket
+/// allow is gone); with both off — the default build, where every consumer is
+/// compiled out — the helpers are exercised solely by this module's own fixture +
+/// property tests, so the allow keeps `-D warnings` clean. The residual
+/// `clamp_symbol` + `symbol` echo still awaits the deferred tracing sink
+/// (governance deviation 3) in BOTH adapters, so those two carry their own
+/// narrowed per-item allow (see each site) rather than a real caller.
+#[cfg_attr(not(any(feature = "tastytrade", feature = "dxlink")), allow(dead_code))]
 pub(crate) mod dxfeed_decode;
 
 /// The tastytrade adapter — the poll->stream merge provider (issue #40,
@@ -108,6 +111,21 @@ pub(crate) mod tastytrade;
 /// the domain model inside this module.
 #[cfg(feature = "alpaca")]
 pub(crate) mod alpaca;
+
+/// The standalone DXLink adapter — the **overlay-only** quote/Greeks provider
+/// (issue #42, `docs/03-data-providers.md` §7.3). Behind the DISABLED-by-default
+/// `dxlink` Cargo feature and **excluded from `with_builtins()`**: like tastytrade
+/// and Alpaca it is reachable only through the explicit `with_gated_builtin(id)`
+/// opt-in, which fails with a typed startup error while the gate holds
+/// (`docs/SECURITY.md` §2.4). It has **no chain discovery** (`chain: None`) — its
+/// `discover`/`fetch_chain` return [`ProviderError::Unsupported`], so it is usable
+/// only as a symbol-level overlay onto **another** provider's chain. It maps the
+/// `dxlink` crate's typed `MarketEvent::{Quote,Greeks}` onto the neutral
+/// [`dxfeed_decode`] views (never an adapter-to-adapter edge — it depends on that
+/// shared module, never on the tastytrade adapter). Crate-internal: no raw `dxlink`
+/// DTO crosses the port.
+#[cfg(feature = "dxlink")]
+pub(crate) mod dxlink;
 
 /// The seam every adapter implements: one trait, one adapter per provider id
 /// (`docs/03-data-providers.md` §2).

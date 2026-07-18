@@ -547,6 +547,7 @@ dependencies = [
  "deribit-http",
  "deribit-websocket",
  "dotenvy",
+ "dxlink 0.2.0",
  "futures-util",
  "hdrhistogram",
  "humantime",
@@ -1216,6 +1217,20 @@ name = "dxlink"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1badb9f151bdbce3f4c2506bf714a8bcb15ff571cfd850ca0b4dc7df11d97133"
+dependencies = [
+ "futures-util",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite 0.28.0",
+ "tracing",
+]
+
+[[package]]
+name = "dxlink"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "37c192f3adebdec73c15034fb458acfcb79120aa557b7acfd49a887d5aa605ec"
 dependencies = [
  "futures-util",
  "serde",
@@ -3709,7 +3724,7 @@ dependencies = [
  "chrono",
  "derive_builder",
  "dotenv",
- "dxlink",
+ "dxlink 0.1.5",
  "erased-serde",
  "flume",
  "futures-util",
