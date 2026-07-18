@@ -58,9 +58,9 @@
 //! - Greeks may legitimately be negative, so there is no sign check — only the
 //!   finiteness guard.
 //!
-//! This decoder decodes the **raw** event: the tastytrade streamed-IV narrowing
-//! (§7.2, applied in #40) and the DXLink overlay equivalence gate (§7.3, applied
-//! in #42) are **adapter-level** policies layered on top, not this module's job.
+//! This decoder decodes the **raw** event and carries its IV faithfully; the
+//! DXLink overlay equivalence gate (§7.3, applied in #42) is an **adapter-level**
+//! policy layered on top, not this module's job.
 //!
 //! # Identity is the adapter's job
 //!
@@ -97,6 +97,12 @@ use crate::error::{NormalizeKind, ProviderError};
 pub(crate) struct DxQuoteEvent {
     /// The raw dxfeed event symbol, carried **opaque** — identity resolution is
     /// the adapter's job (§4). Echoed only through [`clamp_symbol`].
+    // Read only by the deferred `clamp_symbol` symbol echo (see that helper's
+    // note): the #40 adapter sets this field but drops unknown/crossed ticks
+    // silently until the tracing sink lands, so the field is written-but-unread
+    // with the `tastytrade` feature on. The allow is narrowed to it with a note
+    // (the #38 review's sanctioned alternative), removed when the echo is wired.
+    #[allow(dead_code)]
     pub(crate) symbol: String,
     /// Best bid price (`NaN` = the venue sent none).
     pub(crate) bid: f64,
@@ -139,6 +145,10 @@ pub(crate) struct DxQuoteEvent {
 #[derive(Debug, Clone)]
 pub(crate) struct DxGreeksEvent {
     /// The raw dxfeed event symbol, carried opaque (see [`DxQuoteEvent::symbol`]).
+    // Written-but-unread with the `tastytrade` feature on, exactly like
+    // [`DxQuoteEvent::symbol`] — the deferred `clamp_symbol` echo is its only
+    // reader. Allow narrowed to it with a note (removed when the echo is wired).
+    #[allow(dead_code)]
     pub(crate) symbol: String,
     /// Delta (may be negative — no sign check).
     pub(crate) delta: f64,
@@ -239,6 +249,15 @@ const MAX_SYMBOL_CHARS: usize = 48;
 /// split and the result is bounded regardless of input length. The adapters
 /// (#40/#42) call this before echoing a symbol into a tracing field (e.g. an
 /// unknown-symbol warning), mirroring the replay `clamp_echo` house rule.
+// The consumer is a bounded symbol echo into a `tracing` field, but ChainView's
+// tracing sink is deferred (governance deviation 3) and `tracing` is not yet a
+// direct dependency. The first `dxfeed_decode` consumer — the #40 tastytrade
+// adapter — therefore drops unknown/crossed ticks SILENTLY for now (the deribit
+// house pattern: "once the tracing sink lands, a WARN/TRACE goes here"), so this
+// helper still has no caller even with the `tastytrade` feature on. Per the #38
+// review, the allow is NARROWED to this single item with a note (the sanctioned
+// alternative to wiring it) and is removed the moment the symbol echo is wired.
+#[allow(dead_code)]
 pub(crate) fn clamp_symbol(symbol: &str) -> String {
     if symbol.chars().count() <= MAX_SYMBOL_CHARS {
         return symbol.to_owned();
@@ -301,8 +320,8 @@ pub(crate) fn decode_quote(
 /// §3), tagging the row [`GreeksOrigin::Provider`] — these are venue-supplied
 /// analytics. A per-field `NaN` / `Inf` (or a negative IV) is dropped to `None`;
 /// a legitimately negative Greek is preserved. The raw event's IV is preserved
-/// faithfully (no fabricated zero) — the tastytrade streamed-IV narrowing (§7.2)
-/// is an **adapter-level** policy applied in #40, not here.
+/// faithfully (no fabricated zero); the tastytrade adapter (#40) forwards it
+/// as-is, as that provider's sole venue IV source (§7.2).
 ///
 /// # Errors
 ///

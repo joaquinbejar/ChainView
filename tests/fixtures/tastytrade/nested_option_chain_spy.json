@@ -1,0 +1,37 @@
+{
+  "underlying-symbol": "SPY",
+  "root-symbol": "SPY",
+  "option-chain-type": "Standard",
+  "shares-per-contract": 100,
+  "expirations": [
+    {
+      "expiration-type": "Regular",
+      "expiration-date": "2026-03-20",
+      "days-to-expiration": 246,
+      "settlement-type": "PM",
+      "strikes": [
+        {
+          "strike-price": "500.00",
+          "call": "SPY   260320C00500000",
+          "call-streamer-symbol": ".SPY260320C500",
+          "put": "SPY   260320P00500000",
+          "put-streamer-symbol": ".SPY260320P500"
+        },
+        {
+          "strike-price": "510.00",
+          "call": "SPY   260320C00510000",
+          "call-streamer-symbol": ".SPY260320C510",
+          "put": "SPY   260320P00510000",
+          "put-streamer-symbol": ".SPY260320P510"
+        }
+      ]
+    },
+    {
+      "expiration-type": "Regular",
+      "expiration-date": "2026-06-19",
+      "days-to-expiration": 337,
+      "settlement-type": "PM",
+      "strikes": []
+    }
+  ]
+}
