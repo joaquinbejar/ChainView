@@ -2,6 +2,7 @@
 name = "chainview"
 version = "0.0.1"
 edition = "2024"
+rust-version = "1.85"
 authors = ["Joaquin Bejar <jb@taunais.com>"]
 description = "Terminal UI for option chains, Greeks and volatility - real-time market data and backtest replay in your terminal."
 license = "MIT"
@@ -12,4 +13,32 @@ keywords = ["finance", "options", "tui", "terminal", "trading"]
 categories = ["finance", "command-line-utilities"]
 include = ["src/**/*", "Cargo.toml", "README.md", "LICENSE"]
 
+[lib]
+name = "chainview"
+path = "src/lib.rs"
+
+[[bin]]
+name = "chainview"
+path = "src/main.rs"
+
 [dependencies]
+
+[lints.rust]
+warnings = { level = "deny", priority = -1 }
+unsafe_code = "deny"
+missing_docs = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+indexing_slicing = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+
+[profile.release]
+lto = true
+codegen-units = 1

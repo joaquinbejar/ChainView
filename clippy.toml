@@ -1,0 +1,11 @@
+# ChainView deviation #1 (CLAUDE.md "Governance precedence"): `anyhow` is
+# permitted ONLY in `src/main.rs` / startup composition glue, which opts out
+# with a scoped `#![allow]`. Everywhere else, typed `thiserror` boundaries.
+disallowed-types = [
+    { path = "anyhow::Error", reason = "anyhow is scoped to main.rs/startup glue; use the thiserror boundary types (ChainView deviation #1)" },
+]
+disallowed-macros = [
+    { path = "anyhow::anyhow", reason = "anyhow is scoped to main.rs/startup glue; use the thiserror boundary types (ChainView deviation #1)" },
+    { path = "anyhow::bail", reason = "anyhow is scoped to main.rs/startup glue; use the thiserror boundary types (ChainView deviation #1)" },
+    { path = "anyhow::ensure", reason = "anyhow is scoped to main.rs/startup glue; use the thiserror boundary types (ChainView deviation #1)" },
+]

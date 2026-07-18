@@ -14,6 +14,14 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- Bootstrap the single-crate (binary + lib) skeleton for v0.1: MSRV Rust 1.85
+  on the 2024 edition, `#![forbid(unsafe_code)]` at both crate roots, the
+  `[lints]` table (deny warnings, deny `unsafe_code`, clippy restriction
+  lints), module stubs for `error` / `config` / `app` / `event` /
+  `providers` / `chain` / `ui`, `rustfmt.toml` + `clippy.toml` (with `anyhow`
+  scoped to `main.rs`/startup glue), the `make pre-push` toolchain skeleton,
+  and `.env.example`. No runtime dependency added.
+
 ### Changed
 
 ### Deprecated
