@@ -7,7 +7,7 @@
 
 CARGO := cargo
 
-.PHONY: all fix fmt fmt-check lint lint-fix test build build-release doc check-spanish pre-push
+.PHONY: all fix fmt fmt-check lint lint-fix test build build-release doc check-spanish perf perf-selftest pre-push
 
 all: build
 
@@ -44,5 +44,17 @@ check-spanish:
 	else \
 		echo 'check-spanish: OK'; \
 	fi
+
+# The v1.0 perf-regression gate (issue #52, BENCH.md section 6). `perf` runs the
+# four hot-path benches and ENFORCES the committed BENCH.md ceilings (exit
+# non-zero on a p99 regression) — run it on baseline-class hardware, where the
+# measured p99 is comparable to the recorded baseline. `perf-selftest` proves the
+# gate fires without running a bench (deterministic; the CI-blocking check). Both
+# are OUT of `pre-push` (the bench run is minutes-long).
+perf:
+	bash scripts/check-perf.sh --run
+
+perf-selftest:
+	bash scripts/check-perf.sh --self-test
 
 pre-push: fix fmt lint-fix test doc check-spanish

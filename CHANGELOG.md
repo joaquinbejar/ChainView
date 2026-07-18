@@ -14,6 +14,55 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- **The CI perf-regression gate — v1.0 opens** (issue #52; `scripts/check-perf.sh`,
+  `.github/workflows/ci.yml`, `Makefile`, `BENCH.md` §6, `docs/06-performance.md`
+  §5, `docs/TESTING.md` §11, NFR-17). Turns the ADR-0007 performance budget into a
+  CI-enforced gate: a hot-path benchmark (HP-1…HP-4) whose `hdrhistogram` **p99**
+  regresses past its documented per-path ceiling (`baseline + threshold`) is
+  rejected. No new dependency (script + CI + docs only); no runtime or dev-dep
+  added.
+  - **`scripts/check-perf.sh` — the comparison gate.** Reads the machine-readable
+    perf-gate block committed in `BENCH.md` §6.2 (baseline p99 + per-path
+    threshold, in us), runs the four benches, parses each headline p99, and fails
+    when `measured > baseline + threshold`, printing the offending path, baseline,
+    threshold, ceiling, and measured. It reads the **committed** file, so the job
+    can never rewrite the baseline it gates against — a re-baseline is a reviewed
+    `BENCH.md` edit in the same PR. The gated metric is p99 (a frame budget is a
+    tail property); p99.9 and max stay indicative, not gated.
+  - **`--self-test` — the non-vacuous proof.** Feeds the comparison engine
+    synthetic measured sets derived from the REAL committed baselines/thresholds —
+    a within-threshold set (passes), a deliberately slowed set (fails on every
+    path), a missing-measurement set (fails; never a vacuous pass), and a mixed
+    set (exactly one fail). Deterministic and hardware-independent, so a green run
+    means "the gate detects a regression", not "the check never ran". It also
+    proves the `BENCH.md` perf-gate block parses.
+  - **Honest wiring for a noisy shared runner (documented deviation).** Two
+    realities make an absolute-p99 CI gate dishonest: a GitHub-hosted runner is a
+    slower, noisier hardware class than the `BENCH.md` baseline host (Apple M4
+    Max); and HP-2 `bench_event_fanin` / HP-3 `bench_chain_merge` rebuild and
+    normalize the full leg set through the real Deribit seam on **every sample**
+    (untimed generation, executed thousands of times), so each runs many minutes
+    of wall-clock even on the baseline host — unbounded for a bounded CI job (the
+    gated fold p99 is still fast; the wall-clock to produce it is not). The new
+    `perf-regression` CI job therefore **blocks** on `--self-test` (deterministic,
+    hardware-independent, the enforced acceptance-criterion check) and runs
+    `--run --only bench_render_chain --report-only` **informationally** — one fast
+    bench end-to-end to exercise the real hdrhistogram-output parser, never
+    failing the build. The **absolute four-bench enforcement** (`--run`, `make
+    perf`) runs on baseline-class hardware, where the multi-minute wall-clock is
+    acceptable and the measured p99 is comparable to the committed baseline.
+    Pinned to the MSRV floor (1.88 — the issue named 1.85, raised at #20) so the
+    gate and baseline share a toolchain; `timeout-minutes: 20` bounds the job.
+  - **`BENCH.md` §6 + doc reconcile.** Adds the regression-gate section (mechanics,
+    the perf-gate block + mirror table with the four p99 baselines and thresholds,
+    the runner-noise deviation, and the legitimate re-baseline procedure —
+    "never to hide a regression"). `docs/06-performance.md` §5 and
+    `docs/TESTING.md` §11 are updated from "before v1.0" to the ACTIVE gate and
+    their stale pre-code / all-DESIGN-TARGET wording is corrected (NFR-14/15
+    MEASURED, NFR-16 stays PENDING as a live-venue distribution — a fabricated
+    startup number would violate the absolute no-fabricated-benchmarks rule).
+    `make perf` / `make perf-selftest` targets added (out of `pre-push` — the
+    bench run is minutes-long).
 - **Depth sequence-gap and surface fallible-path behavioural tests** (issue #51;
   `docs/TESTING.md` §3/§7/§9, `docs/03-data-providers.md` §8/§5, ROADMAP §v0.5). The
   v0.5 acceptance-gate BEHAVIOURAL flows the #50 snapshot goldens cannot prove, added

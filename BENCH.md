@@ -2,17 +2,20 @@
 
 | Field      | Value                                       |
 |------------|---------------------------------------------|
-| Status     | v0.1 baseline (HP-1…HP-3) + v0.3 HP-4        |
+| Status     | v0.1 baseline (HP-1…HP-3) + v0.3 HP-4 + v1.0 regression gate (section 6) |
 | Last run   | 2026-07-17 (HP-4); 2026-07-16 (HP-1…HP-3)   |
 | Suite      | `bench_render_chain`, `bench_event_fanin`, `bench_chain_merge`, `bench_replay_decode` |
-| Issue      | #21 (HP-1…HP-3), #36 (HP-4)                  |
+| Issue      | #21 (HP-1…HP-3), #36 (HP-4), #52 (gate)     |
 
 These are **real measured runs on the machine below** — not design targets and
 not fabricated. The no-fabricated-benchmarks rule is absolute (`CLAUDE.md`): every
 number here came from `cargo bench --features bench` on this host. Re-run before
 quoting on other hardware. HP-4 (`bench_replay_decode`) landed at v0.3 (#36) and
-is the replay decode entry below; the CI regression gate that fails on a
-regression past a documented threshold is v1.0 (#52), not here.
+is the replay decode entry below. The CI regression gate that fails on a
+regression past a documented per-path threshold landed at v1.0 (#52) and is
+specified in **section 6** — the baselines in section 3 are the numbers it gates
+against, and the machine-readable thresholds live in the section 6 perf-gate
+block.
 
 ## 1. Measurement environment
 
@@ -208,3 +211,112 @@ cargo bench --features bench --bench bench_replay_decode   # HP-4 (#36)
 The `hdrhistogram` tail report prints first (the headline table above), then
 criterion's mean cross-check. Without `--features bench` the benches are skipped
 (`required-features`) and the public surface is unchanged.
+
+## 6. Regression gate (CI, issue #52)
+
+The v1.0 stability commitment turns the section 3 baselines into an enforced
+CI gate: a hot-path benchmark whose **p99** regresses past its documented
+per-path ceiling **fails the build** (NFR-17,
+[06 §5](docs/06-performance.md#5-regression-gates),
+[TESTING.md §11](docs/TESTING.md#11-performance--regression-benchmarks)). The
+gated metric is `hdrhistogram` **p99** — a frame budget is a tail property, so
+the mean is never gated; **p99.9 and max are indicative, not gated** (section 1).
+
+### 6.1 Mechanics
+
+- `scripts/check-perf.sh` reads the machine-readable perf-gate block below
+  (baseline p99 + per-path threshold, both in us), runs the four benches, parses
+  each headline p99, and fails when `measured p99 > baseline + threshold`. It
+  reads the **committed** file, so the job can never rewrite the baseline it
+  gates against.
+- **`ceiling = baseline + threshold`.** The threshold is the documented
+  regression band: a conservative noise + headroom margin (see 6.2), so a warmed
+  re-run on baseline-class hardware never flakes and only a **structural**
+  regression breaches it.
+- **`scripts/check-perf.sh --self-test`** proves the gate FIRES without running a
+  bench: it feeds the comparison engine synthetic measured sets derived from the
+  committed baselines/thresholds — a within-threshold set (passes), a
+  deliberately slowed set (fails on every path), a missing-measurement set
+  (fails), and a mixed set (exactly one fail). It is deterministic and
+  hardware-independent, so it is the **CI-blocking** proof the gate is not
+  vacuous. It also proves this perf-gate block parses.
+
+### 6.2 The perf-gate block (source of truth for the gate)
+
+`scripts/check-perf.sh` parses the fenced block between the `perf-gate` markers.
+Columns: `bench_name  metric  baseline_us  threshold_us`. The baselines are the
+section 3 p99 figures (Apple M4 Max); the thresholds are a conservative
+regression band roughly the size of the baseline (headroom for a comparable
+machine under desktop load), tightened only where the absolute number is large
+and stable (HP-4). A breach is a structural regression, not jitter.
+
+<!-- perf-gate:begin -->
+```text
+bench_render_chain    p99    232.319     250.000
+bench_event_fanin     p99     96.639     150.000
+bench_chain_merge     p99    384.511     300.000
+bench_replay_decode   p99   8044.543    3000.000
+```
+<!-- perf-gate:end -->
+
+| Bench | Baseline p99 (us) | Threshold (us) | Ceiling (us) |
+|-------|------------------:|---------------:|-------------:|
+| `bench_render_chain` (HP-1)  |  232.319 |  250.000 |   482.319 |
+| `bench_event_fanin` (HP-2)   |   96.639 |  150.000 |   246.639 |
+| `bench_chain_merge` (HP-3)   |  384.511 |  300.000 |   684.511 |
+| `bench_replay_decode` (HP-4) | 8044.543 | 3000.000 | 11044.543 |
+
+### 6.3 Runner-noise + wall-clock deviation (honest mechanics)
+
+Two realities make an absolute-p99 gate on GitHub-hosted runners dishonest, so
+the gate is wired around them (see `.github/workflows/ci.yml`, job
+`perf-regression`):
+
+1. **Hardware class.** A shared runner is a **slower, noisier** class than the
+   section 1 baseline host (Apple M4 Max), so an absolute-p99 gate against these
+   baselines would always breach there — a flake generator, not a regression
+   catcher.
+2. **Wall-clock.** `bench_render_chain` (HP-1) and `bench_replay_decode` (HP-4)
+   are fast, but `bench_event_fanin` (HP-2) and `bench_chain_merge` (HP-3)
+   **rebuild and normalize the full leg set through the real Deribit seam on
+   every sample** (the burst generation, untimed but executed thousands of times
+   across the hdr loop and criterion's iterations), so each runs for **many
+   minutes** on the baseline host and longer on a runner — unbounded for a
+   bounded CI job. The GATED number (the hdr p99 fold service time) is still
+   fast; the wall-clock to produce it is not.
+
+The honest wiring:
+
+- **CI-blocking:** `scripts/check-perf.sh --self-test` — deterministic and
+  hardware-independent, it proves the gate detects a synthetic regression and
+  accepts a within-threshold run. This is the enforced acceptance-criterion
+  check ("a deliberately slowed run the gate rejects").
+- **CI-informational:** `scripts/check-perf.sh --run --only bench_render_chain
+  --report-only` — runs the ONE fast bench end-to-end on the runner, exercising
+  the real hdrhistogram-output parser (so a bench-format change is caught), and
+  never fails the build. The three other benches are not run in CI: HP-2/HP-3
+  exceed a bounded CI wall-clock (above), and an absolute breach on a
+  non-baseline-class runner is not a regression anyway.
+- **Enforced absolute gate:** `scripts/check-perf.sh --run` (via `make perf`) on
+  **baseline-class hardware** (the developer machine that recorded these numbers,
+  or a self-hosted M4 runner), where the measured p99 is comparable to the
+  committed baseline. This is the real four-bench absolute-threshold enforcement;
+  budget several minutes for the HP-2/HP-3 generation cost.
+
+### 6.4 Re-baselining legitimately (never to hide a regression)
+
+A genuine, understood performance change re-baselines through a **reviewed
+BENCH.md edit in the same PR**, never by the job rewriting the file:
+
+1. Re-run `cargo bench --features bench` on baseline-class hardware and record
+   the new section 3 p99 numbers with the environment (section 1).
+2. Update the matching row in the section 6.2 perf-gate block (baseline, and the
+   threshold if the noise band genuinely changed) and the mirror table.
+3. Explain the delta in the PR (what changed and why the new number is expected)
+   — a re-baseline that hides a regression is a review 🔴. Because the gate reads
+   the committed block, the reviewer is gating the number, not the CI job.
+
+The three NFR figures (frame budget NFR-14, bounded memory NFR-15, startup
+NFR-16) are re-baselined the same way; NFR-16 stays PENDING (section 4) until a
+live-venue distribution is measured — a fabricated startup number would violate
+the no-fabricated-benchmarks rule.
