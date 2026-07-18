@@ -1,0 +1,7 @@
+{
+  "contract_multiplier": 100,
+  "settlement": "cash",
+  "exercise": "european",
+  "quote_currency": "USD",
+  "venue_product_code": "BTC"
+}

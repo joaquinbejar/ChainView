@@ -1508,4 +1508,338 @@ mod tests {
         assert!(backoff_delay(4, 0.0) > backoff_delay(1, 0.0));
         assert_eq!(backoff_delay(30, 0.0), Duration::from_millis(30_000));
     }
+
+    // =====================================================================
+    // Recorded fixtures (issue #46): the DXLink symbol-stream shape at the
+    // pinned `dxlink` 0.2.0 `QuoteEvent`/`GreeksEvent` wire fields, and the
+    // cross-provider overlay pair over a Deribit source fixture. `include_str!`
+    // bakes the bytes into the test binary, so the fixtures are byte-stable
+    // across machines (docs/TESTING.md §5, tests/fixtures/dxlink/README.md).
+    // =====================================================================
+
+    const FIXTURE_QUOTE_SYMBOL: &str =
+        include_str!("../../tests/fixtures/dxlink/quote/quote_symbol.json");
+    const FIXTURE_GREEKS_SYMBOL: &str =
+        include_str!("../../tests/fixtures/dxlink/greeks/greeks_symbol.json");
+    const FIXTURE_OVERLAY_MATCHING: &str =
+        include_str!("../../tests/fixtures/dxlink/overlay/overlay_matching.json");
+    const FIXTURE_OVERLAY_MISMATCHED: &str =
+        include_str!("../../tests/fixtures/dxlink/overlay/overlay_mismatched.json");
+    /// The Deribit source-chain fixture the overlay joins onto (issue #17). The
+    /// overlay pair reuses the SAME committed instrument list the Deribit adapter
+    /// normalizes, so the source leg identity is grounded in a real fixture.
+    const FIXTURE_DERIBIT_INSTRUMENTS: &str =
+        include_str!("../../tests/fixtures/deribit/instruments/instruments_btc.json");
+
+    /// The `BTC-27JUN25-60000-C` option the overlay pair targets — its
+    /// `eventSymbol` in `quote_symbol.json` is this leg's dxfeed streamer symbol.
+    const SOURCE_OPTION_NAME: &str = "BTC-27JUN25-60000-C";
+    /// The dxfeed streamer symbol the DXLink overlay leg subscribes and the event
+    /// fixture carries (`eventSymbol`).
+    const OVERLAY_STREAM_SYMBOL: &str = ".BTC250627C60000";
+
+    /// A minimal view of one Deribit `get_instruments` row — enough to ground the
+    /// overlay source leg's identity in the committed Deribit fixture without
+    /// reaching the Deribit adapter's crate-private normalization.
+    #[derive(serde::Deserialize)]
+    struct FixtureInstrument {
+        instrument_name: String,
+        kind: String,
+        strike: Option<f64>,
+        expiration_timestamp: Option<i64>,
+        option_type: Option<String>,
+        quote_currency: Option<String>,
+    }
+
+    /// The committed overlay-leg fingerprint (the matching / mismatched arm).
+    #[derive(serde::Deserialize)]
+    struct OverlayFixtureSpec {
+        contract_multiplier: u32,
+        settlement: String,
+        exercise: String,
+        quote_currency: String,
+        venue_product_code: String,
+    }
+
+    #[track_caller]
+    fn settlement_of(label: &str) -> SettlementStyle {
+        match label {
+            "cash" => SettlementStyle::Cash,
+            "physical" => SettlementStyle::Physical,
+            other => panic!("unknown settlement label in fixture: {other}"),
+        }
+    }
+
+    #[track_caller]
+    fn exercise_of(label: &str) -> ExerciseStyle {
+        match label {
+            "european" => ExerciseStyle::European,
+            "american" => ExerciseStyle::American,
+            other => panic!("unknown exercise label in fixture: {other}"),
+        }
+    }
+
+    #[track_caller]
+    fn overlay_spec_from(json: &str) -> ContractSpecFingerprint {
+        let dto: OverlayFixtureSpec = match serde_json::from_str(json) {
+            Ok(dto) => dto,
+            Err(e) => panic!("overlay-spec fixture must deserialize: {e}"),
+        };
+        ContractSpecFingerprint {
+            contract_multiplier: dto.contract_multiplier,
+            settlement: settlement_of(&dto.settlement),
+            exercise: exercise_of(&dto.exercise),
+            quote_currency: dto.quote_currency,
+            venue_product_code: dto.venue_product_code,
+        }
+    }
+
+    /// The `BTC-27JUN25-60000-C` option from the committed Deribit source fixture.
+    #[track_caller]
+    fn deribit_source_option() -> FixtureInstrument {
+        let instruments: Vec<FixtureInstrument> =
+            match serde_json::from_str(FIXTURE_DERIBIT_INSTRUMENTS) {
+                Ok(list) => list,
+                Err(e) => panic!("deribit instruments fixture must deserialize: {e}"),
+            };
+        match instruments
+            .into_iter()
+            .find(|i| i.instrument_name == SOURCE_OPTION_NAME && i.kind == "option")
+        {
+            Some(option) => option,
+            None => panic!("the deribit fixture must carry {SOURCE_OPTION_NAME}"),
+        }
+    }
+
+    /// The provider-agnostic key of the Deribit source option, read from the
+    /// committed fixture (absolute-UTC expiry from `expiration_timestamp`).
+    #[track_caller]
+    fn source_key(option: &FixtureInstrument) -> InstrumentKey {
+        let millis = match option.expiration_timestamp {
+            Some(ms) => ms,
+            None => panic!("the source option fixture carries an expiration_timestamp"),
+        };
+        let expiration_utc = match DateTime::<Utc>::from_timestamp_millis(millis) {
+            Some(dt) => dt,
+            None => panic!("the fixture expiration_timestamp is a valid instant: {millis}"),
+        };
+        let strike = match option.strike {
+            Some(s) => pos(s),
+            None => panic!("the source option fixture carries a strike"),
+        };
+        let style = match option.option_type.as_deref() {
+            Some("call") => OptionStyle::Call,
+            Some("put") => OptionStyle::Put,
+            other => panic!("unexpected source option_type: {other:?}"),
+        };
+        InstrumentKey {
+            underlying: "BTC".to_owned(),
+            expiration_utc,
+            strike,
+            style,
+        }
+    }
+
+    /// The Deribit source leg's fingerprint, matching what the Deribit adapter
+    /// normalizes for this instrument (`contract_size 1.0 -> 1`, cash / european,
+    /// its `quote_currency`, the underlying as the venue product code).
+    fn source_spec(option: &FixtureInstrument) -> ContractSpecFingerprint {
+        ContractSpecFingerprint {
+            contract_multiplier: 1,
+            settlement: SettlementStyle::Cash,
+            exercise: ExerciseStyle::European,
+            quote_currency: option
+                .quote_currency
+                .clone()
+                .unwrap_or_else(|| "USD".to_owned()),
+            venue_product_code: "BTC".to_owned(),
+        }
+    }
+
+    /// Build the overlay-pair store: the Deribit source chain (from the committed
+    /// instruments fixture) joined with a DXLink overlay leg carrying
+    /// `overlay_spec` — the alias-catalog join at composition. Returns the store
+    /// and the DXLink overlay leg (the `req.instruments` the overlay subscribes).
+    #[track_caller]
+    fn overlay_pair_store(overlay_spec: ContractSpecFingerprint) -> (ChainStore, Instrument) {
+        let option = deribit_source_option();
+        let key = source_key(&option);
+
+        // The Deribit source leg (native OCC-style symbol, no stream symbol).
+        let source = Instrument {
+            key: key.clone(),
+            provider: pid("deribit"),
+            native_symbol: SOURCE_OPTION_NAME.to_owned(),
+            stream_symbol: None,
+            spec: source_spec(&option),
+        };
+        // The DXLink overlay leg for the SAME key: dxfeed stream symbol + its own
+        // (committed) fingerprint — the cross-provider join.
+        let overlay = Instrument {
+            key: key.clone(),
+            provider: pid("dxlink"),
+            native_symbol: OVERLAY_STREAM_SYMBOL.to_owned(),
+            stream_symbol: Some(OVERLAY_STREAM_SYMBOL.to_owned()),
+            spec: overlay_spec,
+        };
+
+        let mut catalog = AliasCatalog::new();
+        catalog.insert(source);
+        catalog.insert(overlay.clone());
+
+        let expiry = key.expiration_utc;
+        let mut chain = OptionChain::new("BTC", key.strike, expiry.to_rfc3339(), None, None);
+        // Seed the source row with the Deribit ticker-fixture bid/ask (0.05/0.06),
+        // so a merged overlay quote (0.062) is a visible source->overlay change.
+        chain.add_option(
+            key.strike,
+            Some(pos(0.05)),
+            Some(pos(0.06)),
+            Some(pos(0.05)),
+            Some(pos(0.06)),
+            Positive::ZERO,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let fetch = ChainFetch::new(
+            chain,
+            ExpirySource::new("BTC", expiry, pid("deribit")),
+            catalog,
+        );
+        let store = ChainStore::seed(fetch, ChainSource::Merged, Duration::from_secs(2), expiry);
+        (store, overlay)
+    }
+
+    /// Decode the committed DXLink quote fixture through the adapter's REAL path:
+    /// the upstream `QuoteEvent` -> `map_market_event` -> `route_event`, resolving
+    /// the event symbol back to `overlay` via the subscription lookup.
+    #[track_caller]
+    fn decode_fixture_quote(overlay: &Instrument) -> QuoteUpdate {
+        let event: dxlink::events::QuoteEvent = match serde_json::from_str(FIXTURE_QUOTE_SYMBOL) {
+            Ok(ev) => ev,
+            Err(e) => panic!("quote fixture must deserialize as dxlink QuoteEvent: {e}"),
+        };
+        let raw = map_market_event(MarketEvent::Quote(event));
+        let lookup = stream_lookup(std::slice::from_ref(overlay));
+        let (mut sink, mut rx_control, mut rx_coalesced) = test_sink(8);
+        let sent = block(route_event(&raw, &lookup, &mut sink));
+        assert_ne!(sent, SinkSend::Closed);
+        let mut out = drain(&mut rx_control);
+        out.extend(drain(&mut rx_coalesced));
+        match out.as_slice() {
+            [MarketUpdate::Quote(quote)] => quote.clone(),
+            other => panic!("expected a single decoded QuoteUpdate, got {other:?}"),
+        }
+    }
+
+    // === Fixture normalization: the DXLink symbol-stream shape ================
+
+    #[test]
+    fn test_dxlink_fixture_quote_symbol_normalizes_to_quote_update() {
+        // The committed `QuoteEvent` fixture flows through the REAL upstream
+        // mapping + decode into a `QuoteUpdate` tagged `dxlink`, with no venue time.
+        let (_store, overlay) = overlay_pair_store(overlay_spec_from(FIXTURE_OVERLAY_MATCHING));
+        let quote = decode_fixture_quote(&overlay);
+        assert_eq!(quote.instrument.provider.as_str(), "dxlink");
+        assert_eq!(quote.instrument.key, overlay.key);
+        assert_eq!(quote.bid, Some(pos(0.062)));
+        assert_eq!(quote.ask, Some(pos(0.064)));
+        assert_eq!(quote.bid_size, Some(pos(12.0)));
+        assert_eq!(quote.ask_size, Some(pos(8.0)));
+        // DXLink events carry no venue timestamp (§7.3).
+        assert!(quote.event_time.is_none());
+    }
+
+    #[test]
+    fn test_dxlink_fixture_greeks_symbol_normalizes_to_greeks_row() {
+        let (_store, overlay) = overlay_pair_store(overlay_spec_from(FIXTURE_OVERLAY_MATCHING));
+        let event: dxlink::events::GreeksEvent = match serde_json::from_str(FIXTURE_GREEKS_SYMBOL) {
+            Ok(ev) => ev,
+            Err(e) => panic!("greeks fixture must deserialize as dxlink GreeksEvent: {e}"),
+        };
+        let raw = map_market_event(MarketEvent::Greeks(event));
+        let lookup = stream_lookup(std::slice::from_ref(&overlay));
+        let (mut sink, mut rx_control, mut rx_coalesced) = test_sink(8);
+        let _ = block(route_event(&raw, &lookup, &mut sink));
+        let mut out = drain(&mut rx_control);
+        out.extend(drain(&mut rx_coalesced));
+        match out.as_slice() {
+            [MarketUpdate::Greeks(greeks)] => {
+                assert_eq!(greeks.instrument.provider.as_str(), "dxlink");
+                // A dxfeed Greeks event is a venue analytics source; IV as-is (§3).
+                assert_eq!(greeks.origin, GreeksOrigin::Provider);
+                assert_eq!(greeks.iv, Some(pos(0.4922)));
+                assert!(greeks.event_time.is_none());
+            }
+            other => panic!("expected a single decoded GreeksRow, got {other:?}"),
+        }
+    }
+
+    // === The cross-provider overlay pair (deribit source + dxlink overlay) =====
+
+    #[track_caller]
+    fn overlay_call_bid(store: &ChainStore, strike: Positive) -> Option<Positive> {
+        store
+            .chain()
+            .options
+            .iter()
+            .find(|o| o.strike_price == strike)
+            .and_then(|o| o.call_bid)
+    }
+
+    #[test]
+    fn test_overlay_pair_leg_selection_subscribes_dxlink_stream_legs() {
+        // The leg-selection rule (#42): the overlay subscription receives the
+        // DXLINK legs' dxfeed stream symbols in `req.instruments`, NEVER the source
+        // provider's native OCC legs.
+        let (_store, overlay) = overlay_pair_store(overlay_spec_from(FIXTURE_OVERLAY_MATCHING));
+        assert_eq!(
+            subscription_symbols(std::slice::from_ref(&overlay)),
+            vec![OVERLAY_STREAM_SYMBOL.to_owned()],
+            "the overlay subscribes the dxfeed stream symbol, not the deribit native"
+        );
+        assert_ne!(overlay.native_symbol, SOURCE_OPTION_NAME);
+    }
+
+    #[test]
+    fn test_overlay_pair_matching_fingerprint_merges_overlay_wins() {
+        // (a) MATCHING fingerprint: the joined DXLink overlay leg's fingerprint
+        // equals the Deribit source leg's -> the decoded overlay quote MERGES and
+        // its bid wins over the source's 0.05.
+        let (mut store, overlay) = overlay_pair_store(overlay_spec_from(FIXTURE_OVERLAY_MATCHING));
+        let key = overlay.key.clone();
+
+        // The alias-catalog join is proven: the dxfeed stream symbol resolves back
+        // to the SHARED source key.
+        match store.aliases().resolve_symbol(OVERLAY_STREAM_SYMBOL) {
+            Some(resolved) => assert_eq!(resolved, &key),
+            None => panic!("the overlay dxfeed symbol must resolve to the shared source key"),
+        }
+
+        let quote = decode_fixture_quote(&overlay);
+        assert_eq!(store.apply_quote(&quote), MergeOutcome::Applied);
+        assert!(!store.is_overlay_refused(&key));
+        // The overlay (live DXLink stream) wins the quote field over the source.
+        assert_eq!(overlay_call_bid(&store, key.strike), Some(pos(0.062)));
+    }
+
+    #[test]
+    fn test_overlay_pair_mismatched_fingerprint_refused_source_kept() {
+        // (b) MISMATCHED fingerprint: the joined DXLink overlay leg declares a
+        // different contract multiplier -> the decoded overlay quote is REFUSED,
+        // the Deribit source leg is kept unchanged, and the leg is badged
+        // overlay-refused (the economic-equivalence gate, docs/01 §4).
+        let (mut store, overlay) =
+            overlay_pair_store(overlay_spec_from(FIXTURE_OVERLAY_MISMATCHED));
+        let key = overlay.key.clone();
+        let quote = decode_fixture_quote(&overlay);
+        assert_eq!(store.apply_quote(&quote), MergeOutcome::OverlayRefused);
+        assert!(store.is_overlay_refused(&key));
+        // The Deribit source leg is kept unchanged (0.05), never fused.
+        assert_eq!(overlay_call_bid(&store, key.strike), Some(pos(0.05)));
+    }
 }
