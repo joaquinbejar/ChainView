@@ -493,12 +493,20 @@ fn is_valid_underlying(s: &str) -> bool {
 }
 
 /// The five structured fields recovered from a `contract_id` join key.
+///
+/// `pub(crate)` (with `pub(crate)` fields) so the replay payoff-at-head build
+/// (#49, `src/app/replay_payoff_build.rs`) can recover a `positions` leg's
+/// `strike_cents` / `style` / `expiration_ns` — which `positions.parquet` carries
+/// **only** inside the join key, not as structured columns (`docs/04-replay-mode.md`
+/// §2.2). The validation chain (#32) has already proven every `contract_id` parses
+/// before any consumer reaches this, so the payoff build's re-parse never fails on a
+/// validated bundle.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ParsedContractId {
-    underlying: String,
-    expiration_ns: i64,
-    strike_cents: u64,
-    style: OptionStyle,
+pub(crate) struct ParsedContractId {
+    pub(crate) underlying: String,
+    pub(crate) expiration_ns: i64,
+    pub(crate) strike_cents: u64,
+    pub(crate) style: OptionStyle,
 }
 
 /// Parse a `contract_id` — `"v1:{UNDERLYING}:{expiration_ns}:{strike_cents}:{C|P}"`
@@ -510,7 +518,7 @@ struct ParsedContractId {
 /// out-of-grammar `UNDERLYING`, a non-numeric `expiration_ns`/`strike_cents`, or a
 /// style char other than `C`/`P`. The caller wraps the reason with the clamped
 /// offending id.
-fn parse_contract_id(cid: &str) -> Result<ParsedContractId, &'static str> {
+pub(crate) fn parse_contract_id(cid: &str) -> Result<ParsedContractId, &'static str> {
     let mut parts = cid.split(':');
     let version = parts.next().ok_or("empty contract_id")?;
     let underlying = parts.next().ok_or("missing UNDERLYING field")?;

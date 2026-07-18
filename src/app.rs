@@ -67,6 +67,7 @@ pub(crate) mod keymap;
 mod payoff_build;
 mod registry;
 mod replay_load;
+mod replay_payoff_build;
 mod replay_view;
 mod supervisor;
 mod surface_build;
@@ -2382,6 +2383,59 @@ pub struct LoadedReplay {
     /// (load + every cursor move), diffed by the ui view-cache to re-project the equity
     /// series only when it actually changed (#35, the payoff-cache pattern).
     equity_revision: u64,
+    /// The expiration payoff `GraphData::Series` of the **open position at the head**
+    /// (#49), built off the draw path from the cached open set on every cursor move and
+    /// projected by the ui view-cache. Private — the payoff screen reads the projection,
+    /// never this `GraphData`. An empty series is the "flat at this step" state.
+    payoff_graph: GraphData,
+    /// The payoff-at-head header figures the draw reads: the break-even prices, the
+    /// current net mark-to-market P&L in **integer cents**, and the open-leg count —
+    /// all resolved off the draw path so the panel scans no positions per frame (#49).
+    payoff_head: ReplayPayoffHead,
+    /// A monotonic counter bumped whenever [`payoff_graph`](Self::payoff_graph) is
+    /// rebuilt (load + every cursor move), diffed by the ui view-cache to re-project the
+    /// payoff series only when the open set at the head actually changed (#49).
+    payoff_revision: u64,
+}
+
+/// The replay payoff-at-head **header** figures the panel renders (#49): the
+/// break-even underlying prices, the current net mark-to-market P&L in **integer
+/// cents** (`None` when the head is flat), and the count of open legs at the head.
+///
+/// Built off the draw path from the cursor's cached open set (never a per-frame scan)
+/// and read by the replay payoff panel's `draw_replay` at the render edge, where the
+/// cents are formatted to `$` and the break-evens overlaid as markers.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReplayPayoffHead {
+    /// The break-even underlying prices, overlaid as markers (empty when flat).
+    break_evens: Vec<Positive>,
+    /// The current net mark-to-market P&L in **integer cents** (signed), or `None`
+    /// when the head is flat (no open leg).
+    mark_pnl_cents: Option<i64>,
+    /// The number of open legs at the head (`0` ⇒ the "flat at this step" state).
+    open_legs: usize,
+}
+
+impl ReplayPayoffHead {
+    /// The break-even underlying prices to overlay as markers (empty when flat).
+    #[must_use]
+    pub fn break_even_points(&self) -> &[Positive] {
+        &self.break_evens
+    }
+
+    /// The current net mark-to-market P&L in **integer cents** (signed), or `None`
+    /// when the head is flat. Formatted to `$` only at the render edge (#49).
+    #[must_use]
+    pub fn mark_pnl_cents(&self) -> Option<i64> {
+        self.mark_pnl_cents
+    }
+
+    /// The number of open legs at the head — `0` is the "flat at this step" state the
+    /// panel renders as its deliberate empty state (before any curve).
+    #[must_use]
+    pub fn open_legs(&self) -> usize {
+        self.open_legs
+    }
 }
 
 impl LoadedReplay {
@@ -2400,12 +2454,16 @@ impl LoadedReplay {
             .or_else(|| bundle.equity.first().map(|point| point.equity_cents))
             .unwrap_or(0);
         let geometry = EquityGeometry::build(visible, seed_cents);
+        let (payoff_graph, payoff_head) = build_payoff_at_head(&cursor, &bundle);
         Self {
             bundle,
             cursor,
             selection: None,
             geometry,
             equity_revision: 0,
+            payoff_graph,
+            payoff_head,
+            payoff_revision: 0,
         }
     }
 
@@ -2431,6 +2489,28 @@ impl LoadedReplay {
         self.geometry.peak_drawdown_cents()
     }
 
+    /// The cached payoff-at-head `GraphData` (the expiration payoff of the open
+    /// position at the head, #49), for the ui view-cache to project off the draw path.
+    /// Not read by `draw`.
+    #[must_use]
+    pub fn payoff_graph(&self) -> &GraphData {
+        &self.payoff_graph
+    }
+
+    /// The payoff-at-head header figures (break-evens, mark P&L in cents, open-leg
+    /// count) the panel renders, resolved off the draw path (#49).
+    #[must_use]
+    pub fn payoff_head(&self) -> &ReplayPayoffHead {
+        &self.payoff_head
+    }
+
+    /// The payoff-series revision the ui view-cache diffs to schedule a re-project
+    /// (#49): monotonic within this bundle, bumped on every cursor move.
+    #[must_use]
+    pub fn payoff_revision(&self) -> u64 {
+        self.payoff_revision
+    }
+
     /// The `Copy` identity key of the drill-down selection — `(step, order_id,
     /// fill_seq)`, the fill's unique sort key — or `None` when nothing is selected.
     /// The driver's view-signature diffs this to turn a `,` / `.` selection move into
@@ -2440,14 +2520,16 @@ impl LoadedReplay {
         self.selection.as_ref().map(fill_key)
     }
 
-    /// Rebuild the cached equity geometry and re-clamp the drill-down selection after
-    /// the cursor moved — the single off-draw refresh both [`ReplayState::seek`] and
-    /// [`ReplayState::advance_playback`] run (#35).
+    /// Rebuild the cached equity + payoff geometry and re-clamp the drill-down
+    /// selection after the cursor moved — the single off-draw refresh both
+    /// [`ReplayState::seek`] and [`ReplayState::advance_playback`] run (#35, #49).
     fn on_cursor_moved(&mut self) {
         self.rebuild_equity();
+        self.rebuild_payoff();
         self.reclamp_selection();
     }
 
+<<<<<<< HEAD
     /// Refresh the cached equity geometry from the cursor's as-of slice and bump the
     /// revision, off the draw path. A **forward** move (the slice grew or held) folds
     /// only the newly-visible tail into the running peak and appends its samples —
@@ -2455,6 +2537,21 @@ impl LoadedReplay {
     /// seek (the slice shrank) cannot extend, so it rebuilds from the opening-capital
     /// seed — `O(visible)`, but only on an arbitrary jump, not per tick. Either way the
     /// result is a pure function of the bundle + cursor (incremental == full).
+=======
+    /// Rebuild the payoff-at-head geometry from the cursor's cached open set and bump
+    /// its revision, off the draw path (#49). The open set is resolved **here** (a
+    /// seek-time `O(k log k)` pass), never per frame in `draw`.
+    fn rebuild_payoff(&mut self) {
+        let (graph, head) = build_payoff_at_head(&self.cursor, &self.bundle);
+        self.payoff_graph = graph;
+        self.payoff_head = head;
+        self.payoff_revision = self.payoff_revision.checked_add(1).unwrap_or(0);
+    }
+
+    /// Rebuild the equity series + peak-drawdown figure from the cursor's as-of slice
+    /// and bump the revision, off the draw path. `O(visible)` on the seek/tick path,
+    /// never per frame.
+>>>>>>> 5420efe (Add the replay payoff-at-head panel (#49))
     fn rebuild_equity(&mut self) {
         let visible = self.cursor.visible_equity(&self.bundle);
         if visible.len() >= self.geometry.raw_len() {
@@ -2546,6 +2643,26 @@ fn fill_key(fill: &Fill) -> (u32, u64, u32) {
 #[must_use]
 fn selection_key(selection: Option<&Fill>) -> Option<(u32, u64, u32)> {
     selection.map(fill_key)
+}
+
+/// Resolve the open-position set at the head (the #33 contract — a seek-time `Vec`,
+/// never a per-frame call) and build the cached payoff-at-head geometry from it (#49):
+/// the expiration payoff `GraphData::Series` and the header figures. Off the draw
+/// path — run only on load and on a cursor move.
+#[must_use]
+fn build_payoff_at_head(
+    cursor: &TimelineCursor,
+    bundle: &LoadedBundle,
+) -> (GraphData, ReplayPayoffHead) {
+    let open = cursor.open_positions(bundle);
+    let head_ts_ns = cursor.head_equity(bundle).map(|point| point.ts_ns);
+    let geometry = replay_payoff_build::build(&open, head_ts_ns);
+    let head = ReplayPayoffHead {
+        break_evens: geometry.break_evens,
+        mark_pnl_cents: geometry.mark_pnl_cents,
+        open_legs: geometry.open_legs,
+    };
+    (geometry.graph, head)
 }
 
 // ---------------------------------------------------------------------------
@@ -2646,7 +2763,7 @@ fn live_screen_for_slot(slot: u8) -> Option<LiveScreen> {
 }
 
 /// The replay screen a number-key slot selects (`docs/05-views-and-ux.md` §2):
-/// `1`=Replay, `2`=Payoff (v0.5); any other slot is unbound.
+/// `1`=Replay, `2`=Payoff (the payoff-at-head panel, #49); any other slot is unbound.
 #[must_use]
 fn replay_screen_for_slot(slot: u8) -> Option<ReplayScreen> {
     match slot {
@@ -2657,15 +2774,16 @@ fn replay_screen_for_slot(slot: u8) -> Option<ReplayScreen> {
 }
 
 /// Whether a [`ReplayScreen`] is reachable in the current build
-/// (`docs/05-views-and-ux.md` §2.1). Replay is always reachable; the replay Payoff
-/// screen is a **v0.5** feature and is not reachable yet — its number key flashes
-/// the "Payoff is v0.5" hint rather than switching. This is a build/version gate,
-/// not a capability or [`ProviderId`] gate (replay has no live provider).
+/// (`docs/05-views-and-ux.md` §2.1). Both replay screens are reachable from **v0.5**:
+/// the equity/attribution/drill-down screen, and the **payoff-at-head** panel (#49),
+/// which renders the payoff of the open position at the scrub head. This is a
+/// build/version gate, not a capability or [`ProviderId`] gate (replay has no live
+/// provider) — the payoff panel degrades to its "flat at this step" empty state when
+/// no position is open at the head, so it is always navigable.
 #[must_use]
 pub fn is_replay_screen_reachable(screen: ReplayScreen) -> bool {
     match screen {
-        ReplayScreen::Replay => true,
-        ReplayScreen::Payoff => false,
+        ReplayScreen::Replay | ReplayScreen::Payoff => true,
     }
 }
 
@@ -2692,14 +2810,13 @@ pub(crate) fn replay_screen_name(screen: ReplayScreen) -> &'static str {
 }
 
 /// The keybar hint for an unavailable replay screen (`docs/05-views-and-ux.md`
-/// §2.1). The replay Payoff screen is deferred to v0.5.
+/// §2.1). Both replay screens are reachable from v0.5 (#49), so this is now purely
+/// defensive — it keeps the number-key switch total and wildcard-free without ever
+/// flashing in practice.
 #[must_use]
 fn replay_unavailable_hint(screen: ReplayScreen) -> String {
     match screen {
-        ReplayScreen::Payoff => "Payoff is v0.5".to_owned(),
-        // Replay is always reachable, so this arm is defensive; keep the exhaustive
-        // match wildcard-free.
-        ReplayScreen::Replay => "screen not available".to_owned(),
+        ReplayScreen::Replay | ReplayScreen::Payoff => "screen not available".to_owned(),
     }
 }
 

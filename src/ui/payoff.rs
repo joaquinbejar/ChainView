@@ -34,7 +34,7 @@
 use crossterm::event::KeyEvent;
 use optionstratlib::OptionStyle;
 use optionstratlib::chains::chain::OptionChain;
-use optionstratlib::prelude::Positive;
+use optionstratlib::prelude::{Decimal, Positive, ToPrimitive};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Flex, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -43,9 +43,11 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Axis, Block, Chart, Dataset, GraphType, Paragraph};
 
 use crate::app::atm_index_of;
-use crate::app::keymap::{KeyChord, PayoffAction, resolve_payoff};
-use crate::app::{BuilderLeg, CurveMode, LegFocus, LiveState, PayoffBuilder, ReplayState, Side};
-use crate::event::AppEvent;
+use crate::app::keymap::{KeyChord, PayoffAction, ReplayAction, resolve_payoff, resolve_replay};
+use crate::app::{
+    BuilderLeg, CurveMode, LegFocus, LiveState, PayoffBuilder, ReplayPayoffHead, ReplayState, Side,
+};
+use crate::event::{AppEvent, ReplayControl, SeekTo};
 use crate::ui::graph::{EmptyReason, GraphProjection, ProjectedSeries};
 use crate::ui::theme::{StrikeRelation, Theme};
 
@@ -591,25 +593,285 @@ fn style_of(leg: LegFocus) -> OptionStyle {
 }
 
 // ===========================================================================
-// Replay payoff (v0.5) — unchanged pure seams.
+// Replay payoff-at-head (#49) — the open position at the scrub head.
 // ===========================================================================
 
-/// Draw the replay payoff (the open position at the head) for `state` into `area`
-/// — a pure render. Placeholder body until v0.5 (`docs/ROADMAP.md`).
-pub fn draw_replay(_state: &ReplayState, frame: &mut Frame, area: Rect) {
-    super::placeholder_body(
-        frame,
-        area,
-        "Payoff",
-        "replay payoff at the head lands in v0.5",
-    );
+/// Draw the replay **payoff-at-head** panel for `state` into `area` — the expiration
+/// payoff of the OPEN POSITION at the scrub head, plus the current mark-to-market
+/// reference (`docs/04-replay-mode.md` §6, `docs/05-views-and-ux.md` §5). A **pure**
+/// render over the borrowed replay state and the pre-projected `payoff`
+/// (`docs/02-tui-architecture.md` §7): `payoff` is the ui view-cache's projection,
+/// computed **off** the draw path by [`ViewState::sync`](crate::ViewState) from the
+/// open set the cursor resolved at seek time (#33) — this paint builds no `GraphData`
+/// and prices nothing.
+///
+/// States first (`docs/05-views-and-ux.md` §5): the **loading** note while the bundle
+/// is not `Ready`, then the **"flat at this step"** empty state when no position is
+/// open at the head (recovery: scrub to an open step), then — once an open position is
+/// priced — the payoff **line chart** (the expiration curve, the current-mark
+/// reference, the break-even markers, and the zero line). Never a blank, never a
+/// fabricated line, and **no claim of bit-exact upstream repricing** (`docs/04` §6).
+pub fn draw_replay(
+    state: &ReplayState,
+    payoff: &GraphProjection,
+    frame: &mut Frame,
+    area: Rect,
+    theme: Theme,
+) {
+    let title = Line::from(vec![
+        Span::styled("Payoff", theme.accent()),
+        Span::styled("  at head", theme.dim()),
+    ]);
+    let block = Block::bordered().title(title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    // Loading / failed bundle: the equity screen owns the full load/error UI; the
+    // payoff panel just reports the bundle is not ready yet.
+    let Some(loaded) = state.loaded() else {
+        draw_replay_center(frame, inner, theme, "loading bundle…", "");
+        return;
+    };
+    let head = loaded.payoff_head();
+
+    // "flat at this step": no open position at the head → the deliberate empty state,
+    // BEFORE the happy path (recovery is scrubbing to an open step, §5).
+    if head.open_legs() == 0 {
+        draw_replay_center(
+            frame,
+            inner,
+            theme,
+            "flat at this step",
+            "no open position at the head — scrub to an open step",
+        );
+        return;
+    }
+
+    // Open legs, but the curve projected Empty (a degenerate range, or every
+    // coordinate was non-finite and the #23 adapter dropped it): an honest state, never
+    // a fabricated line.
+    let Some(series) = payoff.ready() else {
+        draw_replay_center(
+            frame,
+            inner,
+            theme,
+            "payoff unavailable at this step",
+            "the open position could not be priced",
+        );
+        return;
+    };
+
+    draw_replay_chart(frame, inner, theme, head, series);
 }
 
-/// Handle a replay-payoff-local key, returning any follow-on [`AppEvent`]. Pure —
-/// no I/O. Lands with the replay payoff (v0.5).
+/// Draw the replay payoff-at-head **line chart**: a header (open-leg count, the
+/// current mark-to-market P&L, and the break-even prices as text — legible under
+/// `NO_COLOR`) over a ratatui [`Chart`] of the projected **expiration** series, with a
+/// dim zero reference line, the break-even points, and the current-mark level overlaid
+/// as markers. The markers are resolved at the UI edge from the cached
+/// [`ReplayPayoffHead`] — nothing is recomputed or priced here.
+fn draw_replay_chart(
+    frame: &mut Frame,
+    inner: Rect,
+    theme: Theme,
+    head: &ReplayPayoffHead,
+    series: &ProjectedSeries,
+) {
+    let [header, body] = Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).areas(inner);
+    frame.render_widget(Paragraph::new(replay_payoff_header(theme, head)), header);
+
+    let [x_min, x_max] = series.x_bounds();
+    // A dim zero reference line across the x-range, so break-evens read visually.
+    let zero_line = [(x_min, 0.0), (x_max, 0.0)];
+    // Break-even markers on the zero line, kept in-range and finite.
+    let breakevens: Vec<(f64, f64)> = head
+        .break_even_points()
+        .iter()
+        .map(Positive::to_f64)
+        .filter(|x| x.is_finite() && *x >= x_min && *x <= x_max)
+        .map(|x| (x, 0.0))
+        .collect();
+    // The current mark-to-market level as a horizontal reference (the mark-based
+    // "t+0" anchor — the current MTM, NOT a repriced curve). Cents → plot `f64` at
+    // this display edge only, and dropped when non-finite.
+    let mark_y = head.mark_pnl_cents().and_then(cents_to_plot_f64);
+    let mark_line: Vec<(f64, f64)> = match mark_y {
+        Some(y) => vec![(x_min, y), (x_max, y)],
+        None => Vec::new(),
+    };
+
+    let mut datasets = vec![
+        Dataset::default()
+            .marker(Marker::Braille)
+            .graph_type(GraphType::Line)
+            .style(theme.dim())
+            .data(&zero_line),
+        Dataset::default()
+            .name(series.name().to_owned())
+            .marker(Marker::Braille)
+            .graph_type(GraphType::Line)
+            .style(theme.accent())
+            .data(series.points()),
+    ];
+    if !mark_line.is_empty() {
+        datasets.push(
+            // The mark reference uses a distinct `Dot` marker so it reads under
+            // NO_COLOR (shape, not color); its P&L-signed tint colors it in a palette.
+            Dataset::default()
+                .name("mark")
+                .marker(Marker::Dot)
+                .graph_type(GraphType::Line)
+                .style(theme.pnl_style(mark_y.is_some_and(|y| y < 0.0)))
+                .data(&mark_line),
+        );
+    }
+    if !breakevens.is_empty() {
+        datasets.push(
+            Dataset::default()
+                .name("break-even")
+                .marker(Marker::Dot)
+                .graph_type(GraphType::Scatter)
+                .style(theme.warning())
+                .data(&breakevens),
+        );
+    }
+
+    // Widen the drawn y-bounds to include 0 (the zero line + break-even markers) and
+    // the mark level, so the y=0 overlays and the mark reference never clip.
+    let y_bounds = replay_y_bounds(series.y_bounds(), mark_y);
+    let y_labels = payoff_y_labels(y_bounds);
+
+    let chart = Chart::new(datasets)
+        .x_axis(
+            Axis::default()
+                .title("underlying")
+                .bounds(series.x_bounds())
+                .labels(axis_labels(series.x_labels()))
+                .style(theme.dim()),
+        )
+        .y_axis(
+            Axis::default()
+                .title("P&L")
+                .bounds(y_bounds)
+                .labels(y_labels)
+                .style(theme.dim()),
+        );
+    frame.render_widget(chart, body);
+}
+
+/// The three-line payoff-at-head header: the open-leg count and the current
+/// mark-to-market P&L, the break-even prices, and the honest "not a reprice" caveat —
+/// all as text so the numbers and the caveat survive `NO_COLOR`
+/// (`docs/04-replay-mode.md` §6).
 #[must_use]
-pub fn handle_key_replay(_state: &mut ReplayState, _key: KeyEvent) -> Option<AppEvent> {
-    None
+fn replay_payoff_header(theme: Theme, head: &ReplayPayoffHead) -> Vec<Line<'static>> {
+    let n = head.open_legs();
+    let summary = Line::from(vec![
+        Span::styled("✓ ", theme.accent()),
+        Span::styled(format!("open {n} {}", leg_word(n)), theme.accent()),
+        Span::styled("   mark ", theme.dim()),
+        match head.mark_pnl_cents() {
+            Some(cents) => Span::styled(fmt_signed_cents(cents), theme.pnl_style(cents < 0)),
+            None => Span::raw(EM_DASH.to_owned()),
+        },
+    ]);
+    let marks = Line::from(vec![
+        Span::styled("break-even ", theme.dim()),
+        Span::raw(fmt_break_evens(head.break_even_points())),
+    ]);
+    let caveat = Line::from(Span::styled(
+        "expiration payoff · mark = current MTM (not a bit-exact reprice)",
+        theme.dim(),
+    ));
+    vec![summary, marks, caveat]
+}
+
+/// Widen the payoff series' y-bounds to include `0` (via [`y_bounds_including_zero`])
+/// and the current-mark level `mark_y`, so the zero line, the break-even markers, and
+/// the mark reference never clip when the P&L window sits away from them. Both series
+/// endpoints are finite (post-projection); `mark_y` is folded in only when finite.
+#[must_use]
+fn replay_y_bounds(series_bounds: [f64; 2], mark_y: Option<f64>) -> [f64; 2] {
+    let [lo, hi] = y_bounds_including_zero(series_bounds);
+    match mark_y {
+        Some(y) if y.is_finite() => [lo.min(y), hi.max(y)],
+        _ => [lo, hi],
+    }
+}
+
+/// Convert an integer-cent P&L figure to a plot `f64` in **dollars** for a chart
+/// reference line — a display-geometry conversion at the UI edge only (the accounting
+/// value stays integer cents). `Decimal → f64` (never an `as` cast); `None` when the
+/// value is not representable or non-finite, so a non-finite coordinate never reaches
+/// the chart.
+#[must_use]
+fn cents_to_plot_f64(cents: i64) -> Option<f64> {
+    let dollars = Decimal::from(cents).checked_div(Decimal::from(100))?;
+    dollars.to_f64().filter(|y| y.is_finite())
+}
+
+/// Format a signed integer-cent P&L as `+$1,234.56` / `−$0.15` — the single cents→`$`
+/// seam for the payoff-at-head header, integer arithmetic only (no `f64` money). The
+/// sign glyph carries the sign under `NO_COLOR`.
+#[must_use]
+fn fmt_signed_cents(cents: i64) -> String {
+    let sign = if cents < 0 { "−" } else { "+" };
+    let magnitude = cents.unsigned_abs();
+    let dollars = magnitude / 100;
+    let rem = magnitude % 100;
+    format!("{sign}${dollars}.{rem:02}")
+}
+
+/// Draw a deliberate centered two-line replay-payoff state (loading / flat /
+/// unavailable): a headline over an optional sub-note, so an empty panel reads as an
+/// intentional state, never a blank void (`docs/05-views-and-ux.md` §5, §6).
+fn draw_replay_center(frame: &mut Frame, inner: Rect, theme: Theme, headline: &str, sub: &str) {
+    let mut lines = vec![Line::from(Span::styled(
+        headline.to_owned(),
+        theme.accent(),
+    ))];
+    if !sub.is_empty() {
+        lines.push(Line::from(Span::styled(sub.to_owned(), theme.dim())));
+    }
+    let text = Text::from(lines);
+    let height = u16::try_from(text.height())
+        .unwrap_or(u16::MAX)
+        .min(inner.height);
+    let [centered] = Layout::vertical([Constraint::Length(height)])
+        .flex(Flex::Center)
+        .areas(inner);
+    frame.render_widget(Paragraph::new(text).alignment(Alignment::Center), centered);
+}
+
+/// Handle a replay-payoff-at-head key, returning any follow-on [`AppEvent`]
+/// (`docs/05-views-and-ux.md` §5). Pure over `&mut ReplayState` — no I/O, no pricing,
+/// no `.await`.
+///
+/// The chord resolves **through the single keybinding map**
+/// ([`resolve_replay`](crate::resolve_replay), `src/app/keymap.rs`) for the payoff
+/// screen's context, so the panel supports the same **scrub / jump / playback** keys
+/// as the equity screen (the recovery for the "flat at this step" state is scrubbing
+/// to an open step): the scrubs (`←`/`→`/`h`/`l`, `Home`/`End`) return an
+/// [`AppEvent::ReplaySeek`] and play/pause + speed (`Space`, `+`/`-`) an
+/// [`AppEvent::ReplayControl`]. The fill drill-down keys are not bound in this panel's
+/// context (there is no fill list), so they never resolve here; their arms stay for
+/// exhaustiveness.
+#[must_use]
+pub fn handle_key_replay(state: &mut ReplayState, key: KeyEvent) -> Option<AppEvent> {
+    let chord = KeyChord::from_event(key)?;
+    match resolve_replay(chord, state.screen)? {
+        ReplayAction::StepBack => Some(AppEvent::ReplaySeek(SeekTo::StepBy(-1))),
+        ReplayAction::StepForward => Some(AppEvent::ReplaySeek(SeekTo::StepBy(1))),
+        ReplayAction::JumpStart => Some(AppEvent::ReplaySeek(SeekTo::Step(0))),
+        // The cursor clamps `Step` to `end_step`, so `u32::MAX` lands on the last step.
+        ReplayAction::JumpEnd => Some(AppEvent::ReplaySeek(SeekTo::Step(u32::MAX))),
+        ReplayAction::PlayPause => Some(AppEvent::ReplayControl(ReplayControl::PlayPause)),
+        ReplayAction::SpeedSlower => Some(AppEvent::ReplayControl(ReplayControl::SpeedSlower)),
+        ReplayAction::SpeedFaster => Some(AppEvent::ReplayControl(ReplayControl::SpeedFaster)),
+        // No fill list on the payoff panel → the drill-down keys are not bound in its
+        // context and never resolve here; the arms keep the match exhaustive.
+        ReplayAction::PrevFill | ReplayAction::NextFill => None,
+    }
 }
 
 #[cfg(test)]
@@ -2127,6 +2389,318 @@ mod tests {
             match term.draw(|frame| draw(&state, &payoff, frame, area, theme)) {
                 Ok(_) => {}
                 Err(e) => prop_assert!(false, "payoff draw failed at {width}x{height}: {e}"),
+            }
+        }
+    }
+
+    // =====================================================================
+    // The replay payoff-at-head panel (#49): the states first, the curve, the
+    // draw-purity assertion, and render_never_panics over the replay states.
+    // =====================================================================
+    mod replay_head {
+        use std::collections::BTreeMap;
+        use std::path::PathBuf;
+
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use proptest::prelude::*;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::Rect;
+
+        use super::super::{draw_replay, handle_key_replay};
+        use crate::app::{ReplayScreen, ReplayState};
+        use crate::config::ThemeChoice;
+        use crate::event::{AppEvent, BundleLoadResult, ReplayControl, SeekTo};
+        use crate::replay::{
+            BundleManifest, EquityPoint, LoadedBundle, PositionRow, PositionSide, SUPPORTED_SCHEMA,
+        };
+        use crate::ui::graph::{GraphProjection, project};
+        use crate::ui::theme::Theme;
+
+        const BASE_TS: i64 = 1_700_000_000_000_000_000;
+        const EXP_NS: i64 = 1_735_286_400_000_000_000;
+
+        fn manifest() -> BundleManifest {
+            let mut row_counts = BTreeMap::new();
+            let _ = row_counts.insert("fills".to_owned(), 0u64);
+            let _ = row_counts.insert("equity_curve".to_owned(), 0u64);
+            let _ = row_counts.insert("positions".to_owned(), 0u64);
+            let _ = row_counts.insert("greeks_attribution".to_owned(), 0u64);
+            BundleManifest {
+                schema: SUPPORTED_SCHEMA.to_owned(),
+                run_id: "run-test".to_owned(),
+                created_utc: "2026-07-18T00:00:00Z".to_owned(),
+                code_version: "0.5.0".to_owned(),
+                lockfile_sha256: "deadbeef".to_owned(),
+                seed: 1,
+                config: serde_json::json!({ "capital_cents": 1_000_000 }),
+                strategy: serde_json::json!({}),
+                data_source: serde_json::json!({}),
+                metrics: serde_json::json!({}),
+                row_counts,
+            }
+        }
+
+        fn equity(step: u32) -> EquityPoint {
+            EquityPoint {
+                step,
+                ts_ns: BASE_TS + i64::from(step),
+                cash_cents: 1_000,
+                position_value_cents: 0,
+                equity_cents: 1_000,
+                drawdown: 0.0,
+            }
+        }
+
+        /// An open (non-terminal) `positions` row at `step` whose join key encodes
+        /// `strike_cents`/`style`, so the head build recovers them.
+        fn position(step: u32, strike_cents: u64, style: char, side: PositionSide) -> PositionRow {
+            PositionRow {
+                step,
+                ts_ns: BASE_TS + i64::from(step),
+                position_id: 1,
+                trade_id: 7,
+                contract_id: format!("v1:BTC:{EXP_NS}:{strike_cents}:{style}"),
+                side,
+                quantity: 1,
+                avg_price_cents: 12_500,
+                mark_cents: 11_800,
+                unrealized_cents: -700,
+                stale_mark: false,
+                exit_reason: None,
+                open_at_end: step == 2,
+            }
+        }
+
+        /// A `Ready` replay state over a 3-step run with the supplied position rows,
+        /// cursor seeked to the last step (the head), so the open set is resolved.
+        fn ready_state(positions: Vec<PositionRow>) -> ReplayState {
+            let bundle = LoadedBundle {
+                manifest: manifest(),
+                fills: Vec::new(),
+                equity: (0..3).map(equity).collect(),
+                positions,
+                greeks: Vec::new(),
+            };
+            let mut state = ReplayState::new(PathBuf::from("/bundle/valid"));
+            state.apply_load_result(BundleLoadResult::Loaded(Box::new(bundle)));
+            state.screen = ReplayScreen::Payoff;
+            let _ = state.seek(SeekTo::Step(u32::MAX));
+            state
+        }
+
+        /// Project the payoff-at-head series exactly as the ui view-cache would (off
+        /// the draw path) — the `&GraphProjection` the panel's `draw_replay` reads.
+        fn projection_of(state: &ReplayState) -> GraphProjection {
+            match state.loaded() {
+                Some(loaded) => project(loaded.payoff_graph()),
+                None => project(&optionstratlib::visualization::GraphData::Series(
+                    optionstratlib::visualization::Series2D::default(),
+                )),
+            }
+        }
+
+        #[track_caller]
+        fn render_to_text(state: &ReplayState, w: u16, h: u16) -> String {
+            let theme = Theme::resolve(ThemeChoice::Auto, false);
+            let payoff = projection_of(state);
+            let mut term = match Terminal::new(TestBackend::new(w, h)) {
+                Ok(t) => t,
+                Err(e) => panic!("TestBackend construction failed: {e}"),
+            };
+            let area = Rect::new(0, 0, w, h);
+            match term.draw(|frame| draw_replay(state, &payoff, frame, area, theme)) {
+                Ok(_) => {}
+                Err(e) => panic!("draw_replay failed at {w}x{h}: {e}"),
+            }
+            crate::ui::golden::buffer_to_text(term.backend().buffer())
+        }
+
+        // --- flat state: no open position at the head → "flat at this step" -----
+
+        #[test]
+        fn test_flat_state_when_no_open_position_at_head() {
+            let state = ready_state(Vec::new());
+            let text = render_to_text(&state, 80, 24);
+            assert!(
+                text.contains("flat at this step"),
+                "the empty state renders before any curve: {text:?}",
+            );
+            assert!(
+                text.contains("scrub to an open step"),
+                "the recovery is stated: {text:?}",
+            );
+        }
+
+        // --- an open position renders the expiration curve + mark + caveat ------
+
+        #[test]
+        fn test_open_position_renders_curve_header_and_honest_caveat() {
+            let state = ready_state(vec![
+                position(0, 6_000_000, 'C', PositionSide::Long),
+                position(1, 6_000_000, 'C', PositionSide::Long),
+                position(2, 6_000_000, 'C', PositionSide::Long),
+            ]);
+            let text = render_to_text(&state, 120, 40);
+            assert!(
+                text.contains("open 1 leg"),
+                "the leg count renders: {text:?}"
+            );
+            // The current mark-to-market P&L formats from integer cents: (11_800 −
+            // 12_500) × 1 long = −700c → −$7.00.
+            assert!(
+                text.contains("−$7.00"),
+                "the mark P&L renders from integer cents: {text:?}",
+            );
+            assert!(
+                text.contains("not a bit-exact reprice"),
+                "the honesty caveat is visible: {text:?}",
+            );
+        }
+
+        // --- draw purity: draw_replay builds no GraphData and prices nothing -----
+
+        #[test]
+        fn test_draw_replay_is_pure_builds_no_graphdata() {
+            let state = ready_state(vec![
+                position(0, 6_000_000, 'C', PositionSide::Long),
+                position(1, 6_000_000, 'C', PositionSide::Long),
+                position(2, 6_000_000, 'C', PositionSide::Long),
+            ]);
+            let (graph_before, rev_before) = match state.loaded() {
+                Some(loaded) => (loaded.payoff_graph().clone(), loaded.payoff_revision()),
+                None => panic!("expected a Ready state"),
+            };
+            let _ = render_to_text(&state, 120, 40);
+            let _ = render_to_text(&state, 40, 12); // a tight body, still pure
+            match state.loaded() {
+                Some(loaded) => {
+                    assert_eq!(
+                        loaded.payoff_graph(),
+                        &graph_before,
+                        "draw_replay built or mutated no GraphData",
+                    );
+                    assert_eq!(
+                        loaded.payoff_revision(),
+                        rev_before,
+                        "draw_replay reprojected nothing (no revision bump)",
+                    );
+                }
+                None => panic!("state stayed Ready"),
+            }
+        }
+
+        // --- a degenerate open set (zero strike) routes to the empty path --------
+
+        #[test]
+        fn test_degenerate_open_set_routes_to_unavailable_not_a_fabricated_curve() {
+            // A zero-strike leg collapses the price grid, so the expiration series is
+            // empty → the projection is Empty → the panel shows an honest state, never a
+            // fabricated line (the same route a NaN/Inf coordinate takes via the #23
+            // finite gate).
+            let state = ready_state(vec![
+                position(0, 0, 'C', PositionSide::Long),
+                position(1, 0, 'C', PositionSide::Long),
+                position(2, 0, 'C', PositionSide::Long),
+            ]);
+            assert!(
+                projection_of(&state).ready().is_none(),
+                "the degenerate open set projects Empty, never a fabricated curve",
+            );
+            let text = render_to_text(&state, 80, 24);
+            assert!(
+                text.contains("payoff unavailable at this step"),
+                "an unpriceable open set renders the honest unavailable state: {text:?}",
+            );
+        }
+
+        // --- loading state renders a deliberate note ----------------------------
+
+        #[test]
+        fn test_loading_state_renders_a_note() {
+            let mut state = ReplayState::new(PathBuf::from("/bundle/valid"));
+            state.screen = ReplayScreen::Payoff; // still Loading (no bundle folded)
+            let text = render_to_text(&state, 80, 24);
+            assert!(
+                text.contains("loading bundle"),
+                "the loading note renders while the bundle is not Ready: {text:?}",
+            );
+        }
+
+        // --- the payoff panel supports scrub / playback keys (recovery path) ----
+
+        #[test]
+        fn test_scrub_key_on_payoff_panel_emits_a_seek() {
+            // `AppEvent` is deliberately not `PartialEq` (it carries a `MarketUpdate`),
+            // so assert the returned event by shape via `matches!`.
+            let mut state = ready_state(vec![position(0, 6_000_000, 'C', PositionSide::Long)]);
+            let back =
+                handle_key_replay(&mut state, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+            assert!(
+                matches!(back, Some(AppEvent::ReplaySeek(SeekTo::StepBy(-1)))),
+                "`←` on the payoff panel scrubs back (the flat-state recovery)",
+            );
+            let play = handle_key_replay(
+                &mut state,
+                KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+            );
+            assert!(
+                matches!(
+                    play,
+                    Some(AppEvent::ReplayControl(ReplayControl::PlayPause))
+                ),
+                "`Space` on the payoff panel toggles playback",
+            );
+            // A drill-down key (`,`) is not bound on the payoff panel → no event.
+            let none = handle_key_replay(
+                &mut state,
+                KeyEvent::new(KeyCode::Char(','), KeyModifiers::NONE),
+            );
+            assert!(
+                none.is_none(),
+                "the fill drill-down key is inert on the payoff panel"
+            );
+        }
+
+        // --- render_never_panics over every replay payoff state -----------------
+
+        proptest! {
+            #![proptest_config(ProptestConfig { cases: 96, ..ProptestConfig::default() })]
+
+            /// The payoff-at-head panel draws into a `TestBackend` without panic across
+            /// its states (flat / open-curve / degenerate / loading) and any size
+            /// (`docs/TESTING.md` §3, `render_never_panics`).
+            #[test]
+            fn prop_draw_replay_never_panics(
+                state_idx in 0u8..4,
+                width in 1u16..160,
+                height in 1u16..60,
+            ) {
+                let state = match state_idx {
+                    0 => ready_state(Vec::new()), // flat
+                    1 => ready_state(vec![
+                        position(0, 6_000_000, 'C', PositionSide::Long),
+                        position(1, 6_000_000, 'C', PositionSide::Long),
+                        position(2, 6_000_000, 'C', PositionSide::Long),
+                    ]), // an open curve
+                    2 => ready_state(vec![position(2, 0, 'P', PositionSide::Short)]), // degenerate
+                    _ => {
+                        let mut s = ReplayState::new(PathBuf::from("/bundle/valid"));
+                        s.screen = ReplayScreen::Payoff;
+                        s // loading
+                    }
+                };
+                let theme = Theme::resolve(ThemeChoice::Auto, false);
+                let payoff = projection_of(&state);
+                let mut term = match Terminal::new(TestBackend::new(width, height)) {
+                    Ok(t) => t,
+                    Err(e) => { prop_assert!(false, "TestBackend failed: {e}"); return Ok(()); }
+                };
+                let area = Rect::new(0, 0, width, height);
+                match term.draw(|frame| draw_replay(&state, &payoff, frame, area, theme)) {
+                    Ok(_) => {}
+                    Err(e) => prop_assert!(false, "draw_replay failed at {width}x{height}: {e}"),
+                }
             }
         }
     }

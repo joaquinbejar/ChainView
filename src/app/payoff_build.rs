@@ -422,8 +422,13 @@ fn price_grid(legs: &[BuilderLeg], spot: Positive) -> Option<Vec<Positive>> {
 /// single `GraphData::Series`. A price point whose P&L cannot be computed is
 /// skipped (never fabricated), and the #23 adapter's finite gate is the final
 /// guard at the render edge.
+///
+/// `pub(crate)` so the replay payoff-at-head build (#49,
+/// `src/app/replay_payoff_build.rs`) samples the **same** `optionstratlib`
+/// `Profit`/`Payoff` expiration geometry — the single source of the curve math the
+/// live and replay payoffs share (they differ only in their data source).
 #[must_use]
-fn expiration_series(positions: &[Position], grid: &[Positive]) -> GraphData {
+pub(crate) fn expiration_series(positions: &[Position], grid: &[Positive]) -> GraphData {
     let mut xs = Vec::with_capacity(grid.len());
     let mut ys = Vec::with_capacity(grid.len());
     for price in grid {
@@ -486,8 +491,11 @@ fn tplus0_pnl(positions: &[Position], price: &Positive) -> Option<Decimal> {
 /// Read the break-even underlying prices off the expiration series' zero crossings
 /// (linear-interpolated), an `O(grid)` pass — never the `CustomStrategy` ctor scan.
 /// Returns an empty vector for a non-`Series` `GraphData` (exhaustive, no wildcard).
+///
+/// `pub(crate)` so the replay payoff-at-head build (#49) reads its break-evens off
+/// the **same** expiration-series sign-change scan the live payoff uses.
 #[must_use]
-fn break_even_points(expiration: &GraphData) -> Vec<Positive> {
+pub(crate) fn break_even_points(expiration: &GraphData) -> Vec<Positive> {
     let series = match expiration {
         GraphData::Series(series) => series,
         GraphData::MultiSeries(_) | GraphData::GraphSurface(_) => return Vec::new(),

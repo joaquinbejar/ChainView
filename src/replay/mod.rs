@@ -92,6 +92,10 @@ mod validate;
 // `crate::replay::Playback` is its canonical path.
 pub use timeline::{Playback, PlaybackSpeed, TimelineCursor};
 pub use validate::{BundleDivergence, ORACLE_ABS_TOL, ORACLE_REL_TOL, compare_bundles};
+// The `contract_id` parser is crate-internal: the replay payoff-at-head build (#49)
+// recovers a `positions` leg's strike/style/expiry from the join key, since
+// `positions.parquet` carries no structured strike/style columns.
+pub(crate) use validate::parse_contract_id;
 
 /// The versioned `contract_id` join-key format, fixed here as the single source
 /// of truth for the round-trip check the validation chain (#32) enforces.

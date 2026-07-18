@@ -273,11 +273,11 @@ fn test_replay_path_valid_fixture_end_to_end_renders_populated_screen() {
         "the fill price 12500c renders as $125.00: {text:?}"
     );
 
-    // Render-level two-screens evidence: the Payoff key is shown dimmed/parenthesized
-    // (unavailable), never a live body — no dead key.
+    // Render-level two-screens evidence: from v0.5 the Payoff slot is a LIVE number
+    // key (undimmed), reachable alongside the Replay screen (#49) — no dead key.
     assert!(
-        text.contains("(Payoff)"),
-        "the keybar shows the Payoff slot as unavailable (no dead key): {text:?}",
+        text.contains("2 Payoff") && !text.contains("(Payoff)"),
+        "the keybar shows the Payoff slot as a live, undimmed number key: {text:?}",
     );
 }
 
@@ -404,46 +404,54 @@ fn test_replay_bad_schema_renders_actionable_error_not_partial() {
 // =============================================================================
 
 #[test]
-fn test_replay_reaches_exactly_two_documented_screens_no_dead_payoff_key() {
-    // The reachability gate: v0.3 replay reaches only the Replay screen; the payoff
-    // panel is deferred to v0.5. This is a build/version gate, not a ProviderId or
-    // capability match (replay has no live provider).
+fn test_replay_reaches_both_documented_screens_payoff_live() {
+    // The reachability gate: from v0.5 replay reaches BOTH documented screens — the
+    // equity/attribution/drill-down screen and the payoff-at-head panel (#49). This is
+    // a build/version gate, not a ProviderId or capability match (replay has no live
+    // provider).
     assert!(
         is_replay_screen_reachable(ReplayScreen::Replay),
         "the equity/attribution/drill-down screen is reachable",
     );
     assert!(
-        !is_replay_screen_reachable(ReplayScreen::Payoff),
-        "the payoff screen is NOT reachable until v0.5",
+        is_replay_screen_reachable(ReplayScreen::Payoff),
+        "the payoff-at-head panel is reachable from v0.5 (#49)",
     );
 
     let (mut app, _rx) = replay_app_from_fixture("valid");
 
-    // The Payoff number-key slot (2) can NEVER switch to it — it is a consumed
-    // global that flashes the "v0.5" hint and leaves the Replay screen in place.
+    // The Payoff number-key slot (2) switches to it — a consumed global that lands on
+    // the reachable payoff screen.
     match app.dispatch_key_global(press('2')) {
         KeyRoute::Consumed => {}
         KeyRoute::ToScreen => panic!("a screen-switch number key is a consumed global"),
     }
     assert_eq!(
         replay_screen(&app),
+        ReplayScreen::Payoff,
+        "the Payoff slot switches to the now-reachable payoff panel",
+    );
+    // Slot 1 switches back to the Replay screen.
+    let _ = app.dispatch_key_global(press('1'));
+    assert_eq!(replay_screen(&app), ReplayScreen::Replay);
+
+    // Tab cycles across BOTH reachable screens (Replay ⇄ Payoff), so it does land on
+    // Payoff — no dead key.
+    let _ = app.dispatch_key_global(tab());
+    assert_eq!(
+        replay_screen(&app),
+        ReplayScreen::Payoff,
+        "Tab cycles onto the reachable Payoff screen",
+    );
+    let _ = app.dispatch_key_global(tab());
+    assert_eq!(
+        replay_screen(&app),
         ReplayScreen::Replay,
-        "the Payoff slot never switches to the unreachable screen",
+        "Tab cycles back to the Replay screen",
     );
 
-    // Tab / S-Tab cycle only reachable screens, so they can never land on Payoff.
-    for _ in 0..4 {
-        let _ = app.dispatch_key_global(tab());
-        assert_eq!(
-            replay_screen(&app),
-            ReplayScreen::Replay,
-            "Tab never cycles onto the unreachable Payoff screen",
-        );
-    }
-
-    // The render seam: with no transient hint showing, the keybar lists the Replay
-    // slot live and the Payoff slot dimmed/parenthesized (the no-dead-key visual),
-    // and the rendered BODY is the reachable Replay screen — never a payoff body.
+    // The render seam: the keybar lists BOTH slots live and undimmed (no "(Payoff)"
+    // dead-key parenthesis), and the rendered Replay body still renders.
     let (fresh, _rx2) = replay_app_from_fixture("valid");
     let text = render_replay_frame(&fresh);
     assert!(
@@ -451,12 +459,44 @@ fn test_replay_reaches_exactly_two_documented_screens_no_dead_payoff_key() {
         "the Replay slot is a live number key: {text:?}"
     );
     assert!(
-        text.contains("(Payoff)"),
-        "the Payoff slot renders dimmed/parenthesized (no dead key): {text:?}",
+        text.contains("2 Payoff"),
+        "the Payoff slot is a live number key, undimmed: {text:?}",
+    );
+    assert!(
+        !text.contains("(Payoff)"),
+        "the Payoff slot is no longer a dimmed/parenthesized dead key: {text:?}",
     );
     assert!(
         text.contains("P&L attribution"),
         "the reachable Replay body renders: {text:?}",
+    );
+}
+
+/// Render the replay **payoff-at-head** panel end-to-end: switch to the payoff screen,
+/// sync the view cache off the draw path, and render the whole frame — the panel shows
+/// its honest state (a payoff curve when a position is open at the head, else the "flat
+/// at this step" empty state) and never fabricates a curve.
+#[test]
+fn test_replay_payoff_at_head_renders_end_to_end() {
+    let (mut app, _rx) = replay_app_from_fixture("valid");
+    // Switch to the payoff panel and jump to the last step (the fixture's open set is
+    // deterministic there).
+    let _ = app.dispatch_key_global(press('2'));
+    assert_eq!(replay_screen(&app), ReplayScreen::Payoff);
+    app.on_event(AppEvent::ReplaySeek(SeekTo::Step(u32::MAX)));
+    let text = render_replay_frame(&app);
+    // The panel title renders, and the honest caveat is present whenever a curve shows;
+    // either an open-position curve or the deliberate flat state is rendered — never a
+    // blank or a panic.
+    assert!(
+        text.contains("Payoff"),
+        "the payoff-at-head panel renders its title: {text:?}",
+    );
+    assert!(
+        text.contains("flat at this step")
+            || text.contains("not a bit-exact reprice")
+            || text.contains("payoff unavailable"),
+        "the panel renders an honest state (curve caveat or flat/unavailable): {text:?}",
     );
 }
 

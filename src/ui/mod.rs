@@ -32,10 +32,7 @@
 //! functions here are honest placeholders (a titled block), never fabricated data.
 
 use ratatui::Frame;
-use ratatui::layout::{Alignment, Constraint, Flex, Layout, Rect};
-use ratatui::style::{Modifier, Style};
-use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Paragraph};
+use ratatui::layout::{Constraint, Flex, Layout, Rect};
 
 use crate::app::{App, LiveScreen, Mode, ReplayScreen};
 use crate::ui::theme::Theme;
@@ -162,7 +159,12 @@ pub fn render(app: &App, view: &ViewState, frame: &mut Frame) {
                 theme,
                 app.tick_count,
             ),
-            ReplayScreen::Payoff => payoff::draw_replay(state, frame, root.body),
+            // The replay payoff-at-head reads only the cached projection the view
+            // synced off the draw path — this paint builds no `GraphData` and prices
+            // nothing (#49). All `Copy`/borrowed, so the draw stays pure.
+            ReplayScreen::Payoff => {
+                payoff::draw_replay(state, view.replay_payoff(), frame, root.body, theme)
+            }
         },
     }
     theme::draw_hint(app, frame, root.hint, theme);
@@ -172,27 +174,8 @@ pub fn render(app: &App, view: &ViewState, frame: &mut Frame) {
 }
 
 // ---------------------------------------------------------------------------
-// Shared placeholder body + centered-rect helper.
+// Shared centered-rect helper.
 // ---------------------------------------------------------------------------
-
-/// Render an honest placeholder screen body: a titled bordered block with a
-/// dimmed "coming soon" note (`docs/05-views-and-ux.md` §2.1). The real bodies —
-/// the chain matrix (#18), depth (v0.5), surface/payoff (v0.2), replay (v0.3) —
-/// replace these; a placeholder never fabricates market data.
-pub(crate) fn placeholder_body(frame: &mut Frame, area: Rect, title: &str, note: &str) {
-    let block = Block::bordered().title(title.to_owned());
-    let text = Text::from(vec![
-        Line::from(""),
-        Line::from(Span::styled(
-            note.to_owned(),
-            Style::new().add_modifier(Modifier::DIM),
-        )),
-    ]);
-    let paragraph = Paragraph::new(text)
-        .block(block)
-        .alignment(Alignment::Center);
-    frame.render_widget(paragraph, area);
-}
 
 /// A `width`×`height` rectangle centered in `area`, clamped to `area` so it never
 /// escapes its bounds. Uses [`Flex::Center`] so there is no manual geometry

@@ -36,6 +36,8 @@ pub struct ViewState {
     surface: SurfaceViewCache,
     /// The replay equity-curve projection cache (#35).
     replay: ReplayView,
+    /// The replay payoff-at-head projection cache (#49).
+    replay_payoff: ReplayPayoffView,
 }
 
 impl Default for ViewState {
@@ -54,6 +56,7 @@ impl ViewState {
             payoff: PayoffView::new(),
             surface: SurfaceViewCache::new(),
             replay: ReplayView::new(),
+            replay_payoff: ReplayPayoffView::new(),
         }
     }
 
@@ -80,12 +83,21 @@ impl ViewState {
                 });
             }
             Mode::Replay(replay) => match replay.loaded() {
-                Some(loaded) => self
-                    .replay
-                    .sync(loaded.equity_revision(), || loaded.equity_graph().clone()),
-                // Loading / failed: no equity to show — reset so the next `Ready`
-                // (a fresh bundle whose revision restarts at 0) always re-projects.
-                None => self.replay.reset(),
+                Some(loaded) => {
+                    self.replay
+                        .sync(loaded.equity_revision(), || loaded.equity_graph().clone());
+                    // The payoff-at-head series — re-project only when the open set at
+                    // the head actually changed (#49), keyed on the payoff revision.
+                    self.replay_payoff
+                        .sync(loaded.payoff_revision(), || loaded.payoff_graph().clone());
+                }
+                // Loading / failed: no equity/payoff to show — reset both so the next
+                // `Ready` (a fresh bundle whose revisions restart at 0) always
+                // re-projects.
+                None => {
+                    self.replay.reset();
+                    self.replay_payoff.reset();
+                }
             },
         }
     }
@@ -111,6 +123,15 @@ impl ViewState {
     #[must_use]
     pub fn replay(&self) -> &GraphProjection {
         self.replay.cache.projection()
+    }
+
+    /// The cached replay payoff-at-head [`GraphProjection`] — the only geometry the
+    /// replay payoff screen's `draw` reads (a borrow), so the paint builds no
+    /// `GraphData` (#49). It is a `Ready` expiration series (an open position at the
+    /// head) or an `Empty` (the "flat at this step" state).
+    #[must_use]
+    pub fn replay_payoff(&self) -> &GraphProjection {
+        self.replay_payoff.cache.projection()
     }
 }
 
@@ -217,6 +238,50 @@ impl ReplayView {
     /// Reset to the empty projection when there is no loaded bundle (loading /
     /// failed), so a fresh bundle whose revision restarts at `0` always re-projects.
     /// Idempotent — only touches the cache when it was projecting something.
+    fn reset(&mut self) {
+        if self.projected_for.is_some() {
+            self.cache.update(GraphData::Series(Series2D::default()));
+            self.projected_for = None;
+        }
+    }
+}
+
+/// The replay payoff-at-head projection cache (#49): the [`GraphCache`] plus the
+/// [`payoff_revision`](crate::app::LoadedReplay::payoff_revision) it was last projected
+/// for, so a re-project fires only when the open set at the head actually moved (a
+/// scrub / playback tick that changed which legs are open).
+#[derive(Debug, Clone)]
+struct ReplayPayoffView {
+    /// The projected payoff-at-head series (the #23 cache, projected off the draw path).
+    cache: GraphCache,
+    /// The bundle's payoff revision the cache was projected for, or `None` before the
+    /// first sync / after a reset to a loading/failed bundle.
+    projected_for: Option<u64>,
+}
+
+impl ReplayPayoffView {
+    /// A payoff view seeded with an empty series → `Empty(NoData)` → the "flat at this
+    /// step" empty state on the first frame.
+    fn new() -> Self {
+        Self {
+            cache: GraphCache::new(GraphData::Series(Series2D::default())),
+            projected_for: None,
+        }
+    }
+
+    /// Re-project the payoff-at-head series when `revision` differs from the last
+    /// projected one, pulling the fresh `GraphData` from `source` (a closure so the
+    /// clone happens only on a change). Off the draw path.
+    fn sync(&mut self, revision: u64, source: impl FnOnce() -> GraphData) {
+        if self.projected_for != Some(revision) {
+            self.cache.update(source());
+            self.projected_for = Some(revision);
+        }
+    }
+
+    /// Reset to the empty projection when there is no loaded bundle (loading /
+    /// failed), so a fresh bundle whose revision restarts at `0` always re-projects.
+    /// Idempotent.
     fn reset(&mut self) {
         if self.projected_for.is_some() {
             self.cache.update(GraphData::Series(Series2D::default()));
