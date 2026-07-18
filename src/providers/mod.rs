@@ -98,6 +98,17 @@ pub(crate) mod dxfeed_decode;
 #[cfg(feature = "tastytrade")]
 pub(crate) mod tastytrade;
 
+/// The Alpaca adapter — the composed, completeness-provable poll->stream provider
+/// (issue #41, `docs/03-data-providers.md` §7.5). Behind the DISABLED-by-default
+/// `alpaca` Cargo feature and **excluded from `with_builtins()`**: like tastytrade
+/// it is reachable only through the explicit `with_gated_builtin(id)` opt-in, which
+/// fails with a typed startup error while the gate holds
+/// (`docs/SECURITY.md` §2.4). Crate-internal: no raw `alpaca-http` /
+/// `alpaca-websocket` DTO crosses the port — every upstream struct is normalized to
+/// the domain model inside this module.
+#[cfg(feature = "alpaca")]
+pub(crate) mod alpaca;
+
 /// The seam every adapter implements: one trait, one adapter per provider id
 /// (`docs/03-data-providers.md` §2).
 ///

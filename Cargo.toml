@@ -34,6 +34,15 @@ bench = []
 # does not compile the adapter or pull the `tastytrade` crate at all. `dep:` keeps
 # the optional crate from implicitly defining a same-named feature.
 tastytrade = ["dep:tastytrade"]
+# `alpaca` gates the whole Alpaca adapter (`src/providers/alpaca.rs`, issue #41).
+# It is DISABLED by default and stays off the shippable set: like tastytrade, the
+# adapter is excluded from `with_builtins()` and reachable only via the explicit
+# `with_gated_builtin(id)` opt-in, which fails with a typed startup error while the
+# gate holds (docs/SECURITY.md §2.4). A normal `cargo build` (no `--features
+# alpaca`) does not compile the adapter or pull the `alpaca-http` /
+# `alpaca-websocket` crates at all. `dep:` keeps the optional crates from
+# implicitly defining same-named features.
+alpaca = ["dep:alpaca-http", "dep:alpaca-websocket", "dep:futures-util"]
 
 [lib]
 name = "chainview"
@@ -124,7 +133,7 @@ deribit-websocket = "0.3.1"
 # docs/SECURITY.md §2). Wraps tastytrade's REST option-chain + its bundled dxfeed
 # streaming binding; ChainView never reimplements the protocol (CLAUDE.md "Key
 # Decisions"). Explicit-approval addition (CLAUDE.md "Coding Rules") — ADR-0007
-# audit note in CHANGELOG (`cargo audit` + `cargo deny check --all-features`).
+# audit note in CHANGELOG (`cargo audit` + `cargo deny check` (deny.toml pins `all-features = true`)).
 # Auth is injected programmatically: `TastyTradeConfig` has all-public fields, so
 # the adapter builds it from ChainView-namespaced `CHAINVIEW_TASTYTRADE_*` env
 # vars and calls `TastyTrade::login(&config)` WITHOUT the crate's `from_env()`
@@ -135,6 +144,36 @@ deribit-websocket = "0.3.1"
 # `pretty-simple-display`, and (transitively) `dotenv`/`tracing-subscriber` — the
 # latter two are never exercised because the adapter never calls `from_env`.
 tastytrade = { version = "0.3", optional = true }
+# The Alpaca REST + WebSocket clients (issue #41, the composed poll->stream
+# provider — `docs/03-data-providers.md` §7.5). OPTIONAL and behind the
+# DISABLED-by-default `alpaca` feature: a normal build never pulls them, and the
+# adapter is reachable only via `with_gated_builtin` (which fails while the gate
+# holds, docs/SECURITY.md §2.4). `alpaca-http` wraps the venue REST (option
+# contracts + snapshots); `alpaca-websocket` wraps the underlying Trade/Quote/Bar
+# stream — ChainView never reimplements a protocol (CLAUDE.md "Key Decisions").
+# Explicit-approval addition (CLAUDE.md "Coding Rules") — ADR-0007 audit note in
+# CHANGELOG (`cargo audit` + `cargo deny check` (deny.toml pins `all-features = true`)).
+# Auth is injected programmatically: both clients construct from
+# `alpaca_base::Credentials::new(key, secret)` + `Environment::{Paper,Live}`, so
+# the adapter builds them from ChainView-namespaced `CHAINVIEW_ALPACA_*` env vars
+# and NEVER calls the crates' `from_env()` (which would read the foreign
+# `ALPACA_*` namespace and load a `.env` via `dotenv`). No global tracing
+# subscriber is installed on construction (`init_logger` is opt-in and untouched)
+# — verified against the 0.21.2 / 0.6.0 checkout.
+# Supply-chain delta (feature-on only): pulls `reqwest` (+ default TLS),
+# `tokio-tungstenite` (rustls-tls-webpki-roots), `rustls` (ring provider,
+# installed once by the crate's own `init_crypto_provider`), `futures-util`,
+# `url`, `serde_urlencoded`, `urlencoding`, `uuid`, and (transitively, never
+# exercised) `dotenv` + `tracing-subscriber`.
+alpaca-http = { version = "0.21.2", optional = true }
+alpaca-websocket = { version = "0.6.0", optional = true }
+# The Alpaca `MarketDataStream` is consumed through the `futures_core::Stream`
+# trait it implements, so `StreamExt::next` is needed to drain it into the bounded
+# bridge (issue #41). OPTIONAL, behind the `alpaca` feature only. It already rides
+# the `alpaca-websocket` tree, so a feature-on build pulls no crate that was not
+# already present; `default-features = false` keeps only the async/stream adapters.
+# Explicit-approval addition (CLAUDE.md "Coding Rules") — audit note in CHANGELOG.
+futures-util = { version = "0.3", default-features = false, optional = true }
 # The Parquet reader for the IronCondor result bundle (issue #30, ADR-0010,
 # `docs/04-replay-mode.md` §2/§3). The bundle's four tables are Parquet; the
 # reader decodes them batch-by-batch under measured resource ceilings. ChainView

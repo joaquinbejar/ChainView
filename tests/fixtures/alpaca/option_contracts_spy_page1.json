@@ -1,0 +1,69 @@
+{
+  "option_contracts": [
+    {
+      "id": "11111111-1111-4111-8111-111111111111",
+      "symbol": "SPY260320C00500000",
+      "name": "SPY Mar 20 2026 500 Call",
+      "status": "active",
+      "tradable": true,
+      "expiration_date": "2026-03-20",
+      "strike_price": "500",
+      "type": "call",
+      "style": "american",
+      "underlying_symbol": "SPY",
+      "underlying_asset_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      "root_symbol": "SPY",
+      "open_interest": "1200",
+      "size": "100"
+    },
+    {
+      "id": "22222222-2222-4222-8222-222222222222",
+      "symbol": "SPY260320P00500000",
+      "name": "SPY Mar 20 2026 500 Put",
+      "status": "active",
+      "tradable": true,
+      "expiration_date": "2026-03-20",
+      "strike_price": "500",
+      "type": "put",
+      "style": "american",
+      "underlying_symbol": "SPY",
+      "underlying_asset_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      "root_symbol": "SPY",
+      "open_interest": "900",
+      "size": "100"
+    },
+    {
+      "id": "33333333-3333-4333-8333-333333333333",
+      "symbol": "SPY260320C00510000",
+      "name": "SPY Mar 20 2026 510 Call",
+      "status": "active",
+      "tradable": true,
+      "expiration_date": "2026-03-20",
+      "strike_price": "510",
+      "type": "call",
+      "style": "american",
+      "underlying_symbol": "SPY",
+      "underlying_asset_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      "root_symbol": "SPY",
+      "open_interest": "640",
+      "size": "100"
+    },
+    {
+      "id": "44444444-4444-4444-8444-444444444444",
+      "symbol": "SPY260320P00510000",
+      "name": "SPY Mar 20 2026 510 Put",
+      "status": "active",
+      "tradable": true,
+      "expiration_date": "2026-03-20",
+      "strike_price": "510",
+      "type": "put",
+      "style": "american",
+      "underlying_symbol": "SPY",
+      "underlying_asset_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      "root_symbol": "SPY",
+      "open_interest": "710",
+      "size": "100"
+    }
+  ],
+  "next_page_token": "page2"
+}

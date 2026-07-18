@@ -1,0 +1,124 @@
+{
+  "snapshots": {
+    "SPY260320C00500000": {
+      "latestQuote": {
+        "t": "2026-03-19T14:59:00Z",
+        "bp": 12.10,
+        "bs": 18,
+        "ap": 12.35,
+        "as": 22,
+        "bx": "C",
+        "ax": "C"
+      },
+      "latestTrade": {
+        "t": "2026-03-19T14:58:30Z",
+        "p": 12.20,
+        "s": 3,
+        "x": "C"
+      },
+      "greeks": {
+        "delta": 0.55,
+        "gamma": 0.012,
+        "theta": -0.08,
+        "vega": 0.19,
+        "rho": 0.06
+      },
+      "impliedVolatility": 0.2841
+    },
+    "SPY260320P00500000": {
+      "latestQuote": {
+        "t": "2026-03-19T14:59:00Z",
+        "bp": 9.80,
+        "bs": 12,
+        "ap": 10.05,
+        "as": 15,
+        "bx": "C",
+        "ax": "C"
+      },
+      "greeks": {
+        "delta": -0.45,
+        "gamma": 0.012,
+        "theta": -0.07,
+        "vega": 0.19,
+        "rho": -0.05
+      },
+      "impliedVolatility": 0.2795
+    },
+    "SPY260320C00510000": {
+      "latestQuote": {
+        "t": "2026-03-19T14:59:00Z",
+        "bp": 6.40,
+        "bs": 9,
+        "ap": 6.65,
+        "as": 11,
+        "bx": "C",
+        "ax": "C"
+      },
+      "greeks": {
+        "delta": 0.42,
+        "gamma": 0.014,
+        "theta": -0.09,
+        "vega": 0.21,
+        "rho": 0.05
+      },
+      "impliedVolatility": 0.2712
+    },
+    "SPY260320P00510000": {
+      "latestQuote": {
+        "t": "2026-03-19T14:59:00Z",
+        "bp": 13.90,
+        "bs": 7,
+        "ap": 14.20,
+        "as": 10,
+        "bx": "C",
+        "ax": "C"
+      },
+      "greeks": {
+        "delta": -0.58,
+        "gamma": 0.014,
+        "theta": -0.06,
+        "vega": 0.21,
+        "rho": -0.07
+      },
+      "impliedVolatility": 0.2688
+    },
+    "SPY260320C00520000": {
+      "latestQuote": {
+        "t": "2026-03-19T14:59:00Z",
+        "bp": 3.05,
+        "bs": 14,
+        "ap": 3.25,
+        "as": 19,
+        "bx": "C",
+        "ax": "C"
+      },
+      "greeks": {
+        "delta": 0.30,
+        "gamma": 0.015,
+        "theta": -0.10,
+        "vega": 0.20,
+        "rho": 0.04
+      },
+      "impliedVolatility": 0.2640
+    },
+    "SPY260320P00520000": {
+      "latestQuote": {
+        "t": "2026-03-19T14:59:00Z",
+        "bp": 20.40,
+        "bs": 5,
+        "ap": 20.85,
+        "as": 8,
+        "bx": "C",
+        "ax": "C"
+      },
+      "greeks": {
+        "delta": -0.70,
+        "gamma": 0.015,
+        "theta": -0.05,
+        "vega": 0.20,
+        "rho": -0.09
+      },
+      "impliedVolatility": 0.2601
+    }
+  }
+}
