@@ -564,7 +564,10 @@ impl App {
             Mode::Live(live) => match live_screen_for_slot(slot) {
                 Some(screen) if live.screen == screen => SwitchOutcome::NoChange,
                 Some(screen) if live.screen_reachable(screen) => {
-                    live.screen = screen;
+                    // Route through `enter_screen` so entering the Surface screen pays
+                    // any deferred (off-screen) geometry rebuild once, off the draw
+                    // path (#106).
+                    live.enter_screen(screen);
                     SwitchOutcome::Switched
                 }
                 Some(screen) => SwitchOutcome::Unavailable(format!(
@@ -603,7 +606,10 @@ impl App {
                     .collect();
                 match next_in_cycle(&reachable, live.screen, forward) {
                     Some(next) if next != live.screen => {
-                        live.screen = next;
+                        // Route through `enter_screen` so a `Tab` into the Surface
+                        // screen pays any deferred off-screen geometry rebuild once,
+                        // off the draw path (#106).
+                        live.enter_screen(next);
                         true
                     }
                     _ => false,
@@ -850,10 +856,25 @@ impl LiveState {
     #[must_use = "the returned bool reports whether the screen switch was applied"]
     pub fn set_screen(&mut self, screen: LiveScreen) -> bool {
         if self.screen_reachable(screen) {
-            self.screen = screen;
+            self.enter_screen(screen);
             true
         } else {
             false
+        }
+    }
+
+    /// Set the active screen to `screen` (assumed reachable) and run its screen-entry
+    /// side effect off the draw path. Entering the **Surface** screen pays the deferred
+    /// geometry rebuild if a market fold marked it dirty while hidden (#106), so the
+    /// fan-in path never rebuilt an invisible panel and the cost lands lazily, once, on
+    /// the switch — the draw stays pure. The single seam every screen-switch path
+    /// (number keys, `Tab`, [`set_screen`](Self::set_screen)) routes through, so the
+    /// lazy rebuild can never be skipped.
+    pub(crate) fn enter_screen(&mut self, screen: LiveScreen) {
+        self.screen = screen;
+        if screen == LiveScreen::Surface {
+            let LiveState { store, surface, .. } = self;
+            surface.rebuild_if_dirty(store);
         }
     }
 
@@ -887,6 +908,29 @@ impl LiveState {
             .trades_tape(source.trades_tape || overlay.trades_tape)
             .auth(source.auth)
             .build()
+    }
+
+    /// The stream health a screen that consumes BOTH the chain source and any bound
+    /// quote/Greek overlay must reflect (#118). The Surface screen's smile / curve /
+    /// surface geometry reads Greeks/IV that a **standalone overlay** (e.g. dxlink over
+    /// another provider's chain) may supply, so it degrades when EITHER contributor is
+    /// not [`StreamHealth::Live`]: a stale overlay must dim + badge the surface even
+    /// while the chain source is live — never a bright, trusted-looking curve over a
+    /// stale feed.
+    ///
+    /// Returns the source health while both sides are live, else the first non-live
+    /// contributor (the source preferred when both degraded), so the caller reads one
+    /// `&StreamHealth` for both the stale-dim decision and the title badge. When no
+    /// overlay is bound this is just the source health.
+    #[must_use]
+    pub fn overlay_aware_health(&self) -> &StreamHealth {
+        if !matches!(self.source.health, StreamHealth::Live) {
+            return &self.source.health;
+        }
+        match self.overlay.as_ref() {
+            Some(overlay) if !matches!(overlay.health, StreamHealth::Live) => &overlay.health,
+            _ => &self.source.health,
+        }
     }
 
     /// Fold one market update into the appropriate store, returning whether the fold
@@ -979,13 +1023,20 @@ impl LiveState {
         })
     }
 
-    /// Rebuild the Surface panel's active geometry against the current store snapshot
-    /// (the smile / Greek curve / surface for the active view + axis) — off the draw
-    /// path, on a data-changing market fold. Disjoint field borrows (`store` read,
+    /// Reconcile the Surface panel with a data-changing market fold, off the draw path
+    /// (#47, #106). When the Surface screen is **active** the geometry is rebuilt now
+    /// (the smile / Greek curve / surface for the active view + axis); when it is
+    /// **hidden** the panel is only marked dirty — the fan-in never rebuilds an
+    /// invisible panel, and the deferred rebuild is paid once on switch-to-surface
+    /// ([`enter_screen`](Self::enter_screen)). Disjoint field borrows (`store` read,
     /// `surface` mutated) so no clone and no I/O.
     fn refresh_surface(&mut self) {
-        let LiveState { store, surface, .. } = self;
-        surface.refresh(store);
+        if self.screen == LiveScreen::Surface {
+            let LiveState { store, surface, .. } = self;
+            surface.refresh(store);
+        } else {
+            self.surface.mark_dirty();
+        }
     }
 
     /// Re-price the committed strategy's t+0 curve against the current store
@@ -2001,6 +2052,12 @@ pub struct SurfacePanel {
     /// The projection-cache invalidation revision the ui view cache diffs (bumped only
     /// when [`active`](Self::active) actually changes).
     graph_revision: u64,
+    /// Whether a market fold changed the chain **while the Surface screen was hidden**,
+    /// so the cached geometry is stale relative to the store (#106). Set by
+    /// [`mark_dirty`](Self::mark_dirty) on an off-screen fold and cleared by the next
+    /// [`rebuild`](Self::rebuild); the fan-in never rebuilds an invisible panel — the
+    /// switch-to-surface handler pays the cost once via [`rebuild_if_dirty`](Self::rebuild_if_dirty).
+    dirty: bool,
 }
 
 impl SurfacePanel {
@@ -2019,6 +2076,7 @@ impl SurfacePanel {
             active,
             revision: 0,
             graph_revision: 0,
+            dirty: false,
         }
     }
 
@@ -2072,21 +2130,40 @@ impl SurfacePanel {
     }
 
     /// Rebuild the active geometry against the current `store` snapshot on a
-    /// data-changing market fold (off the draw path). Bumps the graph revision only
-    /// when the geometry moved.
+    /// data-changing market fold **while the Surface screen is active** (off the draw
+    /// path). Bumps the graph revision only when the geometry moved.
     pub(crate) fn refresh(&mut self, store: &ChainStore) {
         self.rebuild(store);
     }
 
+    /// Mark the cached geometry stale because the chain changed **while the Surface
+    /// screen was hidden** (#106) — a cheap flag set on the fan-in path instead of a
+    /// full geometry rebuild for an invisible panel. The rebuild is deferred to the
+    /// switch-to-surface handler ([`rebuild_if_dirty`](Self::rebuild_if_dirty)).
+    pub(crate) fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
+    /// Rebuild the cached geometry **iff** an off-screen fold marked it dirty (#106) —
+    /// run by the switch-to-surface handler so entering the Surface screen pays the
+    /// deferred rebuild once, lazily, off the draw path. A no-op when already current.
+    pub(crate) fn rebuild_if_dirty(&mut self, store: &ChainStore) {
+        if self.dirty {
+            self.rebuild(store);
+        }
+    }
+
     /// Rebuild `active` from the current `(view, axis, store)` and bump the graph
     /// revision only when it changed, so the view cache re-projects only on a real
-    /// geometry change (the #27/#35 cache discipline).
+    /// geometry change (the #27/#35 cache discipline). Clears the dirty flag — the
+    /// cached geometry is now current with the store.
     fn rebuild(&mut self, store: &ChainStore) {
         let next = build_active(self.view, self.axis, store);
         if next != self.active {
             self.active = next;
             self.bump_graph();
         }
+        self.dirty = false;
     }
 
     /// Advance the redraw revision, wrapping to `0` on the (practically unreachable)
@@ -2373,6 +2450,13 @@ pub struct LoadedReplay {
     /// The drilled-into fill, or `None` before any drill-down / after the selected
     /// fill scrubs out of the as-of window (`,` / `.` step it, #35).
     pub selection: Option<Fill>,
+    /// The cached index of [`selection`](Self::selection) within the as-of fills tape
+    /// (oldest → newest), or `None` when nothing is selected (#118). Maintained **off
+    /// the draw path** in lock-step with the selection — set by [`step_fill`](Self::step_fill)
+    /// and recomputed by [`reclamp_selection`](Self::reclamp_selection) on a cursor move
+    /// — so the fills-list draw resolves the scroll anchor in O(1) instead of rescanning
+    /// the whole visible tape every frame.
+    selected_ix: Option<usize>,
     /// The off-draw equity geometry (the step → equity **cents** series up to the head
     /// plus the exact peak drawdown), seeded from the run's opening capital and
     /// maintained incrementally on a forward cursor move / rebuilt on a backward seek
@@ -2459,6 +2543,7 @@ impl LoadedReplay {
             bundle,
             cursor,
             selection: None,
+            selected_ix: None,
             geometry,
             equity_revision: 0,
             payoff_graph,
@@ -2520,6 +2605,15 @@ impl LoadedReplay {
         self.selection.as_ref().map(fill_key)
     }
 
+    /// The cached index of the drill-down selection within the as-of fills tape
+    /// (oldest → newest), or `None` when nothing is selected (#118). Resolved off the
+    /// draw path (on selection step / cursor move) so the fills-list draw reads its
+    /// scroll anchor in O(1) instead of rescanning the whole visible tape per frame.
+    #[must_use]
+    pub fn selected_fill_index(&self) -> Option<usize> {
+        self.selected_ix
+    }
+
     /// Rebuild the cached equity + payoff geometry and re-clamp the drill-down
     /// selection after the cursor moved — the single off-draw refresh both
     /// [`ReplayState::seek`] and [`ReplayState::advance_playback`] run (#35, #49).
@@ -2558,20 +2652,29 @@ impl LoadedReplay {
 
     /// Drop the drill-down selection when its fill is no longer visible at the head
     /// (the head scrubbed back past it) — "the selection follows the visible fills at
-    /// the cursor" (#35). A no-op when nothing is selected or the fill is still in the
-    /// as-of window.
+    /// the cursor" (#35) — and otherwise refresh the cached selection index against the
+    /// new as-of tape (#118). A no-op when nothing is selected. The position scan runs
+    /// **here**, off the draw path on a cursor move, so the fills-list draw never
+    /// rescans the tape per frame.
     fn reclamp_selection(&mut self) {
         let key = match &self.selection {
             Some(fill) => fill_key(fill),
-            None => return,
+            None => {
+                self.selected_ix = None;
+                return;
+            }
         };
-        let present = self
+        match self
             .cursor
             .visible_fills(&self.bundle)
             .iter()
-            .any(|fill| fill_key(fill) == key);
-        if !present {
-            self.selection = None;
+            .position(|fill| fill_key(fill) == key)
+        {
+            Some(ix) => self.selected_ix = Some(ix),
+            None => {
+                self.selection = None;
+                self.selected_ix = None;
+            }
         }
     }
 
@@ -2582,11 +2685,11 @@ impl LoadedReplay {
     /// the selection (the deliberate empty state). Index arithmetic is checked — no
     /// unchecked index, no `saturating_*`.
     fn step_fill(&mut self, forward: bool) -> bool {
-        let next = {
+        let (next, next_ix) = {
             let visible = self.cursor.visible_fills(&self.bundle);
             match visible.len().checked_sub(1) {
                 // Empty fills list: clear any stale selection.
-                None => None,
+                None => (None, None),
                 Some(last) => {
                     let current = self.selection.as_ref().and_then(|fill| {
                         let key = fill_key(fill);
@@ -2601,13 +2704,17 @@ impl LoadedReplay {
                         (Some(0), false) => 0,
                         (Some(i), false) => i - 1,
                     };
-                    visible.get(idx).cloned()
+                    (visible.get(idx).cloned(), Some(idx))
                 }
             }
         };
         if selection_key(self.selection.as_ref()) == selection_key(next.as_ref()) {
             return false;
         }
+        // Cache the resolved index in lock-step with the selection (#118): `next_ix` is
+        // `Some(idx)` exactly when `next` is `Some(fill)`, so the fills-list draw reads
+        // its scroll anchor without a per-frame position scan.
+        self.selected_ix = next.as_ref().and(next_ix);
         self.selection = next;
         true
     }
@@ -3648,6 +3755,129 @@ mod tests {
             live(&app).depth_store.len(),
             1,
             "the ladder was still folded into the store (the store path exists)",
+        );
+    }
+
+    /// A chain at realistic BTC premiums over `strikes` (IV 0.5), so the vol smile
+    /// builds real geometry whose shape depends on the strike ladder — a different
+    /// strike set yields a different smile (a different x-domain / point count),
+    /// regardless of any local IV recompute. The fixture for the deferred-surface-
+    /// rebuild test (#106).
+    fn surface_store_strikes(strikes: &[f64]) -> ChainStore {
+        let mut chain = OptionChain::new("BTC", pos(60_000.0), "2025-06-27".to_owned(), None, None);
+        for &strike in strikes {
+            let mut od = OptionData {
+                strike_price: pos(strike),
+                call_bid: Some(pos(3_000.0)),
+                call_ask: Some(pos(3_100.0)),
+                put_bid: Some(pos(2_000.0)),
+                put_ask: Some(pos(2_100.0)),
+                implied_volatility: pos(0.5),
+                ..Default::default()
+            };
+            od.set_mid_prices();
+            let _ = chain.options.insert(od);
+        }
+        ChainStore::seed(
+            ChainFetch::new(
+                chain,
+                ExpirySource::new("BTC", utc(EXP), pid("deribit")),
+                AliasCatalog::new(),
+            ),
+            ChainSource::Merged,
+            refresh(),
+            utc(EXP),
+        )
+    }
+
+    #[test]
+    fn test_hidden_surface_fold_defers_rebuild_until_switch_to_surface() {
+        // #106: a market fold while the Surface screen is HIDDEN must NOT rebuild the
+        // full surface geometry (fan-in work for an invisible panel) — it only marks the
+        // panel dirty. Switching TO the Surface pays the deferred rebuild once, off the
+        // draw path; determinism + the revision pattern are preserved and draw stays
+        // pure.
+        let mut live = LiveState::new(
+            source_binding("deribit", full_caps()),
+            surface_store_strikes(&[60_000.0, 62_000.0, 64_000.0]),
+        );
+        // Seeded on the default Chain screen: the Surface panel is hidden and clean.
+        assert_eq!(live.screen, LiveScreen::Chain);
+        assert!(!live.surface.dirty, "the seeded panel is clean");
+        let rev0 = live.surface.graph_revision();
+
+        // The store changes (a poll re-lists the strike ladder) while the Surface is
+        // hidden. The geometry WOULD move (a different smile), but the rebuild is
+        // DEFERRED — only the dirty flag is set, the revision does not move.
+        live.store = surface_store_strikes(&[60_000.0, 62_000.0]);
+        live.refresh_surface();
+        assert!(
+            live.surface.dirty,
+            "a hidden-screen fold marks the surface dirty (deferred), not rebuilt",
+        );
+        assert_eq!(
+            live.surface.graph_revision(),
+            rev0,
+            "the hidden fold does not rebuild the surface geometry (no revision bump)",
+        );
+
+        // Switching to the Surface pays the deferred rebuild exactly once: the geometry
+        // moves (the revision bumps) and the dirty flag clears.
+        live.enter_screen(LiveScreen::Surface);
+        assert!(
+            !live.surface.dirty,
+            "the switch clears the deferred-dirty flag"
+        );
+        let rev1 = live.surface.graph_revision();
+        assert_ne!(
+            rev1, rev0,
+            "switch-to-surface rebuilt the deferred geometry once"
+        );
+
+        // A fold while the Surface is ACTIVE rebuilds immediately (never deferred): the
+        // geometry moves and the panel stays clean.
+        live.store = surface_store_strikes(&[58_000.0, 60_000.0, 62_000.0, 64_000.0]);
+        live.refresh_surface();
+        assert!(
+            !live.surface.dirty,
+            "an active-screen fold rebuilds immediately (stays clean)",
+        );
+        assert_ne!(
+            live.surface.graph_revision(),
+            rev1,
+            "an active-screen fold bumps the revision immediately",
+        );
+    }
+
+    #[test]
+    fn test_overlay_aware_health_combines_source_and_overlay() {
+        // #118: `overlay_aware_health` reflects EITHER contributor degrading — the
+        // surface consumes Greeks/IV a standalone overlay may supply, so a stale overlay
+        // must surface even while the chain source is live.
+        // No overlay → the source health.
+        let mut live = LiveState::new(
+            source_binding("deribit", full_caps()),
+            surface_store_strikes(&[60_000.0, 62_000.0]),
+        );
+        assert!(matches!(live.overlay_aware_health(), StreamHealth::Live));
+        // A stale overlay over a live source → the overlay's stale health.
+        live.overlay = Some(OverlayBinding::new(
+            pid("dxlink"),
+            full_caps(),
+            StreamHealth::Stale { since: utc(EXP) },
+        ));
+        assert!(
+            matches!(live.overlay_aware_health(), StreamHealth::Stale { .. }),
+            "a stale overlay surfaces even while the source is live",
+        );
+        // A stale source is preferred (shown) when both degrade.
+        live.source.health = StreamHealth::Reconnecting { attempt: 2 };
+        assert!(
+            matches!(
+                live.overlay_aware_health(),
+                StreamHealth::Reconnecting { .. }
+            ),
+            "the source health is preferred when both sides are degraded",
         );
     }
 

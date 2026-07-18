@@ -543,17 +543,19 @@ fn draw_fills(frame: &mut Frame, area: Rect, theme: Theme, loaded: &LoadedReplay
     }
 }
 
-/// Draw the fills list: the last `height` visible fills (nearest the head), the
-/// selection highlighted with a `▸` glyph + bold. An empty as-of window renders the
-/// deliberate "no fills" state. `O(visible rows on screen)` — never the whole tape.
+/// Draw the fills list, the drill-down selection highlighted with a `▸` glyph + bold.
+/// An empty as-of window renders the deliberate "no fills" state.
+/// `O(visible rows on screen)` — never the whole tape.
 ///
-/// The drill-down selection ([`step_fill`](LoadedReplay::step_fill)) walks the whole
-/// as-of tape, so a selection can step **above** this recent-tape window while its
-/// detail panel keeps updating. Because the window anchors the newest fill at the
-/// bottom, a selection can only leave via the top — so when the selection matches no
-/// rendered row, the TOP row is replaced with the dim
-/// [`off_window_indicator`] (`▸ selected fill ↑ (step N)`) pointing up at it, and the
-/// highlight never silently vanishes.
+/// The list **follows the selection** (#57 scroll-to-selection). The recent-tape
+/// window anchors the newest fill at the bottom; the drill-down selection
+/// ([`step_fill`](LoadedReplay::step_fill)) walks the whole as-of tape, so a `,`
+/// step can move the selection **above** that default window. When it does, the
+/// window scrolls up ([`fills_window_start`]) so the selected fill becomes the top
+/// visible row — the highlight stays on screen instead of the earlier v0.3
+/// off-window `↑` indicator. The window is a pure function of the on-screen row
+/// count, the as-of tape length, and the selection index (the selection is its own
+/// scroll anchor), so no off-draw scroll offset is stashed.
 fn draw_fills_list(frame: &mut Frame, area: Rect, theme: Theme, loaded: &LoadedReplay) {
     let visible = loaded.cursor.visible_fills(&loaded.bundle);
     if visible.is_empty() {
@@ -564,43 +566,45 @@ fn draw_fills_list(frame: &mut Frame, area: Rect, theme: Theme, loaded: &LoadedR
     if rows == 0 {
         return;
     }
-    // Take the last `rows` fills (nearest the head) via `rev().take()` — no index
-    // subtraction — then restore chronological order. Track whether the rendered
-    // window actually contains the selection (O(rows), no whole-tape scan).
     let selection = loaded.selection.as_ref();
-    let mut selection_on_window = false;
-    let mut lines: Vec<Line<'static>> = visible
+    // The index of the drill-down selection within the as-of tape (oldest → newest) —
+    // the scroll anchor. Resolved OFF the draw path (on selection step / cursor move,
+    // #118) and read here in O(1), so the draw never rescans the whole visible tape;
+    // only the window `[start, start + rows)` is formatted below (O(visible rows)).
+    let selected_ix = loaded.selected_fill_index();
+    let start = fills_window_start(visible.len(), rows, selected_ix);
+    // The window `[start, start + rows)` in chronological (oldest → newest) order — the
+    // selected fill is guaranteed on-screen by `fills_window_start`.
+    let lines: Vec<Line<'static>> = visible
         .iter()
-        .rev()
+        .skip(start)
         .take(rows)
-        .map(|fill| {
-            let selected = is_selected(selection, fill);
-            selection_on_window |= selected;
-            fill_line(fill, selected, theme)
-        })
+        .map(|fill| fill_line(fill, is_selected(selection, fill), theme))
         .collect();
-    lines.reverse();
-    // The selection stepped above the window: replace the TOP row with the up-pointing
-    // off-window indicator so the highlight is never silently lost.
-    if let Some(selected) = selection
-        && !selection_on_window
-        && let Some(top) = lines.first_mut()
-    {
-        *top = off_window_indicator(selected.step, theme);
-    }
     frame.render_widget(Paragraph::new(Text::from(lines)), area);
 }
 
-/// The dim, up-pointing indicator that replaces the TOP fills-list row when the
-/// drilled-into fill has stepped above the recent-tape window (the window anchors the
-/// newest fill at the bottom, so the selection can only leave via the top). The `▸`
-/// glyph + text carry it without color (`NO_COLOR`-safe); the detail panel below still
-/// shows the selected fill.
-fn off_window_indicator(step: u32, theme: Theme) -> Line<'static> {
-    Line::from(Span::styled(
-        format!("▸ selected fill ↑ (step {step})"),
-        theme.dim(),
-    ))
+/// The first visible index of the fills window so the drill-down selection stays on
+/// screen (#57 scroll-to-selection). The window shows `rows` fills with the newest
+/// anchored at the bottom (the default recent-tape view); when the selection has
+/// stepped **above** that default window, the window scrolls up so the selected fill
+/// becomes the top visible row — so the highlight follows the selection and never
+/// leaves the viewport. Everything fits (`total <= rows`) or a zero-row viewport → `0`.
+/// A pure, off-draw-testable function of the tape length, the on-screen row count, and
+/// the selection index (never an unchecked subtraction).
+#[must_use]
+fn fills_window_start(total: usize, rows: usize, selected: Option<usize>) -> usize {
+    if rows == 0 || total <= rows {
+        return 0;
+    }
+    // The newest fills anchored at the bottom (`total − rows` is safe: `total > rows`).
+    let default_start = total - rows;
+    match selected {
+        // The selection stepped above the default window → scroll up so it is the top
+        // visible row. `sel < default_start`, so `sel` is a valid, in-range start.
+        Some(sel) if sel < default_start => sel,
+        _ => default_start,
+    }
 }
 
 /// One fills-list line: `▸ <step> <SIDE> <qty>× <underlying> <C/P> @ <$price>`. The
@@ -842,9 +846,9 @@ mod tests {
     use ratatui::text::Line;
 
     use super::{
-        ATTRIB_LABEL_WIDTH, AttribRow, attribution_line, bar_string, draw, fmt_axis_cents,
-        fmt_cents_abs, fmt_drawdown_cents, fmt_drawdown_ratio, fmt_signed_cents, group_thousands,
-        handle_key,
+        ATTRIB_LABEL_WIDTH, AttribRow, attribution_line, bar_string, draw, fill_line,
+        fmt_axis_cents, fmt_cents_abs, fmt_drawdown_cents, fmt_drawdown_ratio, fmt_signed_cents,
+        group_thousands, handle_key,
     };
     use crate::app::tests_support::loaded_bundle;
     use crate::app::{BundleLoad, ReplayState};
@@ -948,14 +952,19 @@ mod tests {
         }
     }
 
-    /// A bundle with one fill per step over `0..n` (distinct order ids), so the
-    /// recent-tape fills window is smaller than the fill count at a modest render
-    /// height — the setup for the off-window selection indicator.
+    /// A bundle with one fill per step over `0..n` (distinct order ids **and** a
+    /// distinct per-step quantity `step + 1`), so the recent-tape fills window is
+    /// smaller than the fill count at a modest render height and each fill line is
+    /// visually distinguishable — the setup for the scroll-to-selection (#57) render.
     fn many_fills_bundle(n: u32) -> LoadedBundle {
         LoadedBundle {
             manifest: manifest(),
             fills: (0..n)
-                .map(|s| fill(s, u64::from(s) + 100, PositionSide::Long))
+                .map(|s| {
+                    let mut f = fill(s, u64::from(s) + 100, PositionSide::Long);
+                    f.quantity = s.checked_add(1).unwrap_or(1);
+                    f
+                })
                 .collect(),
             equity: (0..n)
                 .map(|s| equity(s, 1_000 + i64::from(s) * 10, -0.02))
@@ -1197,12 +1206,15 @@ mod tests {
         );
     }
 
-    // --- off-window selection indicator (P2-01) ------------------------------
+    // --- scroll-to-selection: the fills list follows the selection (#57) ------
 
     #[test]
-    fn test_off_window_selection_renders_the_up_indicator() {
+    fn test_off_window_selection_scrolls_into_view() {
         // Twelve fills, all visible at the head; step the selection to the OLDEST fill
-        // (step 0), which sits far above any recent-tape window at a modest height.
+        // (step 0, quantity 1), which sits far above the default recent-tape window at a
+        // modest height. The list must SCROLL UP so the selected fill is on screen — the
+        // #57 follow-the-selection polish that replaced the earlier off-window `↑`
+        // indicator.
         let mut state = state_from(many_fills_bundle(12));
         let _ = state.seek(SeekTo::Step(u32::MAX));
         for _ in 0..20 {
@@ -1212,13 +1224,31 @@ mod tests {
             Some(fill) => assert_eq!(fill.step, 0, "`,` clamps at the oldest fill"),
             None => panic!("a selection must exist"),
         }
-        // At a height where the fills list shows only a couple of rows, the selection
-        // is off-window: the TOP row becomes the up-indicator, and the detail panel
-        // below still shows the selected step-0 fill.
+        let selected = match state.loaded().and_then(|l| l.selection.clone()) {
+            Some(f) => f,
+            None => panic!("a selection must exist"),
+        };
+        let newest = match state.loaded().and_then(|l| l.bundle.fills.last().cloned()) {
+            Some(f) => f,
+            None => panic!("the bundle has fills"),
+        };
+        // At a height where the fills list shows only a couple of rows, the window has
+        // scrolled to the top: the selected step-0 fill renders highlighted (the `▸`
+        // row built by `fill_line`), and the newest fill (step 11) is scrolled off.
         let text = rendered(&state, 0, 120, 16);
+        let selected_row = line_text(&fill_line(&selected, true, theme()));
+        let newest_row = line_text(&fill_line(&newest, false, theme()));
         assert!(
-            text.contains("selected fill ↑ (step 0)"),
-            "the off-window indicator points up at the selection: {text:?}"
+            !text.contains("selected fill ↑"),
+            "the earlier off-window indicator is gone — the list follows the selection: {text:?}",
+        );
+        assert!(
+            text.contains(&selected_row),
+            "the selected step-0 fill scrolled into view, highlighted ({selected_row:?}): {text:?}",
+        );
+        assert!(
+            !text.contains(&newest_row),
+            "the newest fill (step 11) scrolled off the top-anchored window: {text:?}",
         );
         assert!(
             text.contains("v1:BTC"),
@@ -1227,20 +1257,131 @@ mod tests {
     }
 
     #[test]
-    fn test_in_window_selection_renders_no_off_window_indicator() {
-        // Select the most recent fill (step 11) — always the bottom row of the window,
-        // so it is highlighted in place and no off-window indicator is drawn.
+    fn test_in_window_selection_stays_bottom_anchored() {
+        // Select the most recent fill (step 11) — always the bottom row of the default
+        // window, so the window does NOT scroll: the newest fill is highlighted in place
+        // and the oldest (step 0) is not pulled on-screen.
         let mut state = state_from(many_fills_bundle(12));
         let _ = state.seek(SeekTo::Step(u32::MAX));
         let _ = handle_key(&mut state, press(KeyCode::Char('.')));
+        let newest = match state.loaded().and_then(|l| l.bundle.fills.last().cloned()) {
+            Some(f) => f,
+            None => panic!("the bundle has fills"),
+        };
+        let oldest = match state.loaded().and_then(|l| l.bundle.fills.first().cloned()) {
+            Some(f) => f,
+            None => panic!("the bundle has fills"),
+        };
         let text = rendered(&state, 0, 120, 16);
         assert!(
             !text.contains("selected fill ↑"),
-            "an in-window selection draws no off-window indicator: {text:?}"
+            "no off-window indicator in the follow model: {text:?}"
         );
         assert!(
-            text.contains("LONG"),
-            "the fills list still renders normal fill rows: {text:?}"
+            text.contains(&line_text(&fill_line(&newest, true, theme()))),
+            "the newest fill stays highlighted at the bottom-anchored window: {text:?}",
+        );
+        assert!(
+            !text.contains(&line_text(&fill_line(&oldest, false, theme()))),
+            "the oldest fill is not pulled on-screen: {text:?}",
+        );
+    }
+
+    #[test]
+    fn test_fills_window_start_follows_selection() {
+        use super::fills_window_start;
+        // Everything fits → start 0 regardless of selection.
+        assert_eq!(fills_window_start(3, 10, Some(0)), 0);
+        assert_eq!(fills_window_start(10, 10, None), 0);
+        // A zero-row viewport never indexes.
+        assert_eq!(fills_window_start(20, 0, Some(5)), 0);
+        // No selection (or a selection already in the bottom window) → newest anchored.
+        assert_eq!(fills_window_start(20, 5, None), 15);
+        assert_eq!(
+            fills_window_start(20, 5, Some(18)),
+            15,
+            "in-window keeps anchor"
+        );
+        assert_eq!(
+            fills_window_start(20, 5, Some(15)),
+            15,
+            "at the window top edge"
+        );
+        // A selection above the default window scrolls up so it is the top visible row.
+        assert_eq!(
+            fills_window_start(20, 5, Some(3)),
+            3,
+            "scrolls to the selection"
+        );
+        assert_eq!(
+            fills_window_start(20, 5, Some(0)),
+            0,
+            "oldest → top of the list"
+        );
+    }
+
+    #[test]
+    fn test_selected_fill_index_is_cached_off_draw() {
+        // #118: the fills-list scroll anchor (the selection's index in the as-of tape)
+        // is resolved OFF the draw path — on a `,`/`.` step and on a cursor move — and
+        // read by draw in O(1), so rendering never rescans the whole visible history.
+        let mut state = state_from(many_fills_bundle(12));
+        let _ = state.seek(SeekTo::Step(u32::MAX)); // fills 0..12 all visible
+        assert_eq!(
+            state
+                .loaded()
+                .and_then(crate::app::LoadedReplay::selected_fill_index),
+            None,
+            "no selection → no cached index",
+        );
+        // `.` selects the newest fill (step 11) → the last tape index.
+        let _ = handle_key(&mut state, press(KeyCode::Char('.')));
+        assert_eq!(
+            state
+                .loaded()
+                .and_then(crate::app::LoadedReplay::selected_fill_index),
+            Some(11),
+            "`.` caches the newest fill's tape index",
+        );
+        // `,` steps back one → the cached index decrements.
+        let _ = handle_key(&mut state, press(KeyCode::Char(',')));
+        assert_eq!(
+            state
+                .loaded()
+                .and_then(crate::app::LoadedReplay::selected_fill_index),
+            Some(10),
+            "`,` decrements the cached index",
+        );
+        // The cached index always agrees with a fresh scan of the visible tape.
+        match state.loaded() {
+            Some(loaded) => {
+                let visible = loaded.cursor.visible_fills(&loaded.bundle);
+                let scanned = loaded.selection_key().and_then(|key| {
+                    visible
+                        .iter()
+                        .position(|f| (f.step, f.order_id, f.fill_seq) == key)
+                });
+                assert_eq!(
+                    loaded.selected_fill_index(),
+                    scanned,
+                    "the cached index equals a fresh position scan",
+                );
+            }
+            None => panic!("the bundle is loaded"),
+        }
+        // Scrub the head back past the selected fill (step 10) → the selection AND its
+        // cached index clear together (the off-draw reclamp maintains both).
+        let _ = state.seek(SeekTo::Step(5));
+        assert_eq!(
+            state
+                .loaded()
+                .and_then(crate::app::LoadedReplay::selected_fill_index),
+            None,
+            "a selection scrubbed out of the as-of window clears its cached index",
+        );
+        assert!(
+            state.loaded().and_then(|l| l.selection.as_ref()).is_none(),
+            "the selection clears together with its index",
         );
     }
 

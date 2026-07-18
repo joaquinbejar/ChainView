@@ -339,27 +339,66 @@ fn draw_state_body(frame: &mut Frame, inner: Rect, text: Text<'static>) {
 // Formatting helpers — `—` never a fabricated `0`.
 // ===========================================================================
 
-/// Format a `Positive` price/size to two decimals, guarding the non-finite
-/// [`Positive::INFINITY`] sentinel to `—` so it never paints (rule: guard `f64`
-/// `NaN`/`Inf` before a widget).
+/// The decimals a value at or above `1.0` renders — the familiar money precision
+/// for an index/underlying-scale price (`60000.00`), where two decimals is right.
+const WHOLE_DECIMALS: usize = 2;
+/// The ceiling on rendered decimals, so a pathological sub-cent venue price never
+/// widens the price cell past its column ([`PRICE_W`]).
+const MAX_DECIMALS: usize = 8;
+
+/// Format a `Positive` price/size with **venue-scale-aware** precision (issue #109,
+/// #118), guarding the non-finite [`Positive::INFINITY`] sentinel to `—` so it never
+/// paints (rule: guard `f64` `NaN`/`Inf` before a widget).
+///
+/// The decimal count scales to the value's magnitude: a value `>= 1` renders at the
+/// familiar [`WHOLE_DECIMALS`] cents precision, while a **sub-unit** value renders at
+/// its own exact decimal scale (capped at [`MAX_DECIMALS`]) — so a fractional-coin BTC
+/// option price (`0.049`) keeps its tradeable digits instead of truncating to `0.04`,
+/// and two distinct executable prices near one (`0.9994` vs `0.9995`) never collapse to
+/// the same string. This is a **render-edge** display precision only; the underlying
+/// value stays the exact `Positive` the venue supplied.
 #[must_use]
 fn fmt_num(value: Positive) -> String {
     if value == Positive::INFINITY {
-        EM_DASH.to_owned()
-    } else {
-        format!("{value:.2}")
+        return EM_DASH.to_owned();
     }
+    let places = price_decimals(value.to_dec());
+    format!("{value:.places$}")
 }
 
-/// The bid/ask spread (`ask − bid`) to two decimals, or `—` when non-finite or
-/// crossed — computed with checked [`Decimal`] arithmetic so it never panics.
+/// The render-edge decimal count for a price/size, scaled to its magnitude
+/// (issue #109, #118). A value at or above `1.0` (or a non-positive degenerate value)
+/// renders at [`WHOLE_DECIMALS`]; a **sub-unit** value renders at its OWN decimal scale
+/// (the exact scale of the `Positive`/[`Decimal`] the venue supplied), capped at
+/// [`MAX_DECIMALS`].
+///
+/// Preserving the value's own scale — rather than counting significant figures from the
+/// first non-zero digit — is what keeps two distinct executable prices near one
+/// (`0.9994` and `0.9995`, both scale `4`) rendering distinctly instead of collapsing to
+/// a shared 3-significant-figure `0.999`; the column budget still caps the width.
+#[must_use]
+fn price_decimals(value: Decimal) -> usize {
+    if value >= Decimal::ONE || value <= Decimal::ZERO {
+        return WHOLE_DECIMALS;
+    }
+    usize::try_from(value.scale())
+        .unwrap_or(MAX_DECIMALS)
+        .min(MAX_DECIMALS)
+}
+
+/// The bid/ask spread (`ask − bid`) at the same venue-scale-aware precision as the
+/// ladder prices ([`price_decimals`]), or `—` when non-finite or crossed — computed
+/// with checked [`Decimal`] arithmetic so it never panics.
 #[must_use]
 fn fmt_spread(ask: Positive, bid: Positive) -> String {
     if ask == Positive::INFINITY || bid == Positive::INFINITY {
         return EM_DASH.to_owned();
     }
     match ask.to_dec().checked_sub(bid.to_dec()) {
-        Some(spread) if spread >= Decimal::ZERO => format!("{spread:.2}"),
+        Some(spread) if spread >= Decimal::ZERO => {
+            let places = price_decimals(spread);
+            format!("{spread:.places$}")
+        }
         _ => EM_DASH.to_owned(),
     }
 }
@@ -514,14 +553,14 @@ mod tests {
     use crossterm::event::{KeyCode, KeyModifiers};
     use optionstratlib::chains::OptionData;
     use optionstratlib::chains::chain::OptionChain;
-    use optionstratlib::prelude::Positive;
+    use optionstratlib::prelude::{Decimal, Positive};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::layout::Rect;
     use ratatui::style::Modifier;
 
     use super::{
-        body_visible_rows, clamp_start, draw, fmt_spread, handle_key, inside_market_anchor,
+        body_visible_rows, clamp_start, draw, fmt_num, fmt_spread, handle_key, inside_market_anchor,
     };
     use crate::app::{LiveScreen, LiveState, ScreenLoad, SourceBinding};
     use crate::chain::{
@@ -557,6 +596,16 @@ mod tests {
         match Positive::new(value) {
             Ok(p) => p,
             Err(e) => panic!("invalid test positive `{value}`: {e}"),
+        }
+    }
+
+    /// A `Positive` from an exact `mantissa × 10^-scale` decimal, so a sub-unit price
+    /// assertion (`0.049`) is byte-exact and free of `f64` conversion drift.
+    #[track_caller]
+    fn posd(mantissa: i64, scale: u32) -> Positive {
+        match Positive::new_decimal(Decimal::new(mantissa, scale)) {
+            Ok(p) => p,
+            Err(e) => panic!("invalid test decimal positive: {e}"),
         }
     }
 
@@ -1077,6 +1126,55 @@ mod tests {
         assert_eq!(fmt_spread(pos(60_010.0), pos(60_000.0)), "10.00");
         assert_eq!(fmt_spread(pos(60_000.0), pos(60_010.0)), "—", "crossed → —");
         assert_eq!(fmt_spread(Positive::INFINITY, pos(1.0)), "—", "inf → —");
+        // #118: a sub-unit spread (0.06 − 0.05 = 0.01, scale 2) renders at its own
+        // decimal scale, keeping its tradeable digits.
+        assert_eq!(fmt_spread(posd(6, 2), posd(5, 2)), "0.01");
+    }
+
+    // --- fmt_num venue-scale-aware precision (#109, #118) --------------------
+
+    #[test]
+    fn test_fmt_num_scales_precision_to_magnitude() {
+        // #109/#118: a sub-unit BTC option price renders at its OWN decimal scale,
+        // keeping the tradeable digits instead of collapsing to two decimals (the old
+        // `0.049 → 0.04` truncation); an index/underlying-scale price stays at the
+        // familiar two-decimal cents.
+        assert_eq!(fmt_num(posd(49, 3)), "0.049", "0.049 keeps its 3rd digit");
+        assert_eq!(fmt_num(posd(48, 3)), "0.048");
+        assert_eq!(fmt_num(posd(5, 2)), "0.05", "0.05 renders at scale 2");
+        assert_eq!(fmt_num(posd(61, 3)), "0.061");
+        assert_eq!(
+            fmt_num(posd(5, 3)),
+            "0.005",
+            "0.005 keeps its scale-3 digit"
+        );
+        assert_eq!(fmt_num(pos(1.0)), "1.00", "at 1.0 → cents");
+        assert_eq!(fmt_num(pos(60_000.0)), "60000.00", "index scale → cents");
+        assert_eq!(fmt_num(Positive::INFINITY), "—", "non-finite → em dash");
+    }
+
+    #[test]
+    fn test_fmt_num_distinguishes_near_one_sub_unit_prices() {
+        // #118: two distinct executable prices just below one (both scale 4) must render
+        // distinctly — the old 3-significant-figure scheme collapsed both to `0.999`.
+        assert_eq!(fmt_num(posd(9994, 4)), "0.9994");
+        assert_eq!(fmt_num(posd(9995, 4)), "0.9995");
+        assert_ne!(
+            fmt_num(posd(9994, 4)),
+            fmt_num(posd(9995, 4)),
+            "distinct near-one prices render distinctly, not a shared 0.999",
+        );
+        // The column budget still caps a pathologically deep sub-unit scale: a
+        // scale-9 value renders at most MAX_DECIMALS (8) places, never widening the
+        // price cell past its column.
+        let capped = fmt_num(posd(123_456_789, 9));
+        let decimals = capped
+            .split_once('.')
+            .map_or(0, |(_, frac)| frac.chars().count());
+        assert!(
+            decimals <= 8,
+            "a deep sub-unit scale is capped at MAX_DECIMALS: {capped:?}",
+        );
     }
 
     // --- Draw purity: draw does not mutate the scroll or store ---------------

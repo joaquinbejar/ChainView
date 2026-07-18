@@ -37,9 +37,10 @@ use ratatui::widgets::{Axis, Block, Chart, Dataset, GraphType, Paragraph};
 
 use crate::app::keymap::{KeyChord, SurfaceAction, resolve_surface};
 use crate::app::{LiveState, ScreenLoad, SurfaceAxis, SurfaceView};
+use crate::chain::StreamHealth;
 use crate::event::AppEvent;
 use crate::ui::graph::{EmptyReason, GraphProjection, ProjectedSeries, ProjectedSurface};
-use crate::ui::theme::{Theme, sanitize, spinner_frame};
+use crate::ui::theme::{Theme, health_span, sanitize, spinner_frame};
 
 /// The glyph ramp for the surface heat map, light → dense — the `NO_COLOR`-safe
 /// intensity signal (a present `z` cell maps to one of these by its normalized value,
@@ -77,7 +78,16 @@ pub fn draw(
     tick: u64,
 ) {
     let panel = &state.surface;
-    let block = Block::bordered().title(title_line(panel.view(), panel.axis(), theme));
+    // A dropped stream never blanks the surface: the last-known smile/curve/surface
+    // renders **dimmed** with the stream-health badge in the title, mirroring the
+    // chain/depth stale idiom (`docs/05-views-and-ux.md` §6). The health is the
+    // OVERLAY-AWARE health (source ∪ overlay, #118): the surface geometry consumes
+    // Greeks/IV a standalone overlay may supply, so a stale overlay dims + badges the
+    // surface even while the chain source is live. A borrowed read, so the draw stays
+    // pure.
+    let health = state.overlay_aware_health();
+    let stale = !matches!(health, StreamHealth::Live);
+    let block = Block::bordered().title(title_line(panel.view(), panel.axis(), theme, health));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -113,7 +123,9 @@ pub fn draw(
             );
         }
         ScreenLoad::Ready => match panel.view() {
-            SurfaceView::Smile => draw_series(frame, inner, theme, surface, "strike", "IV", true),
+            SurfaceView::Smile => {
+                draw_series(frame, inner, theme, surface, "strike", "IV", true, stale)
+            }
             SurfaceView::Curve => draw_series(
                 frame,
                 inner,
@@ -122,8 +134,9 @@ pub fn draw(
                 "strike",
                 panel.axis().label(),
                 panel.axis() == SurfaceAxis::Volatility,
+                stale,
             ),
-            SurfaceView::Surface => draw_surface(frame, inner, theme, panel.axis(), surface),
+            SurfaceView::Surface => draw_surface(frame, inner, theme, panel.axis(), surface, stale),
         },
     }
 }
@@ -139,9 +152,17 @@ pub fn draw(
 ///   which the surface body refuses (the 3D `z` is a Greek/Price, never IV). There the
 ///   title is annotated `IV (n/a)` so it never asserts an "IV surface" the body denies.
 ///
-/// Exhaustive over [`SurfaceView`] with no wildcard arm.
+/// Exhaustive over [`SurfaceView`] with no wildcard arm. The stream-health badge is
+/// appended when the feed is not live (`◐ stale` / `↻ reconnecting (n)`), so a dropped
+/// stream is honestly signalled while the last-known geometry stays on screen dimmed
+/// (`docs/05-views-and-ux.md` §6). The badge glyph+text is `NO_COLOR`-safe.
 #[must_use]
-fn title_line(view: SurfaceView, axis: SurfaceAxis, theme: Theme) -> Line<'static> {
+fn title_line(
+    view: SurfaceView,
+    axis: SurfaceAxis,
+    theme: Theme,
+    health: &StreamHealth,
+) -> Line<'static> {
     let mut spans = vec![
         Span::styled("Surface", theme.accent()),
         Span::styled(format!("  {}", view.label()), theme.dim()),
@@ -162,6 +183,10 @@ fn title_line(view: SurfaceView, axis: SurfaceAxis, theme: Theme) -> Line<'stati
             }
         }
     }
+    if !matches!(health, StreamHealth::Live) {
+        spans.push(Span::raw("  "));
+        spans.push(health_span(health, theme));
+    }
     Line::from(spans)
 }
 
@@ -172,7 +197,10 @@ fn title_line(view: SurfaceView, axis: SurfaceAxis, theme: Theme) -> Line<'stati
 /// Draw a 2D line view (the smile or a Greek curve): the projected series as a
 /// ratatui [`Chart`], or the deliberate "insufficient IV" empty state when the
 /// projection carries no renderable series. `y_percent` formats the `y`-axis as a
-/// percent (IV is a fraction upstream).
+/// percent (IV is a fraction upstream). `stale` dims the plotted line when the stream
+/// dropped, so the last-known curve reads as visibly untrusted beneath the title badge
+/// (`docs/05-views-and-ux.md` §6).
+#[allow(clippy::too_many_arguments)]
 fn draw_series(
     frame: &mut Frame,
     inner: Rect,
@@ -181,6 +209,7 @@ fn draw_series(
     x_title: &str,
     y_title: &str,
     y_percent: bool,
+    stale: bool,
 ) {
     let Some(series) = projection.ready() else {
         draw_state_body(
@@ -190,11 +219,16 @@ fn draw_series(
         );
         return;
     };
-    draw_chart(frame, inner, theme, series, x_title, y_title, y_percent);
+    draw_chart(
+        frame, inner, theme, series, x_title, y_title, y_percent, stale,
+    );
 }
 
 /// Render the projected `series` as a ratatui line [`Chart`] with the numeric axis
-/// bounds and precomputed labels — a pure paint over the cached projection.
+/// bounds and precomputed labels — a pure paint over the cached projection. When
+/// `stale`, the series line is drawn dim (never a bright, trusted-looking curve over a
+/// stale badge), mirroring the chain/depth stale idiom (`docs/05-views-and-ux.md` §6).
+#[allow(clippy::too_many_arguments)]
 fn draw_chart(
     frame: &mut Frame,
     inner: Rect,
@@ -203,12 +237,14 @@ fn draw_chart(
     x_title: &str,
     y_title: &str,
     y_percent: bool,
+    stale: bool,
 ) {
+    let series_style = if stale { theme.dim() } else { theme.accent() };
     let dataset = Dataset::default()
         .name(series.name().to_owned())
         .marker(Marker::Braille)
         .graph_type(GraphType::Line)
-        .style(theme.accent())
+        .style(series_style)
         .data(series.points());
     let y_labels = if y_percent {
         percent_labels(series.y_bounds())
@@ -241,12 +277,16 @@ fn draw_chart(
 /// `Volatility` axis has **no** surface projection — the `z` is a Greek/Price, never
 /// IV (the #47 map) — so it reports that and points back to the smile; otherwise the
 /// projected grid renders as a glyph ramp, or the "insufficient IV" state when empty.
+/// `stale` dims the whole grid when the stream dropped, so the 3D heat view reads as
+/// visibly untrusted beneath the title badge — the same stale idiom as the 2D chart
+/// (`docs/05-views-and-ux.md` §6).
 fn draw_surface(
     frame: &mut Frame,
     inner: Rect,
     theme: Theme,
     axis: SurfaceAxis,
     projection: &GraphProjection,
+    stale: bool,
 ) {
     if axis == SurfaceAxis::Volatility {
         draw_state_body(
@@ -270,14 +310,23 @@ fn draw_surface(
         );
         return;
     };
-    draw_heatmap(frame, inner, theme, surface);
+    draw_heatmap(frame, inner, theme, surface, stale);
 }
 
 /// Paint the projected surface as a character heat map: a header (the `z` metric and
 /// its numeric range, `NO_COLOR`-safe), the glyph grid (columns downsampled to fit
 /// the width, rows to the height), and a footer (the strike range and the glyph-ramp
-/// legend). O(visible cells) — the grid was precomputed off the draw path.
-fn draw_heatmap(frame: &mut Frame, inner: Rect, theme: Theme, surface: &ProjectedSurface) {
+/// legend). O(visible cells) — the grid was precomputed off the draw path. When
+/// `stale`, every present cell is dimmed ([`cell_span`]) so the grid never reads
+/// bright/trusted under a `◐ stale` badge; the ramp glyph's shape still carries the
+/// structure (`NO_COLOR`-safe).
+fn draw_heatmap(
+    frame: &mut Frame,
+    inner: Rect,
+    theme: Theme,
+    surface: &ProjectedSurface,
+    stale: bool,
+) {
     let [header, body, footer] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(1),
@@ -322,7 +371,7 @@ fn draw_heatmap(frame: &mut Frame, inner: Rect, theme: Theme, surface: &Projecte
         let mut spans: Vec<Span<'static>> = Vec::with_capacity(col_idx.len());
         for c in &col_idx {
             let cell = row.get(*c).copied().flatten();
-            spans.push(cell_span(cell, theme));
+            spans.push(cell_span(cell, theme, stale));
         }
         lines.push(Line::from(spans));
     }
@@ -346,13 +395,18 @@ fn draw_heatmap(frame: &mut Frame, inner: Rect, theme: Theme, surface: &Projecte
 
 /// One heat-map cell as a styled [`Span`]: the ramp glyph for its normalized `z`
 /// intensity (a gap is a blank), tinted by intensity so color reinforces — but never
-/// replaces — the glyph (`NO_COLOR`-safe).
+/// replaces — the glyph (`NO_COLOR`-safe). When `stale`, every present cell is dimmed
+/// regardless of intensity, so a dropped stream never paints a bright, trusted-looking
+/// heat grid under the `◐ stale` badge — the ramp glyph shape still carries the
+/// structure (`docs/05-views-and-ux.md` §6, #57 P2-01).
 #[must_use]
-fn cell_span(cell: Option<f64>, theme: Theme) -> Span<'static> {
+fn cell_span(cell: Option<f64>, theme: Theme, stale: bool) -> Span<'static> {
     match cell {
         Some(intensity) => {
             let glyph = ramp_glyph(intensity);
-            let style = if intensity >= 0.66 {
+            let style = if stale {
+                theme.dim()
+            } else if intensity >= 0.66 {
                 theme.accent()
             } else if intensity >= 0.33 {
                 theme.warning()
@@ -540,9 +594,12 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::layout::Rect;
+    use ratatui::style::{Color, Modifier};
 
     use super::{cell_span, draw, handle_key, insufficient_text, ramp_glyph, sample_indices};
-    use crate::app::{LiveState, ScreenLoad, SourceBinding, SurfaceAxis, SurfaceView};
+    use crate::app::{
+        LiveState, OverlayBinding, ScreenLoad, SourceBinding, SurfaceAxis, SurfaceView,
+    };
     use crate::chain::{
         AliasCatalog, ChainFetch, ChainSource, ChainStore, ExpirySource, ProviderId, StreamHealth,
     };
@@ -700,6 +757,42 @@ mod tests {
         let _ = handle_key(state, KeyEvent::new(code, KeyModifiers::NONE));
     }
 
+    /// Whether the plotted **Braille** smile/curve line is drawn in the **accent**
+    /// (bright) color. The line draws with Braille markers (`U+2800..=U+28FF`), styled
+    /// `theme.accent()` (fg Cyan) when live and `theme.dim()` (no fg) when stale;
+    /// ratatui's chart Canvas preserves the plotted color, so an accent-colored line
+    /// cell means the line is bright, and its absence means the line is dimmed. A `false`
+    /// return therefore means the line is NOT bright (dimmed or absent).
+    #[track_caller]
+    fn smile_line_is_accent(state: &LiveState, width: u16, height: u16) -> bool {
+        let theme = Theme::resolve(ThemeChoice::Auto, false);
+        let proj = projection(state);
+        let mut term = match Terminal::new(TestBackend::new(width, height)) {
+            Ok(t) => t,
+            Err(e) => panic!("TestBackend construction failed: {e}"),
+        };
+        let area = Rect::new(0, 0, width, height);
+        match term.draw(|frame| draw(state, &proj, frame, area, theme, 0)) {
+            Ok(_) => {}
+            Err(e) => panic!("surface draw failed: {e}"),
+        }
+        let buffer = term.backend().buffer();
+        for y in 0..height {
+            for x in 0..width {
+                if let Some(cell) = buffer.cell((x, y))
+                    && cell
+                        .symbol()
+                        .chars()
+                        .any(|c| ('\u{2800}'..='\u{28FF}').contains(&c))
+                    && cell.fg == Color::Cyan
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     // --- Every state renders without panic -----------------------------------
 
     #[test]
@@ -723,6 +816,106 @@ mod tests {
         render(&empty_iv_state(), 120, 40);
         // Small terminals must not panic either.
         render(&live_state(ScreenLoad::Ready), 40, 8);
+    }
+
+    // --- Stale stream badges the surface and never blanks (#57, §6) ----------
+
+    #[test]
+    fn test_stale_health_badges_the_surface_title() {
+        // A dropped stream never blanks the surface: the last-known smile renders with
+        // the stream-health badge in the title (glyph + text, NO_COLOR-safe), so the
+        // stale state is honest, not a bright, trusted-looking curve (§6).
+        let mut state = live_state(ScreenLoad::Ready);
+        state.source.health = StreamHealth::Stale { since: utc(EXP) };
+        let title = title_row(&state, 120, 40);
+        assert!(
+            title.contains("stale"),
+            "the stale badge renders in the surface title: {title:?}",
+        );
+        // The body still renders the last smile (never blanked).
+        let text = render_text(&state, 120, 40);
+        assert!(
+            text.contains("strike"),
+            "the last smile still renders: {text:?}"
+        );
+    }
+
+    #[test]
+    fn test_reconnecting_health_badges_the_surface_title() {
+        let mut state = live_state(ScreenLoad::Ready);
+        state.source.health = StreamHealth::Reconnecting { attempt: 3 };
+        let title = title_row(&state, 120, 40);
+        assert!(
+            title.contains("reconnecting"),
+            "the reconnecting badge renders in the surface title: {title:?}",
+        );
+    }
+
+    #[test]
+    fn test_live_health_shows_no_surface_badge() {
+        // The control: a live feed shows no health badge (the badge is reserved for the
+        // honest stale/reconnecting state).
+        let title = title_row(&live_state(ScreenLoad::Ready), 120, 40);
+        assert!(
+            !title.contains("stale") && !title.contains("reconnecting"),
+            "a live feed shows no health badge: {title:?}",
+        );
+    }
+
+    // --- Overlay-aware health: a stale overlay dims/badges the surface (#118) --
+
+    #[test]
+    fn test_stale_overlay_dims_and_badges_the_surface_when_source_is_live() {
+        // #118: the surface geometry consumes Greeks/IV that a standalone overlay may
+        // supply, so a stale OVERLAY must dim + badge the surface even while the chain
+        // SOURCE stays live — never a bright, trusted-looking curve over a stale feed.
+        let state = live_state(ScreenLoad::Ready).with_overlay(OverlayBinding::new(
+            pid("dxlink"),
+            caps(),
+            StreamHealth::Stale { since: utc(EXP) },
+        ));
+        // Only the overlay degraded; the source is still live.
+        assert!(
+            matches!(state.source.health, StreamHealth::Live),
+            "the chain source stays live",
+        );
+        let title = title_row(&state, 120, 40);
+        assert!(
+            title.contains("stale"),
+            "a stale overlay badges the surface title: {title:?}",
+        );
+        // The smile still renders (never blanked), but its line is DIMMED — not the
+        // bright accent color of a live feed.
+        let text = render_text(&state, 120, 40);
+        assert!(
+            text.contains("strike"),
+            "the last smile still renders: {text:?}"
+        );
+        assert!(
+            !smile_line_is_accent(&state, 120, 40),
+            "a stale overlay dims the surface line (not accent-colored)",
+        );
+    }
+
+    #[test]
+    fn test_live_overlay_leaves_the_surface_bright() {
+        // The control: with BOTH the source and a live overlay, the surface renders
+        // bright (accent line) with no health badge — the combine dims only on a real
+        // degrade, so it does not over-dim a fully-live surface.
+        let state = live_state(ScreenLoad::Ready).with_overlay(OverlayBinding::new(
+            pid("dxlink"),
+            caps(),
+            StreamHealth::Live,
+        ));
+        let title = title_row(&state, 120, 40);
+        assert!(
+            !title.contains("stale") && !title.contains("reconnecting"),
+            "a live source + live overlay shows no badge: {title:?}",
+        );
+        assert!(
+            smile_line_is_accent(&state, 120, 40),
+            "a fully-live surface renders its line bright (accent)",
+        );
     }
 
     // --- `g`/`G` cycles the Greek axis ---------------------------------------
@@ -904,15 +1097,41 @@ mod tests {
         // even on a monochrome terminal where color carries nothing.
         let theme = Theme::resolve(ThemeChoice::Auto, false);
         assert_eq!(
-            cell_span(Some(0.0), theme).content.as_ref(),
+            cell_span(Some(0.0), theme, false).content.as_ref(),
             "·",
             "a present minimum cell has ink",
         );
         assert_eq!(
-            cell_span(None, theme).content.as_ref(),
+            cell_span(None, theme, false).content.as_ref(),
             " ",
             "a data gap is a blank space",
         );
+    }
+
+    #[test]
+    fn test_cell_span_dims_the_heat_glyph_when_stale() {
+        // #57 P2-01: a dropped stream dims the 3D heat grid too — a high-intensity cell
+        // that would paint bright accent renders dim (only the intensity modifier, no
+        // color), while the ramp glyph shape still carries the structure (NO_COLOR-safe).
+        // So the heat view never reads bright/trusted under a `◐ stale` badge.
+        let theme = Theme::resolve(ThemeChoice::Auto, false);
+        let bright = cell_span(Some(1.0), theme, false);
+        assert!(
+            bright.style.fg.is_some() && bright.style.add_modifier.contains(Modifier::BOLD),
+            "a live max-intensity cell is bright accent (color + bold)",
+        );
+        let stale = cell_span(Some(1.0), theme, true);
+        assert!(
+            stale.style.fg.is_none() && stale.style.add_modifier.contains(Modifier::DIM),
+            "a stale max-intensity cell dims (no color, DIM modifier)",
+        );
+        assert_eq!(
+            stale.content.as_ref(),
+            "@",
+            "the densest ramp glyph still carries the structure when stale",
+        );
+        // A None gap stays a blank space regardless of stale.
+        assert_eq!(cell_span(None, theme, true).content.as_ref(), " ");
     }
 
     #[test]

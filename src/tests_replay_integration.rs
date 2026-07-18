@@ -758,6 +758,44 @@ fn test_replay_payoff_head_flat_state_renders() {
     );
 }
 
+#[test]
+fn test_replay_payoff_error_state_shows_r_retry_not_provider_key() {
+    // #57: a bundle ERROR on the payoff-at-head panel must render the actionable message
+    // with the MODE-CORRECT retry key (Replay → `R`), never fall through to the
+    // "loading bundle…" note, and never surface the Live `r` provider-reconnect key
+    // (`docs/05-views-and-ux.md` §6). The golden pins the deliberate error body.
+    let (tx, _rx) = mpsc::channel::<Command>(16);
+    let mut app = App::new(
+        Mode::Replay(ReplayState::new(fixture_dir("bad_schema"))),
+        ThemeChoice::Auto,
+        tx,
+    );
+    // Switch to the payoff panel, then fold a bundle failure through the real fan-in.
+    let _ = app.dispatch_key_global(press('2'));
+    assert_eq!(replay_screen(&app), ReplayScreen::Payoff);
+    app.on_event(AppEvent::BundleLoaded(BundleLoadResult::Failed(
+        "manifest.json is malformed".to_owned(),
+    )));
+    let text = render_replay_frame(&app);
+    assert!(
+        text.contains("manifest.json is malformed"),
+        "the payoff panel renders the bundle error message: {text:?}",
+    );
+    assert!(
+        text.contains("press R to retry"),
+        "the payoff panel offers the Replay `R` retry key on a bundle error: {text:?}",
+    );
+    assert!(
+        !text.contains("loading bundle"),
+        "a failed bundle no longer shows the loading note on the payoff panel: {text:?}",
+    );
+    assert!(
+        !text.to_lowercase().contains("reconnect"),
+        "a bundle error never surfaces the Live provider-reconnect key: {text:?}",
+    );
+    assert_golden("replay", "payoff_error.txt", &text);
+}
+
 // ---------------------------------------------------------------------------
 // Section: the REAL supervised startup seam (#37 review) — the load arrives
 // through `spawn_bundle_load` -> the event channel -> the fold, never a

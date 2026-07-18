@@ -14,6 +14,39 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- **The cross-screen v1.0 polish pass on states, theme, and keybindings** (issue
+  #57; `src/ui/depth.rs`, `src/ui/replay.rs`, `src/ui/surface.rs`,
+  `src/ui/payoff.rs`, `src/tests_integration.rs`, `src/tests_replay_integration.rs`,
+  `tests/render/golden/`, `docs/05-views-and-ux.md` §5). The first point the whole
+  screen set is audited as one coherent product — every screen carries the full
+  empty / loading / not-supported / stale-reconnecting / computed-Greeks / error
+  state set, with the mode-correct retry key on every error state.
+  - **Depth ladder price precision (closes #109).** The order-book ladder's price /
+    size formatter now uses **venue-scale-aware precision** at the render edge: a
+    sub-unit BTC option premium quoted in fractions of a coin keeps its significant
+    figures (`0.0490` / `0.0480`) instead of collapsing to two decimals (the old
+    `0.04` truncation). Index/underlying-scale prices stay at two-decimal cents. The
+    `depth/deribit_btc_ladder` golden is regenerated in the same commit as a visible
+    diff, and the ladder stays `NO_COLOR`-safe.
+  - **The replay fills list follows the drill-down selection.** When a `,` step moves
+    the selected fill above the recent-tape window, the list now **scrolls up** so the
+    selected fill stays on screen (its highlight never leaves the viewport), replacing
+    the v0.3 off-window `▸ selected fill ↑ (step N)` indicator. The window is a pure
+    function of the on-screen row count, the as-of tape length, and the selection
+    index, so the draw stays pure and stashes no scroll offset.
+  - **The vol-surface screen gained its stale / reconnecting state.** A dropped stream
+    no longer leaves a bright, trusted-looking smile/curve: the title carries the
+    stream-health badge (`◐ stale` / `↻ reconnecting (n)`) and the plotted line dims,
+    mirroring the chain/depth stale idiom — the §6 state the surface previously lacked.
+  - **The replay payoff-at-head panel renders a real bundle-error state.** A failed
+    bundle previously fell through to the "loading bundle…" note; it now shows the
+    actionable error with the **mode-correct** `R` retry key (re-open + revalidate) —
+    a bundle error never surfaces the Live `r` provider-reconnect key.
+  - **Accessibility + layout goldens.** A `NO_COLOR` golden pair for the chain matrix
+    proves the visible marker set is identical with and without color (a style-level
+    probe proves color is genuinely stripped, not that both happen to match); a new
+    `common/too_small` golden pins the cross-screen "widen the terminal" state; and new
+    per-state goldens cover the surface stale render and the replay payoff error render.
 - **The bundle-compatibility freeze against `ironcondor.bundle.v1`** (issue #56;
   `src/replay/mod.rs`, `src/error.rs`, `tests/replay_bundle_fixtures.rs`,
   `tests/common/sha256.rs`, `tests/fixtures/bundle/valid/SHA256SUMS`,

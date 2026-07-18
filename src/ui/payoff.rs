@@ -34,7 +34,7 @@
 use crossterm::event::KeyEvent;
 use optionstratlib::OptionStyle;
 use optionstratlib::chains::chain::OptionChain;
-use optionstratlib::prelude::{Decimal, Positive, ToPrimitive};
+use optionstratlib::prelude::Positive;
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Flex, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -45,11 +45,12 @@ use ratatui::widgets::{Axis, Block, Chart, Dataset, GraphType, Paragraph};
 use crate::app::atm_index_of;
 use crate::app::keymap::{KeyChord, PayoffAction, ReplayAction, resolve_payoff, resolve_replay};
 use crate::app::{
-    BuilderLeg, CurveMode, LegFocus, LiveState, PayoffBuilder, ReplayPayoffHead, ReplayState, Side,
+    BuilderLeg, BundleLoad, CurveMode, LegFocus, LiveState, PayoffBuilder, ReplayPayoffHead,
+    ReplayState, Side,
 };
 use crate::event::{AppEvent, ReplayControl, SeekTo};
 use crate::ui::graph::{EmptyReason, GraphProjection, ProjectedSeries};
-use crate::ui::theme::{StrikeRelation, Theme};
+use crate::ui::theme::{StrikeRelation, Theme, sanitize};
 
 // ===========================================================================
 // The draw entry point + the builder states (states first).
@@ -605,12 +606,14 @@ fn style_of(leg: LegFocus) -> OptionStyle {
 /// open set the cursor resolved at seek time (#33) — this paint builds no `GraphData`
 /// and prices nothing.
 ///
-/// States first (`docs/05-views-and-ux.md` §5): the **loading** note while the bundle
-/// is not `Ready`, then the **"flat at this step"** empty state when no position is
-/// open at the head (recovery: scrub to an open step), then — once an open position is
-/// priced — the payoff **line chart** (the expiration curve, the current-mark
-/// reference, the break-even markers, and the zero line). Never a blank, never a
-/// fabricated line, and **no claim of bit-exact upstream repricing** (`docs/04` §6).
+/// States first (`docs/05-views-and-ux.md` §5, §6): the **loading** note while the
+/// bundle is still opening, the **bundle-error** note with the mode-correct `R` retry
+/// key when the bundle failed (never the Live `r` provider key), then the **"flat at
+/// this step"** empty state when no position is open at the head (recovery: scrub to an
+/// open step), then — once an open position is priced — the payoff **line chart** (the
+/// expiration curve, the current-mark reference, the break-even markers, and the zero
+/// line). Never a blank, never a fabricated line, and **no claim of bit-exact upstream
+/// repricing** (`docs/04` §6).
 pub fn draw_replay(
     state: &ReplayState,
     payoff: &GraphProjection,
@@ -626,11 +629,35 @@ pub fn draw_replay(
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    // Loading / failed bundle: the equity screen owns the full load/error UI; the
-    // payoff panel just reports the bundle is not ready yet.
-    let Some(loaded) = state.loaded() else {
-        draw_replay_center(frame, inner, theme, "loading bundle…", "");
-        return;
+    // The bundle-load lifecycle first (states-first, `docs/05-views-and-ux.md` §6):
+    // a still-loading bundle shows the connecting note, and a **failed** bundle shows
+    // the actionable error with the mode-correct retry key — `R` re-opens + revalidates
+    // the bundle (a bundle error must NEVER surface the Live `r` provider-reconnect key,
+    // §6). Matched exhaustively over [`BundleLoad`] with no wildcard.
+    let loaded = match &state.bundle {
+        BundleLoad::Loading => {
+            draw_replay_center(
+                frame,
+                inner,
+                theme,
+                theme.accent(),
+                "loading bundle…",
+                "reading the bundle tables",
+            );
+            return;
+        }
+        BundleLoad::Error { message } => {
+            draw_replay_center(
+                frame,
+                inner,
+                theme,
+                theme.warning(),
+                &format!("! {}", sanitize(message)),
+                "press R to retry",
+            );
+            return;
+        }
+        BundleLoad::Ready(loaded) => loaded.as_ref(),
     };
     let head = loaded.payoff_head();
 
@@ -641,6 +668,7 @@ pub fn draw_replay(
             frame,
             inner,
             theme,
+            theme.accent(),
             "flat at this step",
             "no open position at the head — scrub to an open step",
         );
@@ -655,6 +683,7 @@ pub fn draw_replay(
             frame,
             inner,
             theme,
+            theme.warning(),
             "payoff unavailable at this step",
             "the open position could not be priced",
         );
@@ -667,9 +696,12 @@ pub fn draw_replay(
 /// Draw the replay payoff-at-head **line chart**: a header (open-leg count, the
 /// current mark-to-market P&L, and the break-even prices as text — legible under
 /// `NO_COLOR`) over a ratatui [`Chart`] of the projected **expiration** series, with a
-/// dim zero reference line, the break-even points, and the current-mark level overlaid
-/// as markers. The markers are resolved at the UI edge from the cached
-/// [`ReplayPayoffHead`] — nothing is recomputed or priced here.
+/// dim zero reference line and the break-even points overlaid as markers. The chart's
+/// y-axis is **per-contract** expiration P&L; the portfolio-dollar mark-to-market is
+/// shown only in the header, never plotted as a y-positioned line here (#108) — mixing
+/// portfolio and per-contract units on one axis would be dishonest and no bundle
+/// multiplier converts between them. The markers are resolved at the UI edge from the
+/// cached [`ReplayPayoffHead`] — nothing is recomputed or priced here.
 fn draw_replay_chart(
     frame: &mut Frame,
     inner: Rect,
@@ -691,14 +723,12 @@ fn draw_replay_chart(
         .filter(|x| x.is_finite() && *x >= x_min && *x <= x_max)
         .map(|x| (x, 0.0))
         .collect();
-    // The current mark-to-market level as a horizontal reference (the mark-based
-    // "t+0" anchor — the current MTM, NOT a repriced curve). Cents → plot `f64` at
-    // this display edge only, and dropped when non-finite.
-    let mark_y = head.mark_pnl_cents().and_then(cents_to_plot_f64);
-    let mark_line: Vec<(f64, f64)> = match mark_y {
-        Some(y) => vec![(x_min, y), (x_max, y)],
-        None => Vec::new(),
-    };
+    // The current mark-to-market figure is NOT plotted on this chart (#108): the
+    // writer's `mark_pnl_cents` is a PORTFOLIO-dollar MTM (summed unrealized), while
+    // this curve's y-axis is PER-CONTRACT expiration P&L — no multiplier in the bundle
+    // converts between them, so drawing the portfolio mark as a y-positioned line here
+    // would mix units dishonestly. The header carries the exact portfolio figure
+    // (`replay_payoff_header`, correctly labeled "mark"); the chart stays per-contract.
 
     let mut datasets = vec![
         Dataset::default()
@@ -713,18 +743,6 @@ fn draw_replay_chart(
             .style(theme.accent())
             .data(series.points()),
     ];
-    if !mark_line.is_empty() {
-        datasets.push(
-            // The mark reference uses a distinct `Dot` marker so it reads under
-            // NO_COLOR (shape, not color); its P&L-signed tint colors it in a palette.
-            Dataset::default()
-                .name("mark")
-                .marker(Marker::Dot)
-                .graph_type(GraphType::Line)
-                .style(theme.pnl_style(mark_y.is_some_and(|y| y < 0.0)))
-                .data(&mark_line),
-        );
-    }
     if !breakevens.is_empty() {
         datasets.push(
             Dataset::default()
@@ -736,9 +754,10 @@ fn draw_replay_chart(
         );
     }
 
-    // Widen the drawn y-bounds to include 0 (the zero line + break-even markers) and
-    // the mark level, so the y=0 overlays and the mark reference never clip.
-    let y_bounds = replay_y_bounds(series.y_bounds(), mark_y);
+    // Widen the drawn y-bounds to include 0 (the zero line + break-even markers), so the
+    // y=0 overlays never clip. The (portfolio-dollar) mark is not on this per-contract
+    // axis, so it does not widen these bounds (#108).
+    let y_bounds = y_bounds_including_zero(series.y_bounds());
     let y_labels = payoff_y_labels(y_bounds);
 
     let chart = Chart::new(datasets)
@@ -786,30 +805,6 @@ fn replay_payoff_header(theme: Theme, head: &ReplayPayoffHead) -> Vec<Line<'stat
     vec![summary, marks, caveat]
 }
 
-/// Widen the payoff series' y-bounds to include `0` (via [`y_bounds_including_zero`])
-/// and the current-mark level `mark_y`, so the zero line, the break-even markers, and
-/// the mark reference never clip when the P&L window sits away from them. Both series
-/// endpoints are finite (post-projection); `mark_y` is folded in only when finite.
-#[must_use]
-fn replay_y_bounds(series_bounds: [f64; 2], mark_y: Option<f64>) -> [f64; 2] {
-    let [lo, hi] = y_bounds_including_zero(series_bounds);
-    match mark_y {
-        Some(y) if y.is_finite() => [lo.min(y), hi.max(y)],
-        _ => [lo, hi],
-    }
-}
-
-/// Convert an integer-cent P&L figure to a plot `f64` in **dollars** for a chart
-/// reference line — a display-geometry conversion at the UI edge only (the accounting
-/// value stays integer cents). `Decimal → f64` (never an `as` cast); `None` when the
-/// value is not representable or non-finite, so a non-finite coordinate never reaches
-/// the chart.
-#[must_use]
-fn cents_to_plot_f64(cents: i64) -> Option<f64> {
-    let dollars = Decimal::from(cents).checked_div(Decimal::from(100))?;
-    dollars.to_f64().filter(|y| y.is_finite())
-}
-
 /// Format a signed integer-cent P&L as `+$1,234.56` / `−$0.15` — the single cents→`$`
 /// seam for the payoff-at-head header, integer arithmetic only (no `f64` money). The
 /// sign glyph carries the sign under `NO_COLOR`.
@@ -822,13 +817,22 @@ fn fmt_signed_cents(cents: i64) -> String {
     format!("{sign}${dollars}.{rem:02}")
 }
 
-/// Draw a deliberate centered two-line replay-payoff state (loading / flat /
+/// Draw a deliberate centered two-line replay-payoff state (loading / error / flat /
 /// unavailable): a headline over an optional sub-note, so an empty panel reads as an
-/// intentional state, never a blank void (`docs/05-views-and-ux.md` §5, §6).
-fn draw_replay_center(frame: &mut Frame, inner: Rect, theme: Theme, headline: &str, sub: &str) {
+/// intentional state, never a blank void (`docs/05-views-and-ux.md` §5, §6). The
+/// `headline_style` lets a bundle **error** render in the warning style (with its `!`
+/// prefix + `R` retry) distinctly from the accent loading/flat/unavailable notes.
+fn draw_replay_center(
+    frame: &mut Frame,
+    inner: Rect,
+    theme: Theme,
+    headline_style: Style,
+    headline: &str,
+    sub: &str,
+) {
     let mut lines = vec![Line::from(Span::styled(
         headline.to_owned(),
-        theme.accent(),
+        headline_style,
     ))];
     if !sub.is_empty() {
         lines.push(Line::from(Span::styled(sub.to_owned(), theme.dim())));
@@ -2516,6 +2520,49 @@ mod tests {
             crate::ui::golden::buffer_to_text(term.backend().buffer())
         }
 
+        // --- bundle lifecycle states: loading + error (#57, §6) -----------------
+
+        #[test]
+        fn test_loading_bundle_shows_connecting_note() {
+            // Before the bundle opens, the payoff panel shows the loading note (not a
+            // blank), distinct from the error state.
+            let state = ReplayState::new(PathBuf::from("/bundle/valid"));
+            let text = render_to_text(&state, 80, 24);
+            assert!(
+                text.contains("loading bundle"),
+                "a loading bundle shows the connecting note: {text:?}",
+            );
+        }
+
+        #[test]
+        fn test_bundle_error_shows_message_and_replay_retry_key() {
+            // A bundle error must render an actionable message with the MODE-CORRECT
+            // retry key: Replay → `R` (re-open + revalidate). It must NEVER surface the
+            // Live `r` provider-reconnect key (§6). Earlier this path fell through to the
+            // "loading bundle…" note — dishonest for a failed bundle.
+            let mut state = ReplayState::new(PathBuf::from("/bundle/broken"));
+            state.apply_load_result(BundleLoadResult::Failed(
+                "manifest.json is malformed".to_owned(),
+            ));
+            let text = render_to_text(&state, 80, 24);
+            assert!(
+                text.contains("manifest.json is malformed"),
+                "the bundle error message renders: {text:?}",
+            );
+            assert!(
+                text.contains("press R to retry"),
+                "a bundle error offers the Replay `R` retry key: {text:?}",
+            );
+            assert!(
+                !text.contains("loading bundle"),
+                "a failed bundle no longer shows the loading note: {text:?}",
+            );
+            assert!(
+                !text.to_lowercase().contains("reconnect"),
+                "a bundle error never surfaces the Live provider-reconnect key: {text:?}",
+            );
+        }
+
         // --- flat state: no open position at the head → "flat at this step" -----
 
         #[test]
@@ -2555,6 +2602,42 @@ mod tests {
             assert!(
                 text.contains("not a bit-exact reprice"),
                 "the honesty caveat is visible: {text:?}",
+            );
+        }
+
+        // --- #108: the portfolio mark is header-only, never a per-contract line --
+
+        #[test]
+        fn test_mark_is_header_only_never_a_line_on_the_per_contract_chart() {
+            // #108: the writer's mark P&L is PORTFOLIO dollars while the chart's y-axis
+            // is PER-CONTRACT expiration P&L, so the mark must NOT be drawn as a
+            // y-positioned line (no unit mixing). The header keeps the exact portfolio
+            // figure (correctly labeled "mark"); the chart legend no longer lists a
+            // "mark" dataset.
+            let state = ready_state(vec![
+                position(0, 6_000_000, 'C', PositionSide::Long),
+                position(1, 6_000_000, 'C', PositionSide::Long),
+                position(2, 6_000_000, 'C', PositionSide::Long),
+            ]);
+            let text = render_to_text(&state, 120, 40);
+            // The header keeps the exact portfolio MTM figure (11_800 − 12_500 = −700c).
+            assert!(
+                text.contains("mark −$7.00"),
+                "the header keeps the portfolio mark figure: {text:?}",
+            );
+            // The chart legend renders (so a stray mark legend entry WOULD show if the
+            // mark line were still a dataset).
+            assert!(
+                text.contains("payoff @ expiration"),
+                "the chart legend renders its series name: {text:?}",
+            );
+            // `mark` now appears ONLY in the header figure and the honest caveat —
+            // never as a chart legend entry (the removed mark-line dataset used to add a
+            // third one).
+            assert_eq!(
+                text.matches("mark").count(),
+                2,
+                "no `mark` legend entry: only the header figure + the caveat: {text:?}",
             );
         }
 
