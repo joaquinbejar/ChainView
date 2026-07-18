@@ -1,0 +1,12 @@
+error[E0639]: cannot create non-exhaustive struct using struct expression
+  --> tests/ui/fail/struct_literal_capabilities.rs:14:17
+   |
+14 |       let _caps = ProviderCapabilities {
+   |  _________________^
+15 | |         chain: ChainCapability::Assemble,
+16 | |         depth: true,
+17 | |         greeks: GreeksCapability::Provided,
+...  |
+22 | |         auth: AuthKind::None,
+23 | |     };
+   | |_____^

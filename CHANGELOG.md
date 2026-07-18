@@ -14,6 +14,41 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- **The `capabilities_source_compat` source-compat compile gate**
+  (`tests/trybuild.rs` + `tests/ui/*`, issue #44; `docs/TESTING.md` §3,
+  `docs/SEMVER.md` provider-port versioning, `docs/03-data-providers.md` §2,
+  ADR-0006). An executable `trybuild` gate that turns the provider-port SemVer
+  promise — "adding an optional capability dimension is a source-compatible
+  **minor** bump" — into a build-breaking test rather than a comment. Four
+  should-pass fixtures build `ProviderCapabilities` through
+  `ProviderCapabilities::builder()` (the only cross-crate construction path),
+  construct capability-enum variants, and read an enum through the mandatory
+  wildcard arm (the minor-bump forward-compat simulation); six should-fail
+  fixtures with committed `.stderr` goldens prove a downstream struct literal
+  for `ProviderCapabilities` (E0639) and an out-of-crate exhaustive match on
+  each capability enum (`ChainCapability` / `GreeksCapability` /
+  `OptionStreamCapability` / `ChainPollCapability` / `AuthKind`, E0004) are
+  **rejected** by the compiler. The gate fails closed the day a capability type
+  loses `#[non_exhaustive]` — the exact edit that would silently reclassify a
+  minor bump as a major break. Fixtures name every port type through
+  `chainview::` alone, so `trybuild` compiles them as separate crates against
+  the built lib — the external-adapter story exactly. `SEMVER.md` and `03 §2`
+  now cross-reference the gate as the executable proof of the minor rule (no
+  rule change).
+  - **New dev-dependency `trybuild` (1.0).** DEV-ONLY — it never rides in the
+    release binary. Supply-chain audit note: all-permissive tree
+    (`glob`/`termcolor`/`dissimilar` plus `serde`/`serde_json`/`toml` already
+    in the graph), MIT/Apache-2.0 on the `deny.toml` allow-list, builds on the
+    1.88 MSRV floor, and `cargo audit` + `cargo deny check` are clean with it
+    added (no new advisory, no new license, no new source).
+  - **Toolchain-pinned CI wiring.** The committed `.stderr` goldens are
+    rustc-version-sensitive, so the gate is EXECUTED only in the pinned Rust
+    1.88 CI job (via `CHAINVIEW_TRYBUILD_UI`) where the goldens are byte-stable;
+    on the moving `stable` job (and any other toolchain) the test self-skips, so
+    a benign compiler-message change never breaks an unrelated PR. The
+    regeneration flow (`CHAINVIEW_TRYBUILD_UI=1 TRYBUILD=overwrite cargo +1.88
+    test --test trybuild`) is documented in the harness so a message drift is a
+    deliberate, reviewed golden update.
 - **The delivered, documented, semver-governed public provider port**
   (`src/lib.rs`, `src/providers/mod.rs`, `src/config.rs`, issue #43;
   `docs/03-data-providers.md` §11, `docs/SEMVER.md`, `docs/07-configuration.md`

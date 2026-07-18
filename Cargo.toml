@@ -276,6 +276,19 @@ tokio = { version = "1", default-features = false, features = ["test-util"] }
 # behind. All RUSTSEC-clean, well under the 1.88 floor.
 arrow-schema = "59"
 tempfile = "3"
+# The compile-fixture harness for the `capabilities_source_compat` source-compat
+# gate (issue #44, `docs/TESTING.md` §3, `docs/SEMVER.md` provider-port
+# versioning). DEV-ONLY — it never rides in the release binary; it compiles the
+# `tests/ui/*` fixtures as separate crates against the built `chainview` lib
+# (the exact external-adapter story) and asserts a downstream struct literal for
+# a `#[non_exhaustive]` capability type is rejected while the builder path
+# compiles. Explicit-approval addition (CLAUDE.md "Coding Rules") — supply-chain
+# audit note in CHANGELOG (`cargo audit` + `cargo deny check`). All-permissive
+# tree (`glob`/`termcolor`/`dissimilar`/`serde`/`serde_json`/`toml`, the last
+# three already in the graph); MIT/Apache-2.0, well under the 1.88 floor and
+# RUSTSEC-clean. The gate is EXECUTED only on the pinned 1.88 CI job (committed
+# `.stderr` is rustc-version-sensitive); it self-skips on any other toolchain.
+trybuild = "1.0"
 
 # The panic-injection restore harness is a bare subprocess (no libtest capture),
 # so the child panics on a normal process with the default hook as the chained

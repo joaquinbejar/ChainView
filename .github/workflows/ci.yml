@@ -108,6 +108,19 @@ jobs:
         run: cargo build --all-features
       - name: test --all-features (MSRV)
         run: cargo test --all-features
+      # The `capabilities_source_compat` source-compat gate (issue #44,
+      # docs/TESTING.md §3, docs/SEMVER.md provider-port versioning). Its
+      # committed `tests/ui/*.stderr` goldens are rustc-version-sensitive, so the
+      # gate is EXECUTED only here — on the pinned 1.88 toolchain that never
+      # drifts — via CHAINVIEW_TRYBUILD_UI; on the moving `stable` job (and any
+      # other toolchain) the test self-skips, so a benign compiler-message change
+      # never breaks an unrelated PR. A dropped `#[non_exhaustive]` (or a new
+      # public struct-literal path) fails this step closed. Bounded: one test
+      # target, ~10 tiny fixtures against the already-built lib.
+      - name: trybuild source-compat gate (capabilities_source_compat)
+        env:
+          CHAINVIEW_TRYBUILD_UI: "1"
+        run: cargo test --all-features --test trybuild
 
   # --------------------------------------------------------------------------
   # Coverage — non-blocking / informational (docs/TESTING.md). cargo-llvm-cov
