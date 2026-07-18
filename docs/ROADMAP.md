@@ -327,7 +327,13 @@ release cycle without a breaking change before promotion.
 
 ### Issues
 - [ ] #52 — Activate the CI perf-regression gate (M; depends on #21, #36)
-- [ ] #53 — Add fuzz targets for the parser surfaces (M; depends on #31, #15)
+- [~] #53 — Add fuzz targets for the parser surfaces (M; depends on #31, #15) —
+      `fuzz/` crate + both targets + fixture-seeded corpus + nightly CI smoke +
+      docs landed. `fuzz_provider_normalize` clean (809,601 runs); the first
+      `fuzz_replay_decode` run found an OPEN upstream `arrow-ipc` panic on a
+      malformed Parquet footer schema (deferred to `replay-expert`: a
+      `catch_unwind`/upstream-bump mitigation in `src/replay/*` + regression
+      fixture — see `fuzz/README.md`).
 - [ ] #54 — Add the vulnerability-report channel and finalize supply-chain gates (S; depends on #20)
 - [ ] #55 — Freeze the CLI/config/keybinding surfaces and SemVer discipline (M; depends on #3, #14, #43)
 - [ ] #56 — Freeze bundle compatibility against the IronCondor schema (M; depends on #32, #36)

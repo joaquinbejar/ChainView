@@ -43,6 +43,16 @@ tastytrade = ["dep:tastytrade"]
 # `alpaca-websocket` crates at all. `dep:` keeps the optional crates from
 # implicitly defining same-named features.
 alpaca = ["dep:alpaca-http", "dep:alpaca-websocket", "dep:futures-util"]
+# `fuzz` gates the fuzz-only harness surface (`src/fuzz_support.rs` plus the
+# `#[cfg(feature = "fuzz")]` `pub(crate)` Deribit normalize entry points reached
+# by the separate `fuzz/` cargo-fuzz crate, issue #53). It is OFF by default and
+# OUT of the semver-governed public API: a normal `cargo build` (no `--features
+# fuzz`) exposes the exact same public surface it did before and never compiles
+# the harness — nothing under this feature appears without it. It adds NO
+# dependency to the main tree (`fuzz = []`); the cargo-fuzz/libfuzzer-sys deps
+# live only in `fuzz/Cargo.toml`, a separate crate excluded from the default
+# workspace build (docs/TESTING.md §13.4, docs/SECURITY.md §7).
+fuzz = []
 # `dxlink` gates the whole standalone DXLink overlay adapter
 # (`src/providers/dxlink.rs`, issue #42). It is DISABLED by default and stays off
 # the shippable set: like tastytrade and Alpaca, the adapter is excluded from

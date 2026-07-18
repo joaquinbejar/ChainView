@@ -654,6 +654,48 @@ fn parquet_err(detail: String) -> BundleError {
     BundleError::Parquet(detail)
 }
 
+/// Run an upstream Parquet/Arrow decode `op`, converting a **panic** that escapes
+/// the upstream decoder into a typed [`BundleError::Parquet`] instead of unwinding
+/// out of the reader.
+///
+/// The upstream `arrow-ipc` footer / embedded-`ARROW:schema` decode (reached via
+/// [`ParquetRecordBatchReaderBuilder::try_new`]) and the per-batch page decode
+/// `panic!` on some malformed inputs (issue #53: a corrupt embedded schema
+/// flatbuffer panics `arrow-ipc`'s `get_data_type`) — a `panic!` the reader's
+/// `.map_err` chain cannot catch, so it would otherwise escape the reader. Wrapping
+/// ONLY the upstream call in [`std::panic::catch_unwind`] (which needs **no**
+/// `unsafe`, so `#![forbid(unsafe_code)]` holds) preserves the module contract that
+/// a malformed bundle is a typed error, never a panic (`docs/04-replay-mode.md` §5,
+/// `docs/SECURITY.md` §6.2). A codec/decode failure is `Parquet` per that §5.
+///
+/// `op` returns a `Result`, so a value it produces normally — including a
+/// [`BundleError::Cancelled`] or a ceiling reject — passes through UNCHANGED; only
+/// an actual unwinding panic is mapped to `Parquet`. The panic payload is
+/// deliberately NOT interpolated into the message: the error names the table only,
+/// so a hostile bundle cannot steer the (bounded, non-secret) error string.
+/// [`std::panic::AssertUnwindSafe`] is sound here because the reader is abandoned on
+/// the panic path — the caller returns `Err` and never observes the
+/// partially-decoded upstream state again.
+///
+/// # Caveat: the process panic hook still runs
+///
+/// `catch_unwind` catches the unwind but does NOT suppress the process panic hook,
+/// which fires (a `stderr` line by default, or the TUI restore hook installed at
+/// startup) before this returns. This reader is a domain seam that must stay free
+/// of terminal knowledge, so it does not touch the global hook; coordinating hook
+/// suppression with the TUI is an app-layer concern, outside this reader's scope.
+fn catch_decode_panic<T>(
+    file: &str,
+    op: impl FnOnce() -> Result<T, BundleError>,
+) -> Result<T, BundleError> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(op)) {
+        Ok(inner) => inner,
+        Err(_) => Err(parquet_err(format!(
+            "{file}: upstream Parquet/Arrow decoder panicked on malformed input"
+        ))),
+    }
+}
+
 /// Build a [`BundleError::MissingTable`] on the cold absent-file path.
 #[cold]
 #[inline(never)]
@@ -1136,8 +1178,16 @@ impl BundleReader {
             std::io::ErrorKind::NotFound => missing_table(file.to_owned()),
             _ => io_err(format!("open {file}: {e}")),
         })?;
-        let builder = ParquetRecordBatchReaderBuilder::try_new(handle)
-            .map_err(|e| parquet_err(format!("{file}: {e}")))?;
+        // `try_new` reads the Parquet footer, which includes the embedded
+        // `ARROW:schema` flatbuffer. The upstream `arrow-ipc` decoder `panic!`s on
+        // some malformed footers (issue #53, `arrow-ipc` `get_data_type`) — a panic
+        // a `.map_err` cannot catch. Wrap ONLY this upstream call in `catch_unwind`
+        // so a decoder panic becomes a typed `BundleError::Parquet`, never an
+        // escaping panic (`docs/04-replay-mode.md` §5, `docs/SECURITY.md` §6.2).
+        let builder = catch_decode_panic(file, move || {
+            ParquetRecordBatchReaderBuilder::try_new(handle)
+                .map_err(|e| parquet_err(format!("{file}: {e}")))
+        })?;
 
         // --- Ceiling 2: footer row count, before decode. ---
         let (footer_rows, uncompressed, compressed) = {
@@ -1234,18 +1284,35 @@ impl BundleReader {
         // drops) and the typed decode's RETAINED owned rows (persistent). The Arrow
         // footprint counts a dictionary-encoded UTF8 column once, while the owned
         // rows copy the string per row, so the retained part — returned by `decode`
-        // — is what closes that gap.
-        let reader = builder
-            .with_batch_size(self.ceilings.max_batch_rows)
-            .build()
-            .map_err(|e| parquet_err(format!("{file}: {e}")))?;
+        // — is what closes that gap. Built under the #53 panic boundary: a
+        // malformed embedded schema can panic the upstream builder.
+        let mut reader = catch_decode_panic(file, || {
+            builder
+                .with_batch_size(self.ceilings.max_batch_rows)
+                .build()
+                .map_err(|e| parquet_err(format!("{file}: {e}")))
+        })?;
         let mut decoded_rows: usize = 0;
-        for batch in reader {
+        loop {
             // Abort at the batch boundary before decoding/accounting the next one.
             if cancelled() {
                 return Err(BundleError::Cancelled);
             }
-            let batch = batch.map_err(|e| parquet_err(format!("{file}: {e}")))?;
+            // Pull the next batch under a panic boundary: a malformed data page can
+            // `panic!` inside the upstream arrow decoder the same way a corrupt
+            // footer schema does (issue #53), so the pull — the ONLY upstream call
+            // in this loop — is wrapped, while the ceiling accounting and typed
+            // decode below stay OUTSIDE the boundary (ChainView logic, and the
+            // cancellation check / `budget.account` must never be swallowed). On a
+            // panic the reader is abandoned: we return `Err` and never poll it
+            // again, so `AssertUnwindSafe` observes no partially-decoded state.
+            let next = catch_decode_panic(file, || {
+                reader
+                    .next()
+                    .transpose()
+                    .map_err(|e| parquet_err(format!("{file}: {e}")))
+            })?;
+            let Some(batch) = next else { break };
             let batch_bytes = u64::try_from(batch.get_array_memory_size())
                 .map_err(|_| too_large(format!("{file}: decoded batch size exceeds u64")))?;
             let measured = apply_overhead(batch_bytes, self.ceilings.decoded_overhead_permille)?;

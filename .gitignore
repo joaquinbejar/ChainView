@@ -1,5 +1,13 @@
 /target
 /.claude
+# cargo-fuzz working state (issue #53): the corpus is regenerated from the
+# committed fixtures by fuzz/gen_corpus.sh, and a crashing artifact becomes a
+# committed regression test, so none of these are checked in.
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts
+/fuzz/coverage
+/fuzz/Cargo.lock
 /docs
 /rules
 /AGENTS.md

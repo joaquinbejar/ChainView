@@ -1,0 +1,59 @@
+# The ChainView fuzz crate (issue #53) — a SEPARATE cargo-fuzz package, excluded
+# from the default workspace build.
+#
+# The root `Cargo.toml` declares NO `[workspace]`, so `cargo build` / `cargo test`
+# at the repo root operate on the `chainview` package alone and never touch this
+# directory. The empty `[workspace]` table below makes this crate its own
+# workspace root too, so it is isolated from the parent in both directions.
+#
+# cargo-fuzz / libfuzzer-sys need a NIGHTLY toolchain (`cargo +nightly fuzz run`)
+# and are DEV TOOLING only: they appear here, never in the root
+# `[dependencies]`, so `cargo audit` / `cargo deny` over the shipped tree are
+# unaffected (docs/SECURITY.md §7). The `fuzz` feature this enables on `chainview`
+# adds no dependency to the main tree (`fuzz = []`).
+
+[package]
+name = "chainview-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+rust-version = "1.88"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+# Each `fuzz_replay_decode` iteration writes the five bundle members to a scratch
+# directory and drives the public `BundleReader` over it. `tempfile` gives that
+# scratch dir; it is a fuzz-crate dev dependency only, never in the main tree.
+tempfile = "3"
+
+[dependencies.chainview]
+path = ".."
+# The harness reaches the `pub(crate)` Deribit normalize seam through
+# `chainview::fuzz_support` (issue #53); the replay decode surface it drives is
+# already public. `default-features = false` is deliberate — a fuzz build never
+# compiles the bench harness or a gated adapter.
+features = ["fuzz"]
+default-features = false
+
+# Prevent this crate from being absorbed by (or absorbing) any parent workspace.
+[workspace]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "fuzz_replay_decode"
+path = "fuzz_targets/fuzz_replay_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_provider_normalize"
+path = "fuzz_targets/fuzz_provider_normalize.rs"
+test = false
+doc = false
+bench = false

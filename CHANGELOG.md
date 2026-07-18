@@ -14,6 +14,75 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- **Fuzzing the parser surfaces — the v1.0 security gate** (issue #53; the
+  `fuzz/` cargo-fuzz crate, `src/fuzz_support.rs`, `src/providers/deribit.rs`,
+  `.github/workflows/ci.yml`, `docs/TESTING.md` §13.4, `docs/SECURITY.md` §7,
+  `docs/ROADMAP.md`). Lands the two fuzz targets the security gate requires, each
+  driving a real **parser surface** — the two places untrusted external bytes
+  become domain values — with arbitrary bytes: any input is a typed error or a
+  valid bundle / domain row, never a panic or an out-of-budget allocation.
+  - **`fuzz_replay_decode`** — feeds arbitrary bytes as a `manifest.json` and as
+    each Parquet table into the public `BundleReader::open`/`load` (the bounded,
+    batched, ceiling-measured decode). A leading selector byte overrides one of
+    the five bundle members while the other four stay the committed VALID fixture,
+    so a single fuzzed member still reaches the full decode; the outcome is
+    `Ok(LoadedBundle)` or a typed `BundleError`, never a panic and never an
+    allocation past `MAX_WORKING_SET`.
+  - **`fuzz_provider_normalize`** — feeds arbitrary bytes through the REAL Deribit
+    `ticker.`/`book.`/instrument-name normalize seam (via the feature-gated
+    `chainview::fuzz_support`, which reaches the `pub(crate)` seam a separate
+    crate cannot). The outcome is a typed reject / dropped field or a valid
+    `QuoteUpdate`/`GreeksRow`/`DepthLadder`, with every produced `Positive`/`Decimal`
+    asserted a valid domain numeric — so a NaN/Inf/negative never reaches a domain
+    value (governance item 2). Deribit is the only shippable, default-compiled
+    built-in with a JSON→domain byte-parser seam; the gated adapters extend the
+    target when their features are enabled.
+  - **Seed corpora derived from the shared fixtures.** `fuzz/gen_corpus.sh` builds
+    the seeds from the committed provider + replay fixtures
+    (`tests/fixtures/deribit/**`, `tests/fixtures/bundle/**`), never hand-typed
+    bytes, so the fuzzer starts from valid shapes and mutates outward. The
+    generated corpus is gitignored (reproducible from the fixtures).
+  - **A time-boxed CI smoke job on nightly.** A separate `fuzz` job pins a nightly
+    toolchain (cargo-fuzz needs it), seeds the corpus, and runs each target for a
+    bounded `-max_total_time`, failing on any crash/panic — distinct from an
+    open-ended campaign, and separate from the MSRV/stable non-negotiables. The
+    crash→regression flow (minimize, fix the seam, land the minimized input as a
+    committed unit regression in the adversarial set) is documented in
+    `fuzz/README.md` and `docs/TESTING.md` §13.3–§13.4.
+  - **Dev-tooling audit note (ADR-0007).** The `fuzz` Cargo feature adds NO
+    dependency to the main tree (`fuzz = []`); `libfuzzer-sys` and `tempfile` live
+    only in `fuzz/Cargo.toml`, a separate crate with its own `[workspace]`,
+    excluded from the default build (the root declares no `[workspace]`, so
+    `cargo build`/`cargo test`/`cargo package` never touch `fuzz/`). `cargo audit`
+    / `cargo deny` over the shipped tree are unaffected. `#![forbid(unsafe_code)]`
+    stays — fuzzing hardens the parser, it does not license `unsafe`.
+  - **First-run finding — FOUND AND FIXED.** The initial smoke proved the gate
+    works: `fuzz_provider_normalize` ran clean (809,601 runs), and
+    `fuzz_replay_decode` found a genuine untrusted-input panic — a
+    `greeks_attribution.parquet` with a malformed embedded Arrow schema panics the
+    **upstream** `arrow-ipc` crate (`get_data_type`) inside
+    `ParquetRecordBatchReaderBuilder::try_new`, which `BundleReader::load`'s
+    `.map_err` cannot catch (`docs/SECURITY.md` §6.2 requires a typed `BundleError`,
+    never a panic). **Mitigation:** `BundleReader`'s `scan_table` now wraps the two
+    upstream decode calls — the footer/`ARROW:schema` read
+    (`ParquetRecordBatchReaderBuilder::try_new`, and the reader `build`) and the
+    per-batch pull (`reader.next()` in the ceiling loop) — in
+    `std::panic::catch_unwind` (safe under `#![forbid(unsafe_code)]`; no `unsafe`),
+    so an escaping upstream decoder panic becomes a typed `BundleError::Parquet`
+    (bounded, non-secret, naming the table only; the panic payload is never echoed).
+    The wrap is tight: the cancellation check and the working-set `budget.account`
+    stay OUTSIDE the boundary, so a `BundleError::Cancelled` and the ceilings are
+    never swallowed. **Caveat:** `catch_unwind` still runs the process panic hook
+    (an `stderr` line, or the TUI restore hook) before returning; this domain seam
+    stays free of terminal knowledge and does not touch the global hook.
+    **Regression:** a committed full-bundle fixture
+    `tests/fixtures/bundle/malformed_arrow_schema/` (the minimized fuzz artifact as
+    the malformed greeks table + three valid siblings + a valid manifest) drives the
+    exact panic path through the real `BundleReader::open`+`load` and asserts the
+    typed `BundleError::Parquet` (`tests/replay_bundle_fixtures.rs`,
+    `tests/common/bundle_gen.rs::write_malformed_arrow_schema`) — red before the
+    `catch_unwind` boundary, green after (`docs/TESTING.md` §13.3). The
+    `fuzz_replay_decode` CI step is expected green.
 - **The CI perf-regression gate — v1.0 opens** (issue #52; `scripts/check-perf.sh`,
   `.github/workflows/ci.yml`, `Makefile`, `BENCH.md` §6, `docs/06-performance.md`
   §5, `docs/TESTING.md` §11, NFR-17). Turns the ADR-0007 performance budget into a

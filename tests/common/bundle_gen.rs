@@ -516,6 +516,41 @@ pub fn write_dangling_position_id(dir: &Path) {
     write_uncompressed(&dir.join("greeks_attribution.parquet"), &greeks_batch(n));
 }
 
+/// The committed minimized `fuzz_replay_decode` crash artifact (issue #53): a
+/// `greeks_attribution.parquet` whose embedded `ARROW:schema` flatbuffer is
+/// malformed so that the upstream `arrow-ipc` decoder `panic!`s in `get_data_type`
+/// while `BundleReader::load` reads its footer. These bytes are **not** generable
+/// from the Arrow writer (they are a corrupt footer), so they are embedded verbatim
+/// from the committed fixture and re-emitted on regeneration, keeping the sibling
+/// tables in sync while preserving the fuzzer-found crash input byte-for-byte.
+const MALFORMED_ARROW_SCHEMA_GREEKS: &[u8] =
+    include_bytes!("../fixtures/bundle/malformed_arrow_schema/greeks_attribution.parquet");
+
+/// Write a bundle whose `greeks_attribution.parquet` carries a malformed embedded
+/// `ARROW:schema` (the #53 fuzz-found crash): a valid manifest and three valid
+/// sibling tables, plus the committed malformed greeks blob
+/// ([`MALFORMED_ARROW_SCHEMA_GREEKS`]). `open` succeeds (presence only) and the
+/// three siblings decode clean, so `load` reaches the malformed greeks footer — the
+/// exact panic path the `catch_unwind` boundary must convert to a typed
+/// `BundleError::Parquet` rather than let escape.
+pub fn write_malformed_arrow_schema(dir: &Path) {
+    fresh_dir(dir);
+    let n = VALID_STEPS;
+    write_manifest(
+        dir,
+        &manifest_json(SCHEMA, RUN_ID, CAPITAL_CENTS, counts(n)),
+    );
+    write_uncompressed(&dir.join("fills.parquet"), &fills_batch(n, None));
+    write_uncompressed(&dir.join("equity_curve.parquet"), &equity_batch(n));
+    write_uncompressed(&dir.join("positions.parquet"), &positions_batch(n));
+    if let Err(e) = std::fs::write(
+        dir.join("greeks_attribution.parquet"),
+        MALFORMED_ARROW_SCHEMA_GREEKS,
+    ) {
+        panic!("write malformed greeks into {}: {e}", dir.display());
+    }
+}
+
 /// Write a conformant bundle of `steps` steps into `dir` — the HP-4 bench target.
 pub fn write_bench_bundle(dir: &Path, steps: usize) {
     fresh_dir(dir);

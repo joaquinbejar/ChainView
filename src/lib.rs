@@ -195,6 +195,18 @@ mod tests_capability_matrix;
 #[cfg(feature = "bench")]
 pub mod bench_support;
 
+// Fuzz-only harness surface (issue #53, docs/TESTING.md §13.4), compiled ONLY
+// under the `fuzz` Cargo feature. It exposes the byte-in entry point the
+// separate `fuzz/` cargo-fuzz crate's `fuzz_provider_normalize` target needs to
+// reach the `pub(crate)` Deribit normalize seam (raw upstream DTOs stop at
+// `src/providers/*`). Like `bench_support`, it is `#[cfg(feature = "fuzz")]` and
+// OFF by default, so a normal build never compiles it and the semver-governed
+// public API is unchanged. The replay decode surface it complements is already
+// public (`BundleReader`), so the `fuzz_replay_decode` target needs nothing here
+// (docs/SECURITY.md §7).
+#[cfg(feature = "fuzz")]
+pub mod fuzz_support;
+
 // The application state machine + fan-in (`docs/02-tui-architecture.md` §3, §4):
 // the `App`, the `Live | Replay` `Mode`, the mode-scoped `LiveScreen`/
 // `ReplayScreen`, the composite source/overlay bindings and per-screen state, and
