@@ -16,13 +16,30 @@
 //!   (ADR-0009 / `docs/03-data-providers.md` §5);
 //! - it plugs into the ADR-0009 supervised composition seam
 //!   ([`spawn_supervised_subscription`]) identically to a built-in;
+//! - its `fetch` folds into the public [`ChainStore`] with **domain parity** — the
+//!   same data under a built-in id yields byte-identical leg state, and a streaming
+//!   quote merges `Applied` — proving the `fetch -> store fold -> stream merge` path
+//!   is id-agnostic through the port alone;
+//! - it renders **end-to-end** through the public [`render`] entry (the external id
+//!   in the status bar, the faux chain matrix in the body), with the reserved- and
+//!   duplicate-id collisions surfacing as the TYPED [`RegistryError`] variants;
 //! - its declared [`ProviderCapabilities`] gate the screens — the gate is TOTAL
 //!   over the declared caps, **never** a `ProviderId` match.
 //!
-//! The complementary in-crate live-path golden render lives in
+//! # What is deliberately NOT here (the public/in-crate split)
+//!
+//! The **committed golden** render-parity proof — the faux chain rendered to the
+//! byte-exact `chain/deribit_btc_atm` golden — lives in-crate in
 //! `src/tests_integration.rs` (`#[cfg(test)]`), because it needs `pub(crate)`
-//! internals this public crate cannot reach. Every test here is deterministic
-//! (no socket, no wall-clock wait) and finishes far under the 10 s bound.
+//! internals this external crate cannot reach: the `ui::chain::draw` body (the
+//! public [`render`] wraps it in an id-bearing status bar, so a full-frame
+//! byte-identity assertion is the WRONG shape — the UI *displays* the id as a
+//! label but never *gates* on it) and the `assert_golden`/`buffer_to_text` golden
+//! harness (promoting either would widen the semver-governed API, the same reason
+//! the #19 goldens live in-crate). This file instead proves parity through the
+//! **public** surface: domain store-fold equivalence and a public-`render`
+//! end-to-end draw. Every test here is deterministic (no socket, no wall-clock
+//! wait) and finishes far under the 10 s bound.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -35,18 +52,23 @@ use optionstratlib::chains::chain::OptionChain;
 use optionstratlib::prelude::Positive;
 use optionstratlib::{ExpirationDate, OptionStyle};
 use proptest::prelude::*;
+use ratatui::Terminal;
+use ratatui::backend::TestBackend;
+use ratatui::buffer::Buffer;
 use tokio::sync::Notify;
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use chainview::{
-    AliasCatalog, ChainCapability, ChainFetch, ChainPollCapability, ChainSnapshot, ChainSource,
-    ChainViewApp, ChainViewError, Config, ContractSpecFingerprint, EventBridge, ExerciseStyle,
-    ExpirySource, FinalTeardown, GreeksCapability, Instrument, InstrumentKey, LiveScreen,
-    MarketUpdate, MarketUpdateSink, ModeSelect, Provider, ProviderCapabilities, ProviderError,
-    ProviderId, RESERVED_PROVIDER_IDS, RegistryError, SettlementStyle, StreamHealth,
-    SubscriptionHandle, SubscriptionRequest, Supervisor, ThemeChoice, UnderlyingRef,
-    is_screen_reachable, spawn_supervised_subscription,
-};
+    AliasCatalog, App, ChainCapability, ChainFetch, ChainPollCapability, ChainSnapshot,
+    ChainSource, ChainStore, ChainViewApp, ChainViewError, Command, Config,
+    ContractSpecFingerprint, EventBridge, ExerciseStyle, ExpirySource, FinalTeardown,
+    GreeksCapability, Instrument, InstrumentKey, LiveScreen, LiveState, MarketUpdate,
+    MarketUpdateSink, MergeOutcome, Mode, ModeSelect, Provider, ProviderCapabilities,
+    ProviderError, ProviderId, QuoteUpdate, RESERVED_PROVIDER_IDS, RegistryError, ScreenLoad,
+    SettlementStyle, SourceBinding, StreamHealth, SubscriptionHandle, SubscriptionRequest,
+    Supervisor, ThemeChoice, UnderlyingRef, ViewState, is_screen_reachable, render,
+    spawn_supervised_subscription,};
 
 // --- Test constructors (no unwrap/expect/indexing per the ruleset) -----------
 
@@ -416,6 +438,27 @@ fn test_faux_external_provider_duplicate_registration_is_typed_error() {
     }
 }
 
+#[test]
+fn test_faux_external_provider_reserved_id_registration_is_typed_error() {
+    // An external registration under a RESERVED built-in id is a TYPED
+    // `RegistryError::ReservedId` through the PUBLIC builder — an external adapter
+    // can never masquerade as a built-in or shadow its config namespace
+    // (`docs/03-data-providers.md` §11.2). The registry surfaces the build-phase
+    // collision BEFORE config resolution, so `run` reports the typed variant with
+    // the offending id. This is the OTHER typed collision (the companion of the
+    // duplicate story above), proven against the public surface alone.
+    let result = ChainViewApp::builder()
+        .register(FauxProvider::chainful(pid("deribit")))
+        .with_config(live_config("deribit"))
+        .run();
+    match result {
+        Err(ChainViewError::Registry(RegistryError::ReservedId(id))) => {
+            assert_eq!(id.as_str(), "deribit");
+        }
+        other => panic!("expected ReservedId(deribit) from the public surface, got {other:?}"),
+    }
+}
+
 // =============================================================================
 // 2. fetch_chain returns the NAMED ChainFetch; a forced reconnect RESUBSCRIBES
 //    off the fresh ChainFetch.aliases (no bare OptionChain, no re-derivation).
@@ -608,6 +651,238 @@ fn test_screen_gating_is_capability_driven_never_provider_id() {
     assert!(is_screen_reachable(LiveScreen::Payoff, &a.capabilities()));
 }
 
+// =============================================================================
+// 5. The `fetch -> store fold -> stream merge -> render` path reaches DOMAIN and
+//    RENDER parity through the port ALONE — driven with only public items.
+// =============================================================================
+
+/// A fixed as-of / poll-receipt instant for the store-fold + render checks, so
+/// the merge and the rendered frame are byte-stable across machines (no wall
+/// clock). Distinct from the fixture's own contract expiry.
+#[track_caller]
+fn as_of() -> DateTime<Utc> {
+    match DateTime::<Utc>::from_timestamp(1_700_000_000, 0) {
+        Some(t) => t,
+        None => panic!("valid fixed as-of timestamp"),
+    }
+}
+
+/// Seed a [`ChainStore`] from a fetch through the PUBLIC domain surface — the
+/// `fetch -> store fold` step a built-in takes, with no adapter internals.
+fn seed_store(fetch: ChainFetch) -> ChainStore {
+    ChainStore::seed(fetch, ChainSource::Merged, Duration::from_secs(2), as_of())
+}
+
+/// The per-strike `(strike, call_bid, call_ask, put_bid, put_ask)` view of a
+/// store's normalized `OptionChain` — the id-independent leg state two stores are
+/// compared on (`OptionChain` derives no `PartialEq`, so parity is asserted over
+/// this projection).
+type Leg = (
+    Positive,
+    Option<Positive>,
+    Option<Positive>,
+    Option<Positive>,
+    Option<Positive>,
+);
+
+fn chain_legs(store: &ChainStore) -> Vec<Leg> {
+    store
+        .chain()
+        .options
+        .iter()
+        .map(|od| {
+            (
+                od.strike_price,
+                od.call_bid,
+                od.call_ask,
+                od.put_bid,
+                od.put_ask,
+            )
+        })
+        .collect()
+}
+
+/// An idempotent streaming [`QuoteUpdate`] for one faux leg, carrying the same
+/// bid/ask the seeded chain already holds, so folding it is a real within-provider
+/// `apply_quote` merge (`MergeOutcome::Applied`) with no value drift. `provider`
+/// equals the store's source provider, so the overlay gate is a no-op.
+fn faux_quote(
+    provider: &ProviderId,
+    strike: Positive,
+    style: OptionStyle,
+    bid: Positive,
+    ask: Positive,
+) -> QuoteUpdate {
+    QuoteUpdate {
+        instrument: Instrument {
+            key: InstrumentKey {
+                underlying: "BTC".to_owned(),
+                expiration_utc: expiry_utc(),
+                strike,
+                style,
+            },
+            provider: provider.clone(),
+            native_symbol: format!("FAUX-BTC-{strike}-{}", style.as_str()),
+            stream_symbol: None,
+            spec: faux_spec("BTC"),
+        },
+        bid: Some(bid),
+        ask: Some(ask),
+        last: None,
+        bid_size: None,
+        ask_size: None,
+        event_time: None,
+        received_time: as_of(),
+    }
+}
+
+/// A Ready live chain [`App`] bound to `provider`'s declared `caps` and the seeded
+/// `store` — the state the render loop hands [`render`] for a live source. The
+/// command channel is created outside any runtime (only an awaited send/recv would
+/// need one) and never touched by the pure draw path.
+fn live_chain_app(store: ChainStore, provider: ProviderId, caps: ProviderCapabilities) -> App {
+    let mut live = LiveState::new(
+        SourceBinding::new(provider, caps, StreamHealth::Live),
+        store,
+    );
+    live.screen = LiveScreen::Chain;
+    live.load = ScreenLoad::Ready;
+    let (tx, _rx) = mpsc::channel::<Command>(16);
+    App::new(Mode::Live(live), ThemeChoice::Auto, tx)
+}
+
+/// Render `app` full-frame through the PUBLIC [`render`] entry into a fixed
+/// 120x40 `TestBackend`, returning the visible buffer as text (one row per line,
+/// trailing spaces trimmed). This is the external-crate view of the render path:
+/// no `pub(crate)` golden harness, no `ui::chain::draw` — only public `render` +
+/// [`ViewState`].
+#[track_caller]
+fn render_full_frame_text(app: &App) -> String {
+    let mut term = match Terminal::new(TestBackend::new(120, 40)) {
+        Ok(t) => t,
+        Err(e) => panic!("TestBackend construction failed: {e}"),
+    };
+    let mut view = ViewState::new();
+    view.sync(app);
+    match term.draw(|frame| render(app, &view, frame)) {
+        Ok(_) => {}
+        Err(e) => panic!("full-frame render failed: {e}"),
+    }
+    buffer_to_text(term.backend().buffer())
+}
+
+/// A local buffer-to-text: each cell's visible symbol, row by row, trailing spaces
+/// trimmed. The in-crate golden helper is `pub(crate)` and so unreachable here —
+/// re-deriving the trivial projection keeps this proof on the public surface.
+fn buffer_to_text(buffer: &Buffer) -> String {
+    let area = *buffer.area();
+    let mut out = String::new();
+    for y in 0..area.height {
+        let mut line = String::new();
+        for x in 0..area.width {
+            if let Some(cell) = buffer.cell((x, y)) {
+                line.push_str(cell.symbol());
+            }
+        }
+        out.push_str(line.trim_end());
+        out.push('\n');
+    }
+    out
+}
+
+#[tokio::test]
+async fn test_faux_fetch_folds_into_chainstore_like_a_builtin_source() {
+    let exp = ExpirationDate::DateTime(expiry_utc());
+
+    // The external faux source: fetch -> the NAMED ChainFetch (never a bare chain).
+    let faux = FauxProvider::chainful(pid("faux"));
+    let faux_fetch = match faux.fetch_chain("BTC", &exp).await {
+        Ok(fetch) => fetch,
+        Err(e) => panic!("faux fetch_chain must succeed, got {e}"),
+    };
+    // The SAME chain data under a RESERVED built-in id, used ONLY to build the
+    // comparison store — never registered (reservation gates `register`, not
+    // construction). The domain fold reads the normalized `OptionChain`, never the
+    // provider id, so both stores must hold identical leg state.
+    let builtin = FauxProvider::chainful(pid("deribit"));
+    let builtin_fetch = match builtin.fetch_chain("BTC", &exp).await {
+        Ok(fetch) => fetch,
+        Err(e) => panic!("the built-in-shaped fetch_chain must succeed, got {e}"),
+    };
+
+    let mut faux_store = seed_store(faux_fetch);
+    let builtin_store = seed_store(builtin_fetch);
+
+    // (a) fetch -> normalize: the faux fetch became an optionstratlib `OptionChain`
+    // carrying exactly its two declared strikes.
+    let strikes: Vec<Positive> = faux_store
+        .chain()
+        .options
+        .iter()
+        .map(|od| od.strike_price)
+        .collect();
+    assert!(
+        strikes == vec![pos(60_000.0), pos(61_000.0)],
+        "the faux fetch normalized into the expected OptionChain strikes"
+    );
+
+    // (b) DOMAIN parity: the external-id and built-in-id stores hold byte-identical
+    // leg state — the fold is id-agnostic (the deribit-shaped-path parity the
+    // conformance contract names).
+    assert!(
+        chain_legs(&faux_store) == chain_legs(&builtin_store),
+        "the store state matches the same data folded through a built-in-shaped source"
+    );
+
+    // (c) stream merge: an idempotent quote on a present leg folds `Applied` — the
+    // poll->stream merge path treats an external provider's leg like a built-in's.
+    let outcome = faux_store.apply_quote(&faux_quote(
+        &pid("faux"),
+        pos(60_000.0),
+        OptionStyle::Call,
+        pos(1.0),
+        pos(1.2),
+    ));
+    assert_eq!(
+        outcome,
+        MergeOutcome::Applied,
+        "a streaming quote folds into the faux chain exactly as a built-in's would"
+    );
+}
+
+#[tokio::test]
+async fn test_faux_provider_renders_end_to_end_through_public_render() {
+    // The faux external source drives the render path END TO END through the PUBLIC
+    // `render` entry — the external-crate view of "runs end-to-end and renders",
+    // with NO built-in special-casing.
+    let exp = ExpirationDate::DateTime(expiry_utc());
+    let faux = FauxProvider::chainful(pid("faux"));
+    let caps = faux.capabilities();
+    let fetch = match faux.fetch_chain("BTC", &exp).await {
+        Ok(fetch) => fetch,
+        Err(e) => panic!("faux fetch_chain must succeed, got {e}"),
+    };
+    let app = live_chain_app(seed_store(fetch), pid("faux"), caps);
+    let text = render_full_frame_text(&app);
+
+    // The external provider id renders in the status bar (a DISPLAY label — the UI
+    // shows the id but never GATES on it), and the faux chain's underlying plus
+    // BOTH strikes render in the chain matrix body: the external source reaches the
+    // screen through the public render path with no id special-casing.
+    assert!(
+        text.contains("faux"),
+        "the external provider id renders in the status bar:\n{text}"
+    );
+    assert!(
+        text.contains("BTC"),
+        "the faux chain's underlying renders through the public render path:\n{text}"
+    );
+    assert!(
+        text.contains("60000") && text.contains("61000"),
+        "the faux chain's strikes render in the matrix body:\n{text}"
+    );
+}
+
 // --- proptest helpers --------------------------------------------------------
 
 /// A strategy over grammar-valid, NON-reserved provider ids.
@@ -690,6 +965,12 @@ proptest! {
             .register(FauxProvider::chainful(id))
             .with_config(live_config(id_str))
             .run();
-        prop_assert!(result.is_err(), "a reserved id used externally is refused");
+        prop_assert!(
+            matches!(
+                result,
+                Err(ChainViewError::Registry(RegistryError::ReservedId(_)))
+            ),
+            "a reserved id used externally is refused as the typed ReservedId, got {result:?}"
+        );
     }
 }
