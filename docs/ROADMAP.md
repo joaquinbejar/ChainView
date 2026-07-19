@@ -340,7 +340,18 @@ release cycle without a breaking change before promotion.
       license/source/ban allow-lists + the three transitive advisory ignores
       frozen as the reviewed v1.0 gate; `cargo audit` / `cargo deny` proven to
       fail closed on a dry-run breach and on the un-ignored advisories.
-- [ ] #55 — Freeze the CLI/config/keybinding surfaces and SemVer discipline (M; depends on #3, #14, #43)
+- [~] #55 — Freeze the CLI/config/keybinding surfaces and SemVer discipline (M; depends on #3, #14, #43) —
+      the three surfaces (CLI `src/main.rs`, config `src/config.rs`, keybindings
+      `src/app/keymap.rs`) audited against their `docs/` pages and frozen in a new
+      `docs/SEMVER.md` "v1.0 surface-stability audit (#55)" section;
+      `RESERVED_PROVIDER_IDS` confirmed to hold exactly the five built-ins and the
+      port types confirmed `#[non_exhaustive]`/builder-shaped (minor-bump proof via
+      the #44 `trybuild` gate). `scripts/check-changelog.sh` + the blocking
+      `changelog-check` CI job and `scripts/surface-diff.sh` + the informational
+      `surface-diff` job land with self-tests; three doc↔code drifts fixed (keymap
+      source in SEMVER.md + `docs/05` §1/§3; the stale `ProviderId` grammar in
+      `.env.example`). `[package].version` stays pre-1.0 (the v1.0.0-cut rule is
+      recorded, not executed). Docs + CI + scripts only.
 - [ ] #56 — Freeze bundle compatibility against the IronCondor schema (M; depends on #32, #36)
 - [ ] #57 — Run the polish pass on states, theme, and keybindings (M; depends on #18, #27, #35, #47, #48, #49)
 - [ ] #58 — Verify packaging and the zero-config headline acceptance (M; depends on #22, #52, #54)

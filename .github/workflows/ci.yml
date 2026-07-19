@@ -8,6 +8,12 @@
 #   * coverage — non-blocking coverage (cargo-llvm-cov), informational only.
 #   * audit    — `cargo audit` fails on any RUSTSEC advisory (docs/SECURITY.md §7).
 #   * deny     — `cargo deny check` (advisories + licenses + bans + sources).
+#   * changelog-check — a user-visible PR must add a new `[Unreleased]` line
+#                (issue #55, docs/SEMVER.md). Skips on chore:/refactor:/test:/
+#                docs:/ci:/bench: titles and the `[skip changelog]` token.
+#   * surface-diff — INFORMATIONAL: flags a PR touching a frozen public-surface
+#                source (issue #55, docs/SEMVER.md) so a rename/removal is caught
+#                in review. Never fails on a mere touch; its self-test is blocking.
 #
 # CI NEVER touches a real venue — fixtures only. The future live smoke (#22)
 # is `#[ignore]`-by-default, so `cargo test` skips it, and no `SMOKE_*` env var
@@ -298,3 +304,69 @@ jobs:
           tool: cargo-deny
       - name: cargo deny check
         run: cargo deny check
+
+  # --------------------------------------------------------------------------
+  # changelog-check — the CHANGELOG-discipline gate (issue #55, docs/SEMVER.md
+  # "CI enforcement"). BLOCKING on a user-visible PR. Two steps:
+  #
+  #   1. self-test (BLOCKING) — `scripts/check-changelog.sh --self-test` proves
+  #      the gate FIRES without git: an added [Unreleased] line passes, a
+  #      no-added-line diff fails, and both skip paths (skip-prefix,
+  #      [skip changelog]) skip. Deterministic, so a green run means the gate
+  #      detects a missing entry, not that it never ran.
+  #   2. the real gate (BLOCKING) — compares the [Unreleased] block between the
+  #      PR base merge-base and HEAD and requires at least one added line, unless
+  #      the title carries a skip prefix / the `[skip changelog]` token.
+  #
+  # `pull_request`-scoped (the real gate needs a base ref + title) with full
+  # history (`fetch-depth: 0`) so the merge-base is available. Section-scoped +
+  # bounded, so an unrelated PR never flakes. No toolchain needed (bash + git).
+  # --------------------------------------------------------------------------
+  changelog-check:
+    name: changelog-check (Unreleased entry on user-visible PRs)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: check-changelog self-test (blocking)
+        run: bash scripts/check-changelog.sh --self-test
+      - name: changelog gate
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: bash scripts/check-changelog.sh
+
+  # --------------------------------------------------------------------------
+  # surface-diff — the public-surface change reminder (issue #55, docs/SEMVER.md
+  # "What counts as a public surface"). Flags a PR touching a frozen surface
+  # source (src/main.rs CLI grammar, src/config.rs env vars, src/app/keymap.rs
+  # key map, src/ui/theme.rs overlay, src/providers/mod.rs port,
+  # src/chain/identity.rs reserved ids, src/lib.rs exports) so a rename/removal
+  # is caught in review. Two steps, DIFFERENT enforcement by design:
+  #
+  #   1. self-test (BLOCKING) — `--self-test` proves the classifier flags a
+  #      surface touch and ignores an internal-only change (deterministic).
+  #   2. annotation (INFORMATIONAL) — lists the touched surface files with the
+  #      version-increment checklist and always exits 0. A surface source
+  #      changes on almost every additive PR too, so a touch is never a failure;
+  #      the reviewer classifies it minor vs major.
+  #
+  # `pull_request`-scoped with full history so the merge-base is available;
+  # bounded (git diff of file names), so an unrelated PR never flakes.
+  # --------------------------------------------------------------------------
+  surface-diff:
+    name: surface-diff (public-surface change reminder)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: surface-diff self-test (blocking)
+        run: bash scripts/surface-diff.sh --self-test
+      - name: surface-diff annotation (informational)
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: bash scripts/surface-diff.sh
