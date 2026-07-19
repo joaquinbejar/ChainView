@@ -14,6 +14,41 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- The application state machine and synchronous event fan-in (`src/app.rs`,
+  `src/event.rs`, issue #9; `docs/02-tui-architecture.md` §3, §4). `App` owns all
+  render-loop state as a `Live | Replay` `Mode` machine; the fan-in folds every
+  event into state and keeps `ratatui` off the async executor. Key behaviours:
+  - **Mode-scoped screens make out-of-mode pairs unrepresentable.** `LiveScreen
+    { Chain, Depth, Surface, Payoff }` and `ReplayScreen { Replay, Payoff }` are
+    owned by their mode's state, so `Replay` + `Chain` cannot be constructed — the
+    type system, not a runtime fallback, prevents it, and the render dispatch (#13)
+    stays a total, wildcard-free match.
+  - **One exhaustive, wildcard-free fan-in.** `App::on_event` folds each
+    `AppEvent { Key, Resize, Tick, Market, ReplaySeek }` in a single match with no
+    `_` arm and sets `dirty` on any mutation; adding a variant forces every fold
+    site to be revisited by the compiler. `Market(MarketUpdate)` folds into the
+    `ChainStore` (`Quote`/`Greeks` → the merge path, `Chain` → a snapshot-driven
+    `apply_poll`, `Health` → the correct side's badge); an idle tick does not set
+    `dirty`.
+  - **I/O never runs inline.** `on_event` is synchronous and never `.await`s; a
+    handler that needs I/O (reconnect, re-discover, seek/reload the bundle,
+    subscribe) emits a typed `Command { Subscribe, Unsubscribe, Reconnect,
+    Rediscover, SeekBundle, ReloadBundle }` on a bounded command channel via a
+    non-blocking `try_send`.
+  - **Per-side composite health.** `LiveState` binds a `SourceBinding` plus an
+    optional `OverlayBinding`, each carrying its own `ProviderCapabilities` and
+    `StreamHealth`; a health transition routes to the matching side by id equality,
+    so either side failing degrades only that side.
+  - **Capability-driven reachability, never a `ProviderId` match.** The
+    `is_screen_reachable(screen, caps)` helper and `LiveState::set_screen` gate on
+    declared `ProviderCapabilities` (source ∪ overlay), so a screen is only ever
+    set to a reachable value and a built-in and an external provider are gated
+    identically. The `Tab` skip / number-key hint mechanics land in #13/#14.
+  - **Documented stubs with stable shapes.** `ReplayState`/`BundleLoad`/
+    `LoadedReplay`/`Playback` (v0.3) and `PayoffBuilder` (v0.2) are typed
+    placeholders whose enum/struct shapes are fixed now so later work fills the
+    internals without a breaking change; `StatusLine`/`Selection`/`ScreenLoad` are
+    minimal, typed state the render loop (#13/#14) drives.
 - The terminal lifecycle: the RAII `TerminalGuard` and the panic-hook restore
   (`src/terminal.rs`, issue #8; `docs/02-tui-architecture.md` §6, ADR-0001). The
   guard's constructor enables raw mode, enters the alternate screen, and hides the
