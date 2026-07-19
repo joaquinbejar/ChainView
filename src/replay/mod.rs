@@ -1061,10 +1061,17 @@ impl BundleReader {
         // A footer whose uncompressed size dwarfs the on-disk/compressed size is a
         // decompression bomb.
         let on_disk = file_bytes.max(compressed);
-        // Saturate to u64::MAX on overflow: an absurdly large limit simply never
-        // trips this reject (the working-set tally is the real guard), so the
-        // saturated ceiling is the intended, allocation-free behaviour.
-        let bomb_limit = on_disk.saturating_mul(self.ceilings.max_expansion_ratio);
+        // Checked, not saturating (a banned method): a limit that OVERFLOWS u64
+        // would silently disable this reject, so an on-disk size so large that
+        // `on_disk * ratio` cannot be represented is itself rejected as beyond
+        // any plausible ceiling - the check fails CLOSED, never off.
+        let Some(bomb_limit) = on_disk.checked_mul(self.ceilings.max_expansion_ratio) else {
+            return Err(too_large(format!(
+                "{file}: on-disk size {on_disk} B is too large to bound at {}x - \
+                 rejected before decode",
+                self.ceilings.max_expansion_ratio
+            )));
+        };
         if uncompressed > bomb_limit {
             return Err(too_large(format!(
                 "{file}: uncompressed {uncompressed} B exceeds {}x its on-disk size — \
