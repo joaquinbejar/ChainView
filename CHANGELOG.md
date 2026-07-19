@@ -14,6 +14,25 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- The `GraphData` → ratatui dataset adapter (`src/ui/graph.rs`, issue #23;
+  `docs/05-views-and-ux.md` §4, ADR-0001). ratatui does not consume
+  `optionstratlib`'s `GraphData` directly, so `project(&GraphData) ->
+  GraphProjection` maps `GraphData::Series(Series2D)` into the ratatui chart
+  shape — a point series (`&[(f64, f64)]`), x/y `AxisBounds`, and precomputed
+  numeric endpoint labels. The projection is **fallible and first-class-empty**:
+  an empty, mismatched-length, or all-non-finite series yields
+  `GraphProjection::Empty(EmptyReason::{NoData, Degenerate, Unsupported})` — never
+  a panic and never a fabricated series — so the payoff (#27), replay (#35), and
+  vol-surface (#47) screens render a deliberate empty state rather than blanking.
+  Geometry is never built in `draw`: a `GraphCache { input, projection }` projects
+  off the draw path and `draw` reads only the cached projection (`draw` takes
+  `&State`, so it cannot re-project or fabricate a `GraphData`, asserted by a
+  purity test). `Series2D`'s parallel `Vec<Decimal>` domain is formatted to plot
+  `f64` at the UI edge only, and every coordinate crosses a single NaN/Inf gate
+  before entering a dataset. The `MultiSeries`/`GraphSurface` variants are matched
+  wildcard-free (→ `Unsupported`) so v0.5's overlaid Greek curves / surface fill
+  those arms at compile-time. 15 unit + property tests. No new dependency
+  (`ToPrimitive` from the `optionstratlib` prelude).
 - The end-to-end live-path integration test, the layering arch test, the
   external faux-provider conformance, and the manual live smoke (issue #22 Part B;
   `docs/TESTING.md` §7–§8, `docs/03-data-providers.md` §11–§12). **Live-path

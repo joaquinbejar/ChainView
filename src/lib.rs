@@ -86,6 +86,16 @@ pub use ui::{RootLayout, layout_root, render};
 // `OptionChain` at draw time and borrowed, never owned. Public so the render
 // goldens (#19) and downstream screens (#25) can name the projected shapes.
 pub use ui::chain::{ChainRow, LegView};
+// The `GraphData` → ratatui dataset adapter (`src/ui/graph.rs`, issue #23,
+// `docs/05-views-and-ux.md` §4): the fallible projection of an `optionstratlib`
+// `GraphData` into a ratatui chart shape (borrowed `(f64, f64)` points + `[f64; 2]`
+// axis bounds + precomputed labels), and the cache handle that keeps `GraphData`
+// construction off the draw path. Public so the payoff screen (#27), the replay
+// screens (#35), and the vol surface (#47) can hold the cache on their state and
+// name the projected shapes.
+pub use ui::graph::{
+    AxisBounds, EmptyReason, GraphCache, GraphProjection, ProjectedSeries, project,
+};
 // The theme + render surface: the `NO_COLOR`-aware `Theme`, the
 // help-overlay/status/keybar renderers, the `StrikeRelation` K/S bucket and its
 // markers/spans, the responsive chain column-drop policy, and the too-small guard
