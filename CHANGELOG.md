@@ -14,6 +14,42 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- First bench suite and the `BENCH.md` baseline (issue #21;
+  `docs/06-performance.md` §3–§5, `docs/TESTING.md` §11). Three `criterion`
+  benches under `benches/`, each a `harness = false` binary that reports
+  `hdrhistogram` p50/p99/p99.9 (the tail is the headline; criterion's mean is
+  context only) with a per-bench coordinated-omission disclosure, warmup, and a
+  documented sample count: **`bench_render_chain`** (HP-1, draw the fullest
+  64-strike chain matrix into a `TestBackend` @ 120×40), **`bench_event_fanin`**
+  (HP-2, fold a 128-leg `MarketUpdate` burst through `App::on_event`), and
+  **`bench_chain_merge`** (HP-3, a Deribit `ticker.`+`book.` payload → coalescing
+  `OptionChain` merge, plus the NFR-15 bounded-memory staging-bound probe).
+  `BENCH.md` records the first measured baseline with the measurement
+  environment; NFR-14 (16 ms/60 fps p99 frame budget) and NFR-15 (bounded memory)
+  are re-baselined as **MEASURED**, NFR-16 (startup-to-first-chain) stays
+  **PENDING** (a cold, network-dominated path measured against a live venue, not
+  in the deterministic fixture suite). Harness seam: a `bench` Cargo feature
+  (`[features] bench = []`, OFF by default) gates a `#[cfg(feature = "bench")]
+  pub mod bench_support` exposing only the constructors the benches need (a
+  populated render `App`, a seeded `ChainStore`, a scripted `MarketUpdate` burst,
+  and the Deribit payload → coalescing-merge harness) plus a
+  `#[cfg(feature = "bench")]` Deribit stream-normalize helper and the
+  widened-cfg fixture/`EventBridge` staging accessors — so **the default public
+  surface is unchanged** (nothing new appears without the feature; the benches
+  set `required-features = ["bench"]`). Supply-chain: `criterion` and
+  `hdrhistogram` are **`[dev-dependencies]`** — neither rides in the release
+  binary, both are used only by the `bench`-gated targets. `criterion 0.5` is
+  pulled with `default-features = false, features = ["cargo_bench_support"]` to
+  drop the `plotters`/`rayon`/html-report tree; `hdrhistogram 7` is the
+  percentile recorder. Both are well under the crate's 1.88 MSRV. Audit note:
+  `cargo audit` reports **0 vulnerabilities** on the resulting tree; the
+  `criterion 0.5.1` / `hdrhistogram 7.5.4` subtree (`ciborium`, `clap`, `half`,
+  `tinytemplate`, `oorandom`, `anes`, …) introduces **no new RUSTSEC advisory** —
+  the three pre-existing informational warnings (`dotenv` unmaintained via
+  `deribit-*`, `paste` unmaintained via `nalgebra`/`ratatui`, `lru` unsound via
+  `ratatui`) are unrelated and already tracked. As dev-dependencies neither crate
+  ships in the release binary; the CI `cargo audit`/`cargo deny` gates (#20) cover
+  them going forward.
 - CI pipeline and supply-chain gates from v0.1 (`.github/workflows/ci.yml`,
   `deny.toml`, `.github/pull_request_template.md`, issue #20; `docs/SECURITY.md`
   §7.1, `docs/TESTING.md` §13.5, `docs/specs/providers.md` §0). The GitHub

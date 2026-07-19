@@ -973,9 +973,15 @@ fn assemble_chain(
 /// chain) proves the rendered matrix reflects the adapter's output. Passing a
 /// **hostile** `underlying` also proves the seam keeps venue bytes verbatim — the
 /// domain never mangles a venue string — so it is the render edge, not the domain,
-/// that neutralizes the escape sequence (`docs/SECURITY.md` §6.4). `#[cfg(test)]`,
-/// so it never rides in the release binary; the fixture bytes are baked in with
-/// `include_str!`, so the golden is byte-stable across machines (no I/O, no socket).
+/// that neutralizes the escape sequence (`docs/SECURITY.md` §6.4).
+/// `#[cfg(test)]`, so it never rides in the release binary and is **test-only**:
+/// the published `bench` feature deliberately does NOT reach into
+/// `tests/fixtures/` (that tree is excluded from the packaged crate by the
+/// `Cargo.toml` `include` list), so a downstream `cargo build --features bench`
+/// stays self-contained — the scalable bench bodies use the synthetic producers
+/// in [`crate::bench_support`], not this recorded fixture (issue #21). The fixture
+/// bytes are baked in with `include_str!`, so the golden is byte-stable across
+/// machines (no I/O, no socket).
 #[cfg(test)]
 pub(crate) fn fixture_btc_chain_fetch_named(underlying: &str) -> ChainFetch {
     use deribit_http::model::ticker::TickerData;
@@ -1048,6 +1054,140 @@ pub(crate) fn fixture_btc_chain_fetch_named(underlying: &str) -> ChainFetch {
         &legs,
         &deribit_provider_id(),
     )
+}
+
+// ---------------------------------------------------------------------------
+// Bench-only streaming-normalization burst (#21) — the HP-3 seam.
+// ---------------------------------------------------------------------------
+
+/// Bench-only: normalize a synthetic `ticker.`+`book.` burst for `legs` through
+/// the **real** streaming-normalization seam ([`normalize_ticker`] /
+/// [`normalize_book`]) — the busiest provider path (HP-3,
+/// `docs/06-performance.md` §2) exercised with no socket and no wall clock.
+///
+/// `round` perturbs each quote so successive bursts carry fresh, non-crossed
+/// values (the coalescing merge then does real last-value-wins work), and every
+/// event carries a monotonically advancing venue `event_time`, so the store's
+/// per-instrument watermark advances rather than dropping the update out of
+/// order. Each leg yields a [`QuoteUpdate`], a [`GreeksRow`], and a
+/// [`DepthLadder`] — the three coalesced-class updates the Deribit overlay emits.
+///
+/// Gated behind the `bench` feature only (its sole caller is
+/// [`crate::bench_support`], also `bench`-gated), so it never rides in a normal
+/// build and adds nothing to the default public surface.
+#[cfg(feature = "bench")]
+pub(crate) fn bench_stream_burst(
+    legs: &[Instrument],
+    round: u64,
+    received: DateTime<Utc>,
+) -> Vec<MarketUpdate> {
+    // A deterministic, non-crossed quote that varies by round (16-step cycle) so
+    // the merge is real work, not a no-op re-apply of an identical value.
+    let step = u32::try_from(round % 16).unwrap_or(0);
+    let base = 1.0 + f64::from(step) * 0.05;
+    // Advance the venue `event_time` monotonically so the store's watermark
+    // accepts each burst (an equal or lower timestamp would drop as out of order).
+    let base_ms = 1_751_011_200_000_i64; // 2025-06-27T08:00:00Z, the fixture expiry
+    let event_ms = base_ms
+        .checked_add(i64::try_from(round).unwrap_or(0))
+        .unwrap_or(i64::MAX);
+
+    let mut out = Vec::new();
+    for leg in legs {
+        let ticker = TickerPayload {
+            best_bid_price: Some(base),
+            best_ask_price: Some(base + 0.2),
+            best_bid_amount: Some(10.0),
+            best_ask_amount: Some(12.0),
+            last_price: Some(base + 0.1),
+            mark_iv: Some(49.22),
+            timestamp: Some(event_ms),
+            greeks: Some(GreeksPayload {
+                delta: Some(0.5),
+                gamma: Some(0.01),
+            }),
+        };
+        let (quote, greeks) = normalize_ticker(leg, &ticker, received);
+        out.push(MarketUpdate::Quote(quote));
+        out.push(MarketUpdate::Greeks(greeks));
+
+        let book = BookPayload {
+            change_id: Some(round),
+            timestamp: Some(event_ms),
+            bids: vec![
+                BookLevel::Priced([base, 10.0]),
+                BookLevel::Priced([base - 0.1, 20.0]),
+            ],
+            asks: vec![
+                BookLevel::Priced([base + 0.2, 12.0]),
+                BookLevel::Priced([base + 0.3, 22.0]),
+            ],
+        };
+        out.push(MarketUpdate::Depth(normalize_book(leg, &book, received)));
+    }
+    out
+}
+
+/// Bench-only handle over the production [`ProducerStaging`] overwrite-on-full
+/// conflater (`docs/02-tui-architecture.md` §5), so the HP-3 harness and its
+/// saturation test drive the **real** NFR-15 producer path rather than a raw
+/// `try_send` that would DROP the newest under a full channel. Publishing a
+/// `ticker.`+`book.` burst onto a channel bounded BELOW the burst size overflows
+/// it, and the freshest value per instrument is STAGED (last-value-wins per kind),
+/// never dropped — the property the bench must actually exercise (issue #21).
+///
+/// `#[cfg(feature = "bench")]` and `pub(crate)`: it never appears on the default
+/// or the semver-governed public surface, and it wraps the private staging map so
+/// no producer internals leak.
+#[cfg(feature = "bench")]
+#[derive(Debug, Default)]
+pub(crate) struct BenchProducerStaging {
+    inner: ProducerStaging,
+}
+
+#[cfg(feature = "bench")]
+impl BenchProducerStaging {
+    /// An empty producer conflater.
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: ProducerStaging::new(),
+        }
+    }
+
+    /// Publish one synthetic `ticker.`+`book.` burst for `legs` through the real
+    /// overwrite-on-full producer path onto the bounded `tx`. A full channel
+    /// **stages** (never drops) the freshest value per instrument. Returns `false`
+    /// only once the channel has closed.
+    pub(crate) fn publish_burst(
+        &mut self,
+        tx: &mpsc::Sender<MarketUpdate>,
+        legs: &[Instrument],
+        round: u64,
+        received: DateTime<Utc>,
+    ) -> bool {
+        for update in bench_stream_burst(legs, round, received) {
+            if self.inner.publish(tx, update) == SendState::Closed {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Retry the staged residue onto `tx` as the channel drains — the producer
+    /// flush tick the streaming loop performs. Returns `false` on a closed channel.
+    /// Test-only: the drain-to-quiescence loop of the saturation test uses it; the
+    /// non-saturating HP-3 harness never stages, so it never needs to retry.
+    #[cfg(test)]
+    pub(crate) fn flush(&mut self, tx: &mpsc::Sender<MarketUpdate>) -> bool {
+        self.inner.flush(tx) == SendState::Open
+    }
+
+    /// True while any instrument still holds a staged value awaiting channel space.
+    /// Test-only (see [`flush`](Self::flush)).
+    #[cfg(test)]
+    pub(crate) fn has_pending(&self) -> bool {
+        self.inner.has_pending()
+    }
 }
 
 // ---------------------------------------------------------------------------

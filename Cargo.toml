@@ -13,6 +13,16 @@ keywords = ["finance", "options", "tui", "terminal", "trading"]
 categories = ["finance", "command-line-utilities"]
 include = ["src/**/*", "Cargo.toml", "README.md", "LICENSE"]
 
+[features]
+# `bench` gates the bench-only support surface (`src/bench_support.rs` plus the
+# `#[cfg(feature = "bench")]` constructors reached by `benches/*`). It is OFF by
+# default and OUT of the semver-governed public API: a normal `cargo build`
+# (no `--features bench`) exposes the exact same public surface it did before —
+# nothing under this feature appears without it (issue #21). The three
+# `[[bench]]` targets set `required-features = ["bench"]`, so `cargo bench`
+# without the feature simply skips them.
+bench = []
+
 [lib]
 name = "chainview"
 path = "src/lib.rs"
@@ -89,6 +99,20 @@ deribit-websocket = "0.3.1"
 
 [dev-dependencies]
 proptest = "1"
+# The bench harness (issue #21, `benches/*`, `docs/06-performance.md` §4,
+# `docs/TESTING.md` §11). DEV-ONLY — neither crate rides in the release binary,
+# and both are used exclusively by the `required-features = ["bench"]` targets.
+# `criterion` is the timing harness; `default-features = false` drops the
+# `plotters`/`rayon`/html-report tree we do not use, keeping only
+# `cargo_bench_support` (the `--bench` CLI + summary). `hdrhistogram` records the
+# p50/p99/p99.9 tail that headlines `BENCH.md` (a frame budget is a tail metric,
+# so criterion's mean is context only). Explicit-approval addition (CLAUDE.md
+# "Coding Rules") — supply-chain audit note in CHANGELOG. MSRV: both are well
+# under the crate's 1.88 floor.
+criterion = { version = "0.5", default-features = false, features = [
+    "cargo_bench_support",
+] }
+hdrhistogram = "7"
 # `test-util` enables the controllable virtual clock (`#[tokio::test(start_paused
 # = true)]`, `tokio::time::pause`/`advance`) so the supervisor's 2 s
 # bounded-join-then-abort is asserted with ZERO real wall-clock wait (issue #11).
@@ -118,6 +142,25 @@ unimplemented = "deny"
 dbg_macro = "deny"
 print_stdout = "deny"
 print_stderr = "deny"
+
+# The three v0.1 hot-path benches (issue #21). Each is a `harness = false`
+# binary (its own `main` drives criterion + the hdrhistogram tail report) and is
+# gated behind the `bench` feature, so it compiles only under
+# `cargo bench --features bench` and never touches the default build.
+[[bench]]
+name = "bench_render_chain"
+harness = false
+required-features = ["bench"]
+
+[[bench]]
+name = "bench_event_fanin"
+harness = false
+required-features = ["bench"]
+
+[[bench]]
+name = "bench_chain_merge"
+harness = false
+required-features = ["bench"]
 
 [profile.release]
 lto = true
