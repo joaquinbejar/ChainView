@@ -105,6 +105,27 @@ deribit-http = "0.7.1"
 # (feature-unified toward `full`), `serde`/`serde_json`, `url`, and `dotenv`
 # with the existing tree. `aws-lc-rs` requires a C/ASM toolchain at build time.
 deribit-websocket = "0.3.1"
+# The Parquet reader for the IronCondor result bundle (issue #30, ADR-0010,
+# `docs/04-replay-mode.md` §2/§3). The bundle's four tables are Parquet; the
+# reader decodes them batch-by-batch under measured resource ceilings. ChainView
+# never reimplements the columnar format — a hand-rolled reader would violate the
+# no-reimplement rule (CLAUDE.md), and `arrow2` is unmaintained, so `parquet` (the
+# arrow-rs crate) is the choice. Explicit-approval addition (CLAUDE.md "Coding
+# Rules") — audit note in CHANGELOG + ADR-0010. MSRV: parquet 59 is 1.85, under
+# our 1.88 floor (verified with `cargo +1.88 check`).
+# Feature trim: `default-features = false` drops the `async` reader, `object_store`,
+# and the unused codecs; only `arrow` (the `RecordBatchReader` the ceiling decode
+# iterates) plus the three common compression codecs — `snap`, `zstd`, `lz4` —
+# are enabled. The bundle contract (`docs/04` §2) does not yet name a codec, so the
+# trio is enabled as a contract clarification to settle with IronCondor (ADR-0010).
+# The decode is synchronous, batched, and cancellation-polled on a blocking worker
+# — NO `async` feature, so `tokio` is not pulled into the domain reader.
+parquet = { version = "59", default-features = false, features = [
+    "arrow",
+    "snap",
+    "zstd",
+    "lz4",
+] }
 
 [dev-dependencies]
 proptest = "1"
@@ -128,6 +149,16 @@ hdrhistogram = "7"
 # Dev-only, so it never rides in the release binary; the runtime/macros/time
 # features it needs are already in the main `tokio` dependency.
 tokio = { version = "1", default-features = false, features = ["test-util"] }
+# The Parquet test-writer support (issue #30). DEV-ONLY — none rides in the
+# release binary. `arrow-array`/`arrow-schema` (matched to `parquet` 59's arrow
+# epoch) build the `RecordBatch`es the `#[cfg(test)]` writer serialises into tiny
+# real Parquet files for the ceiling round-trips; they are already compiled in the
+# tree as `parquet`'s own transitive deps, so this only names them for the tests.
+# `tempfile` gives each test an auto-cleaned bundle directory (RAII `TempDir`), so
+# no test leaves artifacts behind. All RUSTSEC-clean, well under the 1.88 floor.
+arrow-array = "59"
+arrow-schema = "59"
+tempfile = "3"
 
 # The panic-injection restore harness is a bare subprocess (no libtest capture),
 # so the child panics on a normal process with the default hook as the chained

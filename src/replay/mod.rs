@@ -9,10 +9,34 @@
 //! but never changed unilaterally
 //! ([ADR-0004](https://github.com/joaquinbejar/ChainView/blob/main/docs/adr/0004-ironcondor-result-bundle-as-replay-format.md)).
 //!
-//! This module (issue #29) fixes the **type shapes** every later replay issue is
-//! written against: the reader body (#30), the Parquet decoders (#31), and the
-//! validation chain (#32). It defines the types and their `serde` shape only —
-//! **no I/O, no Parquet decode, and no validation** live here.
+//! Issue #29 fixed the **type shapes** every later replay issue is written
+//! against; issue #30 lands the **reader body and the untrusted-input hardening
+//! spine**: [`BundleReader::open`] validates the directory + `manifest.json`
+//! (presence, its **own byte ceiling** — an oversized manifest is a *manifest
+//! bomb*, rejected on the pre-read `stat` before a byte is slurped — schema gate,
+//! `row_counts` shape) and validates the operator-supplied [`ResourceCeilings`]
+//! **on the enforcement path**, and [`BundleReader::load`] enforces the **three
+//! resource ceilings** ([`ResourceCeilings`], `docs/04-replay-mode.md` §3) via a
+//! **measured, batched, cancellable** Parquet decode that stops the moment the
+//! running working set would exceed the budget — so a malformed or oversized
+//! bundle is a typed [`BundleError`], never a panic or an unbounded allocation.
+//! The per-batch cap ([`MAX_BATCH_BYTES`]) is a **post-materialization** reject —
+//! a batch is decoded and measured *before* it is checked — so the reader's true
+//! transient peak is ~one batch (bounded by [`MAX_BATCH_ROWS`] × the column
+//! widths), not the whole table; that is the documented residual #36's
+//! adversarial fixtures probe. The **typed per-column decode** into `Vec<Fill>`
+//! etc. (#31) and the **cross-table validation chain** (#32) are still pending —
+//! `load` runs the ceilings and returns a [`LoadedBundle`] whose tables are empty
+//! until #31 wires the typed decode at the documented seam.
+//!
+//! # Read-only
+//!
+//! [`BundleReader`] only ever **stats, opens, and reads** files under `root`; it
+//! never writes, moves, renames, or mutates a bundle (`CLAUDE.md` "Module
+//! Boundaries"). The decode is synchronous and runs off the render thread (on the
+//! replay load/seek worker), polling a caller-supplied cancellation probe at every
+//! batch boundary — the domain stays free of `tokio`, so cancellation is a plain
+//! `&dyn Fn() -> bool` the app seam adapts from its shutdown token.
 //!
 //! # Binding properties (set by the type shapes themselves)
 //!
@@ -45,13 +69,15 @@
 //! error, never a silent default.
 
 use std::collections::BTreeMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use optionstratlib::OptionStyle;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::error::BundleError;
+use crate::error::{BundleError, ConfigError};
 
 /// The versioned `contract_id` join-key format, fixed here as the single source
 /// of truth for the round-trip check the validation chain (#32) enforces.
@@ -380,7 +406,11 @@ pub struct GreeksAttribution {
 
 /// A fully materialised bundle — the manifest plus the four decoded tables, each
 /// sorted by its stated sort key (`docs/04-replay-mode.md` §3). Produced by
-/// [`BundleReader::load`] (body lands in #30).
+/// [`BundleReader::load`].
+///
+/// Issue #30 lands the manifest + the resource-ceiling spine, so `load` returns
+/// this with the validated manifest and **empty** tables; the typed per-column
+/// decode that fills the four `Vec`s (sorted + validated) is issue #31/#32.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LoadedBundle {
     /// The validated manifest.
@@ -395,30 +425,467 @@ pub struct LoadedBundle {
     pub greeks: Vec<GreeksAttribution>,
 }
 
-/// A **read-only** reader over a result-bundle directory
-/// (`docs/04-replay-mode.md` §3).
+// ---------------------------------------------------------------------------
+// Resource ceilings (`docs/04-replay-mode.md` §3). The bundle is UNTRUSTED
+// external input: `manifest.row_counts` is an integrity hint that never sizes an
+// allocation, every footer integer crosses into an allocation size via checked
+// `try_from`/`checked_mul` (never an `as` cast), and the working-set budget is a
+// measured, batched, cancellable tally that stops the moment the running total
+// would exceed the ceiling — so the allocation never actually reaches it.
+// ---------------------------------------------------------------------------
+
+/// Bundle file names, in the order the reader stats + decodes them, paired with
+/// each table's `row_counts` key (`docs/04-replay-mode.md` §2.2).
+const TABLES: [(&str, &str); 4] = [
+    ("fills.parquet", "fills"),
+    ("equity_curve.parquet", "equity_curve"),
+    ("positions.parquet", "positions"),
+    ("greeks_attribution.parquet", "greeks_attribution"),
+];
+
+/// The manifest file name at the bundle root.
+const MANIFEST_FILE: &str = "manifest.json";
+
+/// The single supported bundle schema tag — the compatibility gate
+/// (`docs/04-replay-mode.md` §5 step 1). A `manifest.schema` other than this is
+/// [`BundleError::UnsupportedSchema`].
+pub const SUPPORTED_SCHEMA: &str = "ironcondor.bundle.v1";
+
+/// **Manifest ceiling** default — reject a `manifest.json` whose on-disk size
+/// exceeds this (8 MiB) on the pre-read `stat`, *before* it is slurped into a
+/// `Vec<u8>`. A valid manifest is tiny (run provenance + a few opaque JSON
+/// blobs), so a giant one is a *manifest bomb* — an OOM on attacker-controlled
+/// input the three table ceilings would not catch (they apply only to the four
+/// Parquet tables). `docs/SECURITY.md` §6.2 per-file ceiling; `docs/04` §3.
+pub const MAX_MANIFEST_BYTES: u64 = 8 * 1024 * 1024;
+/// **Ceiling 1** default — reject a Parquet file whose on-disk size exceeds this
+/// (512 MiB), *before* opening it.
+pub const MAX_TABLE_BYTES: u64 = 512 * 1024 * 1024;
+/// **Ceiling 2** default — reject a table whose Parquet **footer** declares more
+/// rows than this (5,000,000), *before* decode.
+pub const MAX_TABLE_ROWS: u64 = 5_000_000;
+/// **Ceiling 3** default — the total measured working set across all four tables
+/// may not exceed this (2 GiB); the decode stops the moment it would.
+pub const MAX_WORKING_SET: u64 = 2 * 1024 * 1024 * 1024;
+/// Decode granularity — rows per `RecordBatch` (65,536), so the working set is
+/// measured and capped incrementally rather than after materialising a table.
+pub const MAX_BATCH_ROWS: usize = 65_536;
+/// Per-batch measured-size cap (256 MiB) — a single decoded batch larger than
+/// this is [`BundleError::TooLarge`], independent of the running total. This is a
+/// **post-materialization** reject: the batch is decoded and measured *before* it
+/// is checked, so the reader's true transient peak is ~one batch (bounded by
+/// [`MAX_BATCH_ROWS`] × the column widths), not the whole table — the documented
+/// residual #36's adversarial fixtures probe.
+pub const MAX_BATCH_BYTES: u64 = 256 * 1024 * 1024;
+/// Decoded-overhead multiplier in **per-mille** (1500 = 1.5×). The owned rows +
+/// the sort workspace #31/#32 need cost more than the raw decoded buffers, so the
+/// measured tally inflates each batch by this factor. Held as an integer per-mille
+/// so the budget arithmetic stays exact (no `f64` on the allocation path).
+pub const DECODED_OVERHEAD_PERMILLE: u64 = 1_500;
+/// Decompression-bomb reject ratio (20×) — a footer whose declared uncompressed
+/// size exceeds this multiple of the on-disk/compressed size is rejected before
+/// decode.
+pub const MAX_EXPANSION_RATIO: u64 = 20;
+
+/// The configurable resource ceilings the reader enforces on an untrusted bundle
+/// (`docs/04-replay-mode.md` §3). Defaults are the documented `MAX_*` constants;
+/// tests tighten them to exercise each ceiling on a tiny fixture.
 ///
-/// It records the bundle `root` and never writes, moves, renames, or otherwise
-/// mutates anything under it — a bundle is immutable from ChainView's side. The
-/// [`open`](Self::open) / [`load`](Self::load) bodies are implemented in #30;
-/// this issue (#29) fixes only the stable signature so #30/#31/#32 compile
-/// against it.
-#[derive(Debug, Clone)]
-pub struct BundleReader {
-    root: PathBuf,
+/// These are configuration knobs: [`validate`](Self::validate) checks them at
+/// startup so an out-of-range value is a typed [`ConfigError`], never a panic or
+/// a runaway allocation. (Wiring a CLI/env/file override into [`crate::Config`]
+/// is deferred to the config surface; the defaults are always valid.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResourceCeilings {
+    /// Manifest ceiling — per-`manifest.json` on-disk byte limit, stat-checked
+    /// before the manifest is read (a *manifest bomb* is rejected pre-read).
+    pub max_manifest_bytes: u64,
+    /// Ceiling 1 — per-file on-disk byte limit.
+    pub max_table_bytes: u64,
+    /// Ceiling 2 — per-table Parquet-footer row limit.
+    pub max_table_rows: u64,
+    /// Ceiling 3 — total measured working-set limit across all four tables.
+    pub max_working_set: u64,
+    /// Rows per decoded `RecordBatch`.
+    pub max_batch_rows: usize,
+    /// Per-batch measured-size cap.
+    pub max_batch_bytes: u64,
+    /// Decoded-overhead multiplier, in per-mille (1000 = 1.0×).
+    pub decoded_overhead_permille: u64,
+    /// Decompression-bomb reject ratio.
+    pub max_expansion_ratio: u64,
 }
 
-impl BundleReader {
-    /// Record the bundle `root`. This stub performs **no** filesystem access —
-    /// manifest validation is wired in #30 — so it never mutates the bundle and
-    /// succeeds even for a not-yet-existing path.
+impl Default for ResourceCeilings {
+    fn default() -> Self {
+        Self {
+            max_manifest_bytes: MAX_MANIFEST_BYTES,
+            max_table_bytes: MAX_TABLE_BYTES,
+            max_table_rows: MAX_TABLE_ROWS,
+            max_working_set: MAX_WORKING_SET,
+            max_batch_rows: MAX_BATCH_ROWS,
+            max_batch_bytes: MAX_BATCH_BYTES,
+            decoded_overhead_permille: DECODED_OVERHEAD_PERMILLE,
+            max_expansion_ratio: MAX_EXPANSION_RATIO,
+        }
+    }
+}
+
+impl ResourceCeilings {
+    /// Validate the ceiling knobs at startup (`rules/global_rules.md`
+    /// "Configuration"). Every knob must be usable: the byte/row limits and the
+    /// batch granularity must be non-zero, the per-batch cap must fit inside the
+    /// working-set limit, the overhead multiplier must be at least `1.0×` (else it
+    /// would under-count the decoded working set), and the expansion ratio must be
+    /// at least `1×`.
     ///
     /// # Errors
     ///
-    /// Infallible today; the signature stays `Result` because #30's real body
-    /// validates the manifest and may return [`BundleError`].
+    /// Returns [`ConfigError::InvalidValue`] naming the offending field when a
+    /// knob is out of range — an operator misconfiguration is a clear typed error,
+    /// never a panic or an unbounded allocation.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        let invalid = |field: &str, reason: String| ConfigError::InvalidValue {
+            field: field.to_owned(),
+            reason,
+        };
+        if self.max_manifest_bytes == 0 {
+            return Err(invalid(
+                "replay.max_manifest_bytes",
+                "must be > 0".to_owned(),
+            ));
+        }
+        if self.max_table_bytes == 0 {
+            return Err(invalid("replay.max_table_bytes", "must be > 0".to_owned()));
+        }
+        if self.max_table_rows == 0 {
+            return Err(invalid("replay.max_table_rows", "must be > 0".to_owned()));
+        }
+        if self.max_working_set == 0 {
+            return Err(invalid("replay.max_working_set", "must be > 0".to_owned()));
+        }
+        if self.max_batch_rows == 0 {
+            return Err(invalid("replay.max_batch_rows", "must be > 0".to_owned()));
+        }
+        if self.max_batch_bytes == 0 {
+            return Err(invalid("replay.max_batch_bytes", "must be > 0".to_owned()));
+        }
+        if self.max_batch_bytes > self.max_working_set {
+            return Err(invalid(
+                "replay.max_batch_bytes",
+                format!(
+                    "per-batch cap {} must not exceed the working-set ceiling {}",
+                    self.max_batch_bytes, self.max_working_set
+                ),
+            ));
+        }
+        if self.decoded_overhead_permille < 1_000 {
+            return Err(invalid(
+                "replay.decoded_overhead_permille",
+                format!(
+                    "must be >= 1000 (1.0x); got {}",
+                    self.decoded_overhead_permille
+                ),
+            ));
+        }
+        if self.max_expansion_ratio == 0 {
+            return Err(invalid(
+                "replay.max_expansion_ratio",
+                "must be >= 1".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Build a [`BundleError::TooLarge`] on the cold ceiling-reject path.
+#[cold]
+#[inline(never)]
+fn too_large(detail: String) -> BundleError {
+    BundleError::TooLarge(detail)
+}
+
+/// Build a [`BundleError::Invariant`] on the cold integrity-reject path.
+#[cold]
+#[inline(never)]
+fn invariant(detail: String) -> BundleError {
+    BundleError::Invariant(detail)
+}
+
+/// Build a [`BundleError::Io`] on the cold filesystem-error path (non-secret).
+#[cold]
+#[inline(never)]
+fn io_err(detail: String) -> BundleError {
+    BundleError::Io(detail)
+}
+
+/// Build a [`BundleError::Parquet`] on the cold decode-error path.
+#[cold]
+#[inline(never)]
+fn parquet_err(detail: String) -> BundleError {
+    BundleError::Parquet(detail)
+}
+
+/// Build a [`BundleError::MissingTable`] on the cold absent-file path.
+#[cold]
+#[inline(never)]
+fn missing_table(detail: String) -> BundleError {
+    BundleError::MissingTable(detail)
+}
+
+/// Maximum characters retained from an attacker-supplied `manifest.schema` tag
+/// in a [`BundleError::UnsupportedSchema`] message. A valid tag is ~20 chars, so
+/// a longer one is clamped (on a `char` boundary) with an ellipsis marker to keep
+/// the error message bounded regardless of how much junk the bundle supplies
+/// (`docs/SECURITY.md` §6). Further sanitized at the render edge.
+const MAX_SCHEMA_TAG_CHARS: usize = 64;
+
+/// Clamp an attacker-supplied schema `tag` to [`MAX_SCHEMA_TAG_CHARS`] characters,
+/// appending a single `…` marker when it was longer. Operates on **`char`
+/// boundaries** (`chars().take(..)`), so a multi-byte UTF-8 tag never panics on a
+/// byte-index split, and the result is bounded no matter the input length.
+fn clamp_schema_tag(tag: String) -> String {
+    if tag.chars().count() <= MAX_SCHEMA_TAG_CHARS {
+        return tag;
+    }
+    let mut clamped: String = tag.chars().take(MAX_SCHEMA_TAG_CHARS).collect();
+    clamped.push('…');
+    clamped
+}
+
+/// Build a [`BundleError::UnsupportedSchema`] on the cold schema-gate path,
+/// **clamping** the attacker-supplied tag ([`clamp_schema_tag`]) so a
+/// length-unbounded junk tag cannot bloat the error message.
+#[cold]
+#[inline(never)]
+fn unsupported_schema(tag: String) -> BundleError {
+    BundleError::UnsupportedSchema(clamp_schema_tag(tag))
+}
+
+/// Convert a Parquet footer `i64` (a row count or byte size) into a `u64` via a
+/// **checked** conversion — never an `as` cast. A negative (corrupt or lying)
+/// footer value is [`BundleError::TooLarge`], not a wrapped giant.
+#[inline]
+fn footer_i64_to_u64(raw: i64, what: &str) -> Result<u64, BundleError> {
+    u64::try_from(raw).map_err(|_| too_large(format!("{what}: negative footer value {raw}")))
+}
+
+/// Apply the decoded-overhead multiplier to a measured byte count using
+/// **checked** integer arithmetic. A multiplication overflow is
+/// [`BundleError::TooLarge`] (the count is absurd), never a wrapped `as` cast.
+#[inline]
+fn apply_overhead(bytes: u64, permille: u64) -> Result<u64, BundleError> {
+    bytes
+        .checked_mul(permille)
+        .map(|scaled| scaled / 1_000)
+        .ok_or_else(|| {
+            too_large(format!(
+                "decoded size {bytes} overflows the overhead multiplier"
+            ))
+        })
+}
+
+/// The running measured working set across all four tables. It commits a batch's
+/// bytes only if doing so keeps the total under the ceiling, so on the rejecting
+/// path [`used`](Self::used) is always strictly below `max_working_set` — the
+/// allocation the budget guards never reaches the ceiling
+/// (`docs/04-replay-mode.md` §3).
+#[derive(Debug, Clone, Copy)]
+struct WorkingSetBudget {
+    used: u64,
+    max_working_set: u64,
+    max_batch_bytes: u64,
+}
+
+impl WorkingSetBudget {
+    fn new(ceilings: &ResourceCeilings) -> Self {
+        Self {
+            used: 0,
+            max_working_set: ceilings.max_working_set,
+            max_batch_bytes: ceilings.max_batch_bytes,
+        }
+    }
+
+    /// Account one decoded batch's measured working-set bytes. Rejects with
+    /// [`BundleError::TooLarge`] — **without committing** — the moment the batch
+    /// exceeds the per-batch cap or the running total *would* exceed the
+    /// working-set ceiling, so [`used`](Self::used) never crosses the ceiling.
+    fn account(&mut self, batch_bytes: u64) -> Result<(), BundleError> {
+        if batch_bytes > self.max_batch_bytes {
+            return Err(too_large(format!(
+                "decoded batch {batch_bytes} B exceeds per-batch cap {} B",
+                self.max_batch_bytes
+            )));
+        }
+        let next = self
+            .used
+            .checked_add(batch_bytes)
+            .ok_or_else(|| too_large("cumulative working set overflowed u64".to_owned()))?;
+        if next > self.max_working_set {
+            return Err(too_large(format!(
+                "cumulative working set {next} B would exceed ceiling {} B",
+                self.max_working_set
+            )));
+        }
+        self.used = next;
+        Ok(())
+    }
+
+    /// The committed working set so far — always `< max_working_set`.
+    #[inline]
+    fn used(&self) -> u64 {
+        self.used
+    }
+}
+
+/// Reject a `row_counts` map that is not the **fixed shape** — exactly the four
+/// table keys (`docs/04-replay-mode.md` §2.1). It is an integrity hint, so a
+/// wrong-keyed map is [`BundleError::Invariant`]; negative/non-integer counts are
+/// already rejected by the `u64` typed parse in [`BundleManifest`].
+fn validate_row_counts_shape(row_counts: &BTreeMap<String, u64>) -> Result<(), BundleError> {
+    for (_file, key) in TABLES {
+        if !row_counts.contains_key(key) {
+            return Err(invariant(format!(
+                "row_counts missing required key `{key}`"
+            )));
+        }
+    }
+    if row_counts.len() != TABLES.len() {
+        return Err(invariant(format!(
+            "row_counts carries {} keys; exactly the {} table names are required",
+            row_counts.len(),
+            TABLES.len()
+        )));
+    }
+    Ok(())
+}
+
+/// A **read-only** reader over a result-bundle directory
+/// (`docs/04-replay-mode.md` §3).
+///
+/// It records the bundle `root` and the already-validated [`BundleManifest`] from
+/// [`open`](Self::open) and never writes, moves, renames, or otherwise mutates
+/// anything under `root` — a bundle is immutable from ChainView's side. Money is
+/// never touched here; this stage only stats, gate-checks, and measure-decodes.
+#[derive(Debug, Clone)]
+pub struct BundleReader {
+    root: PathBuf,
+    manifest: BundleManifest,
+    ceilings: ResourceCeilings,
+}
+
+impl BundleReader {
+    /// Open a bundle directory with the default [`ResourceCeilings`]: verify the
+    /// directory exists, parse and **schema-gate** `manifest.json`, and confirm
+    /// the four Parquet tables are present. No table is decoded here — that is
+    /// [`load`](Self::load).
+    ///
+    /// # Errors
+    ///
+    /// - [`BundleError::Io`] if `root` cannot be accessed or is not a directory;
+    /// - [`BundleError::MissingTable`] if `manifest.json` or any of the four
+    ///   Parquet files is absent;
+    /// - [`BundleError::Invariant`] if `manifest.json` is malformed or its
+    ///   `row_counts` is not the fixed four-key shape;
+    /// - [`BundleError::UnsupportedSchema`] if `manifest.schema` is not
+    ///   [`SUPPORTED_SCHEMA`];
+    /// - [`BundleError::TooLarge`] if `manifest.json` exceeds
+    ///   [`MAX_MANIFEST_BYTES`] (rejected on the pre-read `stat`).
     pub fn open(root: impl Into<PathBuf>) -> Result<Self, BundleError> {
-        Ok(Self { root: root.into() })
+        Self::open_with_ceilings(root, ResourceCeilings::default())
+    }
+
+    /// Open a bundle directory with explicit [`ResourceCeilings`] — the same
+    /// validation as [`open`](Self::open), used by tests to exercise a ceiling on
+    /// a tiny fixture and by future config wiring to pass operator overrides. The
+    /// ceilings are [`validate`](ResourceCeilings::validate)d on entry, so a
+    /// misconfigured knob cannot silently disable a guard.
+    ///
+    /// # Errors
+    ///
+    /// The same set as [`open`](Self::open), plus [`BundleError::Config`] if the
+    /// supplied [`ResourceCeilings`] fail validation.
+    pub fn open_with_ceilings(
+        root: impl Into<PathBuf>,
+        ceilings: ResourceCeilings,
+    ) -> Result<Self, BundleError> {
+        // Validate the operator-supplied ceilings on the ENFORCEMENT path — a
+        // misconfigured knob (e.g. `max_batch_rows: 0`, which would make
+        // `with_batch_size(0)` yield zero batches and silently disable the
+        // measured working-set guard) is a typed `BundleError::Config`, never a
+        // silent open. `ceilings` is `Copy`, so this borrows before the store.
+        ceilings.validate()?;
+
+        let root = root.into();
+
+        // The bundle root must exist and be a directory (never written to).
+        let meta = fs::metadata(&root).map_err(|e| {
+            io_err(format!(
+                "cannot access bundle directory {}: {e}",
+                root.display()
+            ))
+        })?;
+        if !meta.is_dir() {
+            return Err(io_err(format!(
+                "bundle root is not a directory: {}",
+                root.display()
+            )));
+        }
+
+        // `manifest.json` must be present and within its byte ceiling. STAT it
+        // before reading, so an oversized `manifest.json` (a *manifest bomb*) is
+        // rejected before it is slurped into a `Vec<u8>` — the table ceilings do
+        // not cover the manifest, so it carries its own.
+        let manifest_path = root.join(MANIFEST_FILE);
+        let manifest_len = match fs::metadata(&manifest_path) {
+            Ok(meta) => meta.len(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(missing_table(MANIFEST_FILE.to_owned()));
+            }
+            Err(e) => return Err(io_err(format!("stat {MANIFEST_FILE}: {e}"))),
+        };
+        if manifest_len > ceilings.max_manifest_bytes {
+            return Err(too_large(format!(
+                "{MANIFEST_FILE} is {manifest_len} B; exceeds manifest ceiling {} B",
+                ceilings.max_manifest_bytes
+            )));
+        }
+
+        // Now read it — bounded by the ceiling just checked.
+        let manifest_bytes = match fs::read(&manifest_path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(missing_table(MANIFEST_FILE.to_owned()));
+            }
+            Err(e) => return Err(io_err(format!("read {MANIFEST_FILE}: {e}"))),
+        };
+
+        // Parse permissively (unknown fields ignored; a missing required field is
+        // a `serde` error surfaced as `Invariant`).
+        let manifest: BundleManifest = serde_json::from_slice(&manifest_bytes)
+            .map_err(|e| invariant(format!("malformed {MANIFEST_FILE}: {e}")))?;
+
+        // Schema gate — a major-incompatible tag is rejected, not partially read.
+        if manifest.schema != SUPPORTED_SCHEMA {
+            return Err(unsupported_schema(manifest.schema));
+        }
+
+        // `row_counts` is the fixed four-key integrity hint.
+        validate_row_counts_shape(&manifest.row_counts)?;
+
+        // All four Parquet tables must be present (presence only; column/type
+        // checks are #31/#32).
+        for (file, _key) in TABLES {
+            if !root.join(file).is_file() {
+                return Err(missing_table(file.to_owned()));
+            }
+        }
+
+        Ok(Self {
+            root,
+            manifest,
+            ceilings,
+        })
     }
 
     /// The bundle directory this reader was opened over.
@@ -427,17 +894,228 @@ impl BundleReader {
         &self.root
     }
 
-    /// Validate the manifest + ceilings, then read, sort, and verify every table
-    /// (`docs/04-replay-mode.md` §5).
+    /// The validated manifest parsed at [`open`](Self::open).
+    #[must_use]
+    pub fn manifest(&self) -> &BundleManifest {
+        &self.manifest
+    }
+
+    /// The resource ceilings this reader enforces.
+    #[must_use]
+    pub fn ceilings(&self) -> &ResourceCeilings {
+        &self.ceilings
+    }
+
+    /// Enforce the three resource ceilings over the four tables, then return the
+    /// [`LoadedBundle`] (`docs/04-replay-mode.md` §3). Uncancellable — equivalent
+    /// to [`load_cancellable`](Self::load_cancellable) with a probe that never
+    /// trips. The ceilings still bound the total work, so this always terminates.
     ///
     /// # Errors
     ///
-    /// The body lands in #30; until then this returns
-    /// [`BundleError::NotImplemented`] — a pending-reader placeholder, **not** a
-    /// data-integrity failure — rather than a panic, so callers compile against a
-    /// stable, non-panicking surface.
+    /// [`BundleError::TooLarge`] if any ceiling is exceeded, [`BundleError::Io`] /
+    /// [`BundleError::Parquet`] on a filesystem/decode failure, or
+    /// [`BundleError::Invariant`] on a `row_counts`/footer mismatch.
     pub fn load(&self) -> Result<LoadedBundle, BundleError> {
-        Err(BundleError::NotImplemented)
+        self.load_cancellable(&|| false)
+    }
+
+    /// Enforce the three resource ceilings over the four tables via a **measured,
+    /// batched, cancellable** decode, then return the [`LoadedBundle`]
+    /// (`docs/04-replay-mode.md` §3).
+    ///
+    /// `cancelled` is polled at every batch boundary (and before touching the
+    /// filesystem): when it returns `true`, the load aborts promptly with
+    /// [`BundleError::Cancelled`] without reading the rest of the bundle. The app
+    /// seam passes `&|| token.is_cancelled()` from its shutdown token
+    /// (`docs/02-tui-architecture.md` §12); the domain stays free of `tokio`.
+    ///
+    /// The typed per-column decode that fills the four table `Vec`s (#31) and the
+    /// cross-table validation chain (#32) are wired at the documented seam below;
+    /// #30 lands the open + ceiling + cancellable-decode spine, so the returned
+    /// tables are empty.
+    ///
+    /// # Errors
+    ///
+    /// - [`BundleError::Cancelled`] if `cancelled` trips at a batch boundary;
+    /// - [`BundleError::TooLarge`] if any of the three ceilings is exceeded;
+    /// - [`BundleError::MissingTable`] / [`BundleError::Io`] on a filesystem
+    ///   failure, [`BundleError::Parquet`] on a decode failure;
+    /// - [`BundleError::Invariant`] if a footer row count disagrees with
+    ///   `row_counts`.
+    pub fn load_cancellable(
+        &self,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<LoadedBundle, BundleError> {
+        // A pre-cancelled load returns before touching the filesystem.
+        if cancelled() {
+            return Err(BundleError::Cancelled);
+        }
+
+        // The working-set budget spans ALL four tables (§3): the running total is
+        // checked after every batch of every table.
+        let mut budget = WorkingSetBudget::new(&self.ceilings);
+        for (file, key) in TABLES {
+            if cancelled() {
+                return Err(BundleError::Cancelled);
+            }
+            self.scan_table(file, key, &mut budget, cancelled)?;
+        }
+
+        // #31 wires the typed per-column decode into these `Vec`s here (reusing the
+        // same batched reader), then #32 sorts + validates them; #30 lands the
+        // ceiling spine only, so they are empty and the manifest is the one
+        // already validated at `open`.
+        Ok(LoadedBundle {
+            manifest: self.manifest.clone(),
+            fills: Vec::new(),
+            equity: Vec::new(),
+            positions: Vec::new(),
+            greeks: Vec::new(),
+        })
+    }
+
+    /// Stat, footer-gate, and measure-decode one table under the three ceilings,
+    /// folding its measured working set into `budget`. Strictly read-only.
+    fn scan_table(
+        &self,
+        file: &str,
+        key: &str,
+        budget: &mut WorkingSetBudget,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(), BundleError> {
+        let path = self.root.join(file);
+
+        // --- Ceiling 1: per-file on-disk bytes, before opening the file. ---
+        let file_bytes = fs::metadata(&path)
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::NotFound => missing_table(file.to_owned()),
+                _ => io_err(format!("stat {file}: {e}")),
+            })?
+            .len();
+        if file_bytes > self.ceilings.max_table_bytes {
+            return Err(too_large(format!(
+                "{file} is {file_bytes} B; exceeds per-file ceiling {} B",
+                self.ceilings.max_table_bytes
+            )));
+        }
+
+        // Open the file read-only and read its Parquet footer.
+        let handle = fs::File::open(&path).map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => missing_table(file.to_owned()),
+            _ => io_err(format!("open {file}: {e}")),
+        })?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(handle)
+            .map_err(|e| parquet_err(format!("{file}: {e}")))?;
+
+        // --- Ceiling 2: footer row count, before decode. ---
+        let (footer_rows, uncompressed, compressed) = {
+            let metadata = builder.metadata();
+            let footer_rows = footer_i64_to_u64(
+                metadata.file_metadata().num_rows(),
+                &format!("{file} footer row count"),
+            )?;
+            let mut uncompressed: u64 = 0;
+            let mut compressed: u64 = 0;
+            for rg in metadata.row_groups() {
+                uncompressed = uncompressed
+                    .checked_add(footer_i64_to_u64(
+                        rg.total_byte_size(),
+                        &format!("{file} row-group uncompressed size"),
+                    )?)
+                    .ok_or_else(|| {
+                        too_large(format!("{file}: footer uncompressed size overflowed u64"))
+                    })?;
+                compressed = compressed
+                    .checked_add(footer_i64_to_u64(
+                        rg.compressed_size(),
+                        &format!("{file} row-group compressed size"),
+                    )?)
+                    .ok_or_else(|| {
+                        too_large(format!("{file}: footer compressed size overflowed u64"))
+                    })?;
+            }
+            (footer_rows, uncompressed, compressed)
+        };
+        if footer_rows > self.ceilings.max_table_rows {
+            return Err(too_large(format!(
+                "{file} footer declares {footer_rows} rows; exceeds per-table ceiling {}",
+                self.ceilings.max_table_rows
+            )));
+        }
+        // Cross-check the footer against the manifest integrity hint — the hint is
+        // NEVER used to size an allocation, only to detect a mismatch.
+        let declared = self
+            .manifest
+            .row_counts
+            .get(key)
+            .copied()
+            .ok_or_else(|| invariant(format!("row_counts missing key `{key}`")))?;
+        if declared != footer_rows {
+            return Err(invariant(format!(
+                "{file}: row_counts says {declared} but the Parquet footer says {footer_rows}"
+            )));
+        }
+
+        // --- Ceiling 3(a): decompression-bomb reject + cheap footer pre-check. ---
+        // A footer whose uncompressed size dwarfs the on-disk/compressed size is a
+        // decompression bomb.
+        let on_disk = file_bytes.max(compressed);
+        // Checked, not saturating (a banned method): a limit that OVERFLOWS u64
+        // would silently disable this reject, so an on-disk size so large that
+        // `on_disk * ratio` cannot be represented is itself rejected as beyond
+        // any plausible ceiling - the check fails CLOSED, never off.
+        let Some(bomb_limit) = on_disk.checked_mul(self.ceilings.max_expansion_ratio) else {
+            return Err(too_large(format!(
+                "{file}: on-disk size {on_disk} B is too large to bound at {}x - \
+                 rejected before decode",
+                self.ceilings.max_expansion_ratio
+            )));
+        };
+        if uncompressed > bomb_limit {
+            return Err(too_large(format!(
+                "{file}: uncompressed {uncompressed} B exceeds {}x its on-disk size — \
+                 decompression bomb rejected",
+                self.ceilings.max_expansion_ratio
+            )));
+        }
+        // Reject an obviously-oversized bundle before the first batch — a cheap
+        // early-out from the footer estimate, NEVER the sole guard (a footer that
+        // lies low still gets caught by the measured tally in 3(b)).
+        let estimate = apply_overhead(uncompressed, self.ceilings.decoded_overhead_permille)?;
+        if budget
+            .used()
+            .checked_add(estimate)
+            .is_none_or(|total| total > self.ceilings.max_working_set)
+        {
+            return Err(too_large(format!(
+                "{file}: estimated decoded working set would exceed ceiling {} B",
+                self.ceilings.max_working_set
+            )));
+        }
+
+        // --- Ceiling 3(b): measured, batched, cancellable decode. ---
+        // `total_uncompressed_size` counts uncompressed PAGES, not the memory the
+        // decoded arrays occupy (dictionary/RLE/repeated UTF8 can expand well
+        // beyond it), so the measured per-batch tally — not the footer — is the
+        // real guard.
+        let reader = builder
+            .with_batch_size(self.ceilings.max_batch_rows)
+            .build()
+            .map_err(|e| parquet_err(format!("{file}: {e}")))?;
+        for batch in reader {
+            // Abort at the batch boundary before decoding/accounting the next one.
+            if cancelled() {
+                return Err(BundleError::Cancelled);
+            }
+            let batch = batch.map_err(|e| parquet_err(format!("{file}: {e}")))?;
+            let batch_bytes = u64::try_from(batch.get_array_memory_size())
+                .map_err(|_| too_large(format!("{file}: decoded batch size exceeds u64")))?;
+            let measured = apply_overhead(batch_bytes, self.ceilings.decoded_overhead_permille)?;
+            budget.account(measured)?;
+        }
+
+        Ok(())
     }
 }
 
@@ -976,24 +1654,6 @@ mod tests {
         assert_eq!(id, "run-abc123");
     }
 
-    // --- BundleReader stub is read-only and non-panicking --------------------
-
-    #[test]
-    fn test_bundle_reader_open_does_no_io_and_load_is_pending() {
-        // `open` records the root without any filesystem access, so it succeeds
-        // even for a not-yet-existing path — read-only by construction.
-        let reader = match BundleReader::open("/no/such/bundle/dir") {
-            Ok(r) => r,
-            Err(e) => panic!("open stub must not perform I/O: {e}"),
-        };
-        assert_eq!(reader.root(), Path::new("/no/such/bundle/dir"));
-        // `load` is the #30 placeholder: a typed pending error, never a panic.
-        match reader.load() {
-            Err(BundleError::NotImplemented) => {}
-            other => panic!("load stub should be pending, got {other:?}"),
-        }
-    }
-
     // --- Money discipline: the only pub f64 field is drawdown ----------------
 
     #[test]
@@ -1025,5 +1685,748 @@ mod tests {
     fn test_fill_serializes_to_json_object() {
         let fill: Fill = from_json(&fill_json("put", "short", "realistic"));
         assert!(to_value(&fill).is_object());
+    }
+
+    // =====================================================================
+    // #30 — BundleReader::open/load, schema gate, and resource ceilings
+    // =====================================================================
+
+    // --- Bundle-writing test helpers (real Parquet under a RAII tempdir) ------
+
+    /// A tempdir that auto-cleans on drop.
+    fn temp_bundle_dir() -> tempfile::TempDir {
+        match tempfile::tempdir() {
+            Ok(d) => d,
+            Err(e) => panic!("create tempdir: {e}"),
+        }
+    }
+
+    /// Write a minimal single-column (`step: INT32`) Parquet file with `num_rows`
+    /// rows — enough for the #30 ceiling paths (which read the footer + measure
+    /// batches, not typed columns).
+    fn write_parquet(path: &Path, num_rows: usize) {
+        use std::sync::Arc;
+
+        use arrow_array::{ArrayRef, Int32Array, RecordBatch};
+        use arrow_schema::{DataType, Field, Schema};
+        use parquet::arrow::ArrowWriter;
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "step",
+            DataType::Int32,
+            false,
+        )]));
+        let steps: Vec<i32> = (0..num_rows)
+            .map(|i| i32::try_from(i).unwrap_or(i32::MAX))
+            .collect();
+        let column: ArrayRef = Arc::new(Int32Array::from(steps));
+        let batch = match RecordBatch::try_new(Arc::clone(&schema), vec![column]) {
+            Ok(b) => b,
+            Err(e) => panic!("build record batch: {e}"),
+        };
+        let file = match std::fs::File::create(path) {
+            Ok(f) => f,
+            Err(e) => panic!("create {}: {e}", path.display()),
+        };
+        let mut writer = match ArrowWriter::try_new(file, schema, None) {
+            Ok(w) => w,
+            Err(e) => panic!("arrow writer: {e}"),
+        };
+        if let Err(e) = writer.write(&batch) {
+            panic!("write batch: {e}");
+        }
+        if let Err(e) = writer.close() {
+            panic!("close writer: {e}");
+        }
+    }
+
+    /// Render a manifest JSON string with a given schema tag, the four
+    /// `row_counts`, and an optional unknown extra top-level field.
+    fn manifest_json_with(schema: &str, counts: [u64; 4], extra: bool) -> String {
+        let [c_fills, c_eq, c_pos, c_greeks] = counts;
+        let extra_field = if extra {
+            "\"future_field\": {\"x\": 1},"
+        } else {
+            ""
+        };
+        format!(
+            r#"{{ "schema": "{schema}", "run_id": "run-abc123",
+                 "created_utc": "2026-07-16T00:00:00Z", "code_version": "0.3.0",
+                 "lockfile_sha256": "deadbeef", "seed": 42, {extra_field}
+                 "config": {{ "capital_cents": 1000000 }},
+                 "strategy": {{ "kind": "iron_condor" }},
+                 "data_source": {{ "kind": "parquet", "path": "tape.parquet", "sha256": "cafe" }},
+                 "metrics": {{ "sharpe": 1.5 }},
+                 "row_counts": {{ "fills": {c_fills}, "equity_curve": {c_eq},
+                                  "positions": {c_pos}, "greeks_attribution": {c_greeks} }} }}"#
+        )
+    }
+
+    /// Write a full bundle: `manifest.json` plus the four Parquet tables, each with
+    /// its `file_rows` count (which may deliberately disagree with `counts` to
+    /// exercise the integrity cross-check).
+    fn write_bundle(
+        dir: &Path,
+        schema: &str,
+        file_rows: [usize; 4],
+        counts: [u64; 4],
+        extra: bool,
+    ) {
+        if let Err(e) = std::fs::write(
+            dir.join(MANIFEST_FILE),
+            manifest_json_with(schema, counts, extra),
+        ) {
+            panic!("write manifest: {e}");
+        }
+        let [(f0, _), (f1, _), (f2, _), (f3, _)] = TABLES;
+        let [r0, r1, r2, r3] = file_rows;
+        write_parquet(&dir.join(f0), r0);
+        write_parquet(&dir.join(f1), r1);
+        write_parquet(&dir.join(f2), r2);
+        write_parquet(&dir.join(f3), r3);
+    }
+
+    #[track_caller]
+    fn open_ok(root: &Path, ceilings: ResourceCeilings) -> BundleReader {
+        match BundleReader::open_with_ceilings(root, ceilings) {
+            Ok(r) => r,
+            Err(e) => panic!("open_with_ceilings should succeed: {e}"),
+        }
+    }
+
+    /// A sorted `(name, size)` snapshot of a directory's entries.
+    fn dir_snapshot(dir: &Path) -> Vec<(String, u64)> {
+        let mut out = Vec::new();
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(e) => panic!("read_dir: {e}"),
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => panic!("dir entry: {e}"),
+            };
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let len = match entry.metadata() {
+                Ok(m) => m.len(),
+                Err(e) => panic!("metadata: {e}"),
+            };
+            out.push((name, len));
+        }
+        out.sort();
+        out
+    }
+
+    // --- open: presence, schema gate, row_counts shape ------------------------
+
+    #[test]
+    fn test_open_and_load_happy_path() {
+        let dir = temp_bundle_dir();
+        write_bundle(
+            dir.path(),
+            SUPPORTED_SCHEMA,
+            [4, 10, 8, 10],
+            [4, 10, 8, 10],
+            false,
+        );
+        let reader = match BundleReader::open(dir.path()) {
+            Ok(r) => r,
+            Err(e) => panic!("a well-formed bundle should open: {e}"),
+        };
+        assert_eq!(reader.manifest().schema, SUPPORTED_SCHEMA);
+        let loaded = match reader.load() {
+            Ok(l) => l,
+            Err(e) => panic!("a well-formed bundle should load under default ceilings: {e}"),
+        };
+        assert_eq!(loaded.manifest.run_id, "run-abc123");
+        // #30 lands the ceiling spine; the typed tables are #31, so empty here.
+        assert!(loaded.fills.is_empty());
+        assert!(loaded.equity.is_empty());
+        assert!(loaded.positions.is_empty());
+        assert!(loaded.greeks.is_empty());
+    }
+
+    #[test]
+    fn test_open_missing_directory_is_io() {
+        match BundleReader::open("/no/such/bundle/dir-xyz") {
+            Err(BundleError::Io(_)) => {}
+            other => panic!("a missing bundle dir must be a typed Io error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_open_missing_manifest_is_missing_table() {
+        let dir = temp_bundle_dir();
+        // The four Parquet files but NO manifest.
+        for (file, _key) in TABLES {
+            write_parquet(&dir.path().join(file), 1);
+        }
+        match BundleReader::open(dir.path()) {
+            Err(BundleError::MissingTable(t)) => assert_eq!(t, MANIFEST_FILE),
+            other => panic!("a missing manifest must be MissingTable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_open_bad_schema_is_unsupported() {
+        let dir = temp_bundle_dir();
+        write_bundle(
+            dir.path(),
+            "ironcondor.bundle.v2",
+            [1, 1, 1, 1],
+            [1, 1, 1, 1],
+            false,
+        );
+        match BundleReader::open(dir.path()) {
+            Err(BundleError::UnsupportedSchema(tag)) => assert_eq!(tag, "ironcondor.bundle.v2"),
+            other => panic!("a major-incompatible tag must be UnsupportedSchema, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_open_unknown_manifest_field_still_opens() {
+        let dir = temp_bundle_dir();
+        write_bundle(
+            dir.path(),
+            SUPPORTED_SCHEMA,
+            [1, 1, 1, 1],
+            [1, 1, 1, 1],
+            true,
+        );
+        assert!(
+            BundleReader::open(dir.path()).is_ok(),
+            "a newer-minor extra manifest field must still open (permissive)"
+        );
+    }
+
+    #[test]
+    fn test_open_missing_table_is_missing_table() {
+        let dir = temp_bundle_dir();
+        if let Err(e) = std::fs::write(
+            dir.path().join(MANIFEST_FILE),
+            manifest_json_with(SUPPORTED_SCHEMA, [1, 1, 1, 1], false),
+        ) {
+            panic!("write manifest: {e}");
+        }
+        // Only three of the four tables.
+        write_parquet(&dir.path().join("fills.parquet"), 1);
+        write_parquet(&dir.path().join("equity_curve.parquet"), 1);
+        write_parquet(&dir.path().join("positions.parquet"), 1);
+        match BundleReader::open(dir.path()) {
+            Err(BundleError::MissingTable(t)) => assert_eq!(t, "greeks_attribution.parquet"),
+            other => panic!("a missing table must be MissingTable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_open_wrong_keyed_row_counts_is_invariant() {
+        let dir = temp_bundle_dir();
+        // A `row_counts` missing the `greeks_attribution` key.
+        let manifest = r#"{ "schema": "ironcondor.bundle.v1", "run_id": "r",
+            "created_utc": "t", "code_version": "v", "lockfile_sha256": "s", "seed": 1,
+            "config": {}, "strategy": {}, "data_source": {}, "metrics": {},
+            "row_counts": { "fills": 1, "equity_curve": 1, "positions": 1 } }"#;
+        if let Err(e) = std::fs::write(dir.path().join(MANIFEST_FILE), manifest) {
+            panic!("write manifest: {e}");
+        }
+        for (file, _key) in TABLES {
+            write_parquet(&dir.path().join(file), 1);
+        }
+        match BundleReader::open(dir.path()) {
+            Err(BundleError::Invariant(_)) => {}
+            other => panic!("a wrong-keyed row_counts must be Invariant, got {other:?}"),
+        }
+    }
+
+    // --- Ceiling 1 / 2 / 3 (each rejects with the allocation bounded) ---------
+
+    #[test]
+    fn test_ceiling1_oversized_file_is_too_large_pre_open() {
+        let dir = temp_bundle_dir();
+        write_bundle(
+            dir.path(),
+            SUPPORTED_SCHEMA,
+            [16, 16, 16, 16],
+            [16, 16, 16, 16],
+            false,
+        );
+        // 1-byte per-file ceiling: every real Parquet file exceeds it, rejected on
+        // the pre-open `stat`, before the footer or any batch is read.
+        let reader = open_ok(
+            dir.path(),
+            ResourceCeilings {
+                max_table_bytes: 1,
+                ..ResourceCeilings::default()
+            },
+        );
+        match reader.load() {
+            Err(BundleError::TooLarge(_)) => {}
+            other => panic!("an oversized file must be TooLarge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_ceiling2_footer_rowcount_is_too_large_pre_decode() {
+        let dir = temp_bundle_dir();
+        write_bundle(
+            dir.path(),
+            SUPPORTED_SCHEMA,
+            [10, 10, 10, 10],
+            [10, 10, 10, 10],
+            false,
+        );
+        let reader = open_ok(
+            dir.path(),
+            ResourceCeilings {
+                max_table_rows: 5,
+                ..ResourceCeilings::default()
+            },
+        );
+        match reader.load() {
+            Err(BundleError::TooLarge(_)) => {}
+            other => panic!("a footer row count over the ceiling must be TooLarge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_ceiling2_footer_rowcount_mismatch_is_invariant() {
+        let dir = temp_bundle_dir();
+        // Manifest claims 10 fills rows; the file has 7 — the integrity hint and
+        // the footer disagree.
+        write_bundle(
+            dir.path(),
+            SUPPORTED_SCHEMA,
+            [7, 10, 8, 10],
+            [10, 10, 8, 10],
+            false,
+        );
+        let reader = open_ok(dir.path(), ResourceCeilings::default());
+        match reader.load() {
+            Err(BundleError::Invariant(_)) => {}
+            other => panic!("a footer/row_counts mismatch must be Invariant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_ceiling3_tiny_working_set_is_too_large() {
+        let dir = temp_bundle_dir();
+        write_bundle(
+            dir.path(),
+            SUPPORTED_SCHEMA,
+            [64, 64, 64, 64],
+            [64, 64, 64, 64],
+            false,
+        );
+        let reader = open_ok(
+            dir.path(),
+            ResourceCeilings {
+                max_working_set: 8,
+                max_batch_bytes: 8,
+                ..ResourceCeilings::default()
+            },
+        );
+        match reader.load() {
+            Err(BundleError::TooLarge(_)) => {}
+            other => panic!("a working set over the ceiling must be TooLarge, got {other:?}"),
+        }
+    }
+
+    // --- Working-set budget: the measured, bounded, stop-before-crossing guard -
+
+    #[test]
+    fn test_working_set_budget_stops_before_crossing_ceiling() {
+        // This is the authoritative bounded-invariant assertion behind the
+        // "lying footer" case: the measured cumulative tally stops mid-decode and
+        // `used()` stays strictly under the ceiling on the rejecting path.
+        let ceilings = ResourceCeilings {
+            max_working_set: 100,
+            max_batch_bytes: 60,
+            ..ResourceCeilings::default()
+        };
+        let mut budget = WorkingSetBudget::new(&ceilings);
+        assert!(budget.account(40).is_ok());
+        assert!(budget.account(40).is_ok());
+        assert_eq!(budget.used(), 80);
+        // A third 40-byte batch would reach 120 > 100 — rejected, NOT committed.
+        match budget.account(40) {
+            Err(BundleError::TooLarge(_)) => {}
+            other => {
+                panic!("the batch that would exceed the ceiling must be TooLarge, got {other:?}")
+            }
+        }
+        assert!(
+            budget.used() < ceilings.max_working_set,
+            "cumulative bytes must stay strictly under the ceiling even on the reject path"
+        );
+        assert_eq!(budget.used(), 80, "a rejected batch is never committed");
+    }
+
+    #[test]
+    fn test_working_set_budget_rejects_oversized_batch() {
+        let ceilings = ResourceCeilings {
+            max_working_set: 1_000,
+            max_batch_bytes: 50,
+            ..ResourceCeilings::default()
+        };
+        let mut budget = WorkingSetBudget::new(&ceilings);
+        match budget.account(51) {
+            Err(BundleError::TooLarge(_)) => {}
+            other => panic!("a batch over the per-batch cap must be TooLarge, got {other:?}"),
+        }
+        assert_eq!(budget.used(), 0, "a rejected batch is never committed");
+    }
+
+    // --- Checked conversions (never an `as` cast on a footer value) ------------
+
+    #[test]
+    fn test_checked_footer_conversion_rejects_negative() {
+        // A negative (corrupt/lying) footer value is TooLarge, not a wrapped giant.
+        match footer_i64_to_u64(-1, "footer row count") {
+            Err(BundleError::TooLarge(_)) => {}
+            other => panic!("a negative footer value must be TooLarge, got {other:?}"),
+        }
+        match footer_i64_to_u64(i64::MIN, "footer size") {
+            Err(BundleError::TooLarge(_)) => {}
+            other => panic!("i64::MIN must be TooLarge, got {other:?}"),
+        }
+        assert_eq!(footer_i64_to_u64(42, "x").ok(), Some(42));
+    }
+
+    #[test]
+    fn test_apply_overhead_overflow_is_too_large() {
+        // The overhead multiply is checked: an absurd measured size that overflows
+        // u64 is TooLarge, never a wrapped allocation size.
+        match apply_overhead(u64::MAX, DECODED_OVERHEAD_PERMILLE) {
+            Err(BundleError::TooLarge(_)) => {}
+            other => panic!("an overflowing overhead multiply must be TooLarge, got {other:?}"),
+        }
+        assert_eq!(apply_overhead(1_000, 1_500).ok(), Some(1_500));
+    }
+
+    // --- Cancellation at a batch boundary -------------------------------------
+
+    #[test]
+    fn test_load_pre_cancelled_returns_promptly() {
+        let dir = temp_bundle_dir();
+        write_bundle(
+            dir.path(),
+            SUPPORTED_SCHEMA,
+            [4, 10, 8, 10],
+            [4, 10, 8, 10],
+            false,
+        );
+        let reader = open_ok(dir.path(), ResourceCeilings::default());
+        match reader.load_cancellable(&|| true) {
+            Err(BundleError::Cancelled) => {}
+            other => panic!("a pre-cancelled load must be Cancelled, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_load_cancels_mid_decode_at_batch_boundary() {
+        use std::cell::Cell;
+
+        let dir = temp_bundle_dir();
+        write_bundle(
+            dir.path(),
+            SUPPORTED_SCHEMA,
+            [8, 8, 8, 8],
+            [8, 8, 8, 8],
+            false,
+        );
+        // One row per batch -> many batch boundaries to observe cancellation at.
+        let reader = open_ok(
+            dir.path(),
+            ResourceCeilings {
+                max_batch_rows: 1,
+                ..ResourceCeilings::default()
+            },
+        );
+        let polls = Cell::new(0_u32);
+        let probe = || {
+            let n = polls.get().saturating_add(1);
+            polls.set(n);
+            n > 3
+        };
+        match reader.load_cancellable(&probe) {
+            Err(BundleError::Cancelled) => {}
+            other => panic!("a mid-decode cancellation must be Cancelled, got {other:?}"),
+        }
+        // Promptly: far fewer polls than a full 32-row (4-table) decode would need.
+        assert!(
+            polls.get() <= 6,
+            "cancellation must abort promptly, got {} polls",
+            polls.get()
+        );
+    }
+
+    // --- Read-only: load never mutates the bundle -----------------------------
+
+    #[test]
+    fn test_load_is_read_only() {
+        let dir = temp_bundle_dir();
+        write_bundle(
+            dir.path(),
+            SUPPORTED_SCHEMA,
+            [4, 10, 8, 10],
+            [4, 10, 8, 10],
+            false,
+        );
+        let before = dir_snapshot(dir.path());
+        let reader = open_ok(dir.path(), ResourceCeilings::default());
+        let _ = reader.load();
+        let after = dir_snapshot(dir.path());
+        assert_eq!(
+            before, after,
+            "load must not add, remove, or modify any bundle file"
+        );
+    }
+
+    // --- Ceiling knobs: documented defaults validate; out-of-range is typed ----
+
+    #[test]
+    fn test_resource_ceilings_default_validates() {
+        assert!(
+            ResourceCeilings::default().validate().is_ok(),
+            "the documented defaults must be valid"
+        );
+    }
+
+    #[test]
+    fn test_resource_ceilings_out_of_range_is_config_error() {
+        let zero = ResourceCeilings {
+            max_table_bytes: 0,
+            ..ResourceCeilings::default()
+        };
+        match zero.validate() {
+            Err(ConfigError::InvalidValue { field, .. }) => {
+                assert_eq!(field, "replay.max_table_bytes")
+            }
+            other => panic!("a zero ceiling must be a ConfigError, got {other:?}"),
+        }
+        let bad_overhead = ResourceCeilings {
+            decoded_overhead_permille: 900,
+            ..ResourceCeilings::default()
+        };
+        assert!(
+            matches!(
+                bad_overhead.validate(),
+                Err(ConfigError::InvalidValue { .. })
+            ),
+            "an overhead below 1.0x must be rejected"
+        );
+        let bad_batch = ResourceCeilings {
+            max_batch_bytes: MAX_WORKING_SET + 1,
+            ..ResourceCeilings::default()
+        };
+        assert!(
+            matches!(bad_batch.validate(), Err(ConfigError::InvalidValue { .. })),
+            "a per-batch cap above the working-set ceiling must be rejected"
+        );
+        // The manifest ceiling is a validated knob too.
+        let bad_manifest = ResourceCeilings {
+            max_manifest_bytes: 0,
+            ..ResourceCeilings::default()
+        };
+        match bad_manifest.validate() {
+            Err(ConfigError::InvalidValue { field, .. }) => {
+                assert_eq!(field, "replay.max_manifest_bytes")
+            }
+            other => panic!("a zero manifest ceiling must be a ConfigError, got {other:?}"),
+        }
+    }
+
+    // --- BLOCKER: manifest byte ceiling (manifest bomb) -----------------------
+
+    #[test]
+    fn test_ceiling_oversized_manifest_rejects_pre_read() {
+        let dir = temp_bundle_dir();
+        // The four tables are present, so table presence is not the failure.
+        for (file, _key) in TABLES {
+            write_parquet(&dir.path().join(file), 1);
+        }
+        // A manifest LARGER than a tiny ceiling whose CONTENT is garbage: it must
+        // be rejected on the pre-read `stat`, before a byte is parsed — proving
+        // the reject fires from the stat, since a read+parse of this junk would be
+        // `Invariant`, not `TooLarge`. (In the real bomb this Vec is 10 GiB.)
+        let junk = "x".repeat(4096);
+        if let Err(e) = std::fs::write(dir.path().join(MANIFEST_FILE), &junk) {
+            panic!("write manifest: {e}");
+        }
+        let ceilings = ResourceCeilings {
+            max_manifest_bytes: 64,
+            ..ResourceCeilings::default()
+        };
+        match BundleReader::open_with_ceilings(dir.path(), ceilings) {
+            Err(BundleError::TooLarge(detail)) => assert!(
+                detail.contains(MANIFEST_FILE),
+                "the oversized artifact must be named the manifest: {detail}"
+            ),
+            other => {
+                panic!("an oversized manifest must be TooLarge pre-read, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn test_normal_manifest_opens_under_a_finite_manifest_ceiling() {
+        let dir = temp_bundle_dir();
+        write_bundle(
+            dir.path(),
+            SUPPORTED_SCHEMA,
+            [1, 1, 1, 1],
+            [1, 1, 1, 1],
+            false,
+        );
+        // A generous-but-finite manifest ceiling still opens a tiny valid manifest.
+        let ceilings = ResourceCeilings {
+            max_manifest_bytes: 8 * 1024,
+            ..ResourceCeilings::default()
+        };
+        assert!(
+            BundleReader::open_with_ceilings(dir.path(), ceilings).is_ok(),
+            "a normal manifest must open under a finite manifest ceiling"
+        );
+    }
+
+    // --- SHOULD-FIX 1: ceilings validated on the enforcement path -------------
+
+    #[test]
+    fn test_open_with_invalid_ceilings_is_typed_error_not_silent_open() {
+        let dir = temp_bundle_dir();
+        write_bundle(
+            dir.path(),
+            SUPPORTED_SCHEMA,
+            [1, 1, 1, 1],
+            [1, 1, 1, 1],
+            false,
+        );
+        // `max_batch_rows: 0` would make `with_batch_size(0)` yield zero batches,
+        // silently disabling the measured working-set guard — so it must be a
+        // typed error on open, never a silent open.
+        let bad = ResourceCeilings {
+            max_batch_rows: 0,
+            ..ResourceCeilings::default()
+        };
+        match BundleReader::open_with_ceilings(dir.path(), bad) {
+            Err(BundleError::Config(ConfigError::InvalidValue { field, .. })) => {
+                assert_eq!(field, "replay.max_batch_rows")
+            }
+            other => panic!(
+                "an invalid ceiling on the enforcement path must be a typed \
+                 BundleError::Config, never a silent open, got {other:?}"
+            ),
+        }
+    }
+
+    // --- SHOULD-FIX 2: attacker-controlled schema tag is clamped --------------
+
+    #[test]
+    fn test_unsupported_schema_tag_is_clamped() {
+        // A 10 KiB junk tag must not ride into the error message length-unbounded.
+        let junk = "z".repeat(10 * 1024);
+        let err = unsupported_schema(junk);
+        match &err {
+            BundleError::UnsupportedSchema(tag) => assert!(
+                tag.chars().count() <= MAX_SCHEMA_TAG_CHARS + 1,
+                "the tag must be clamped (<= {} chars + ellipsis), got {}",
+                MAX_SCHEMA_TAG_CHARS,
+                tag.chars().count()
+            ),
+            other => panic!("expected UnsupportedSchema, got {other:?}"),
+        }
+        // The whole rendered Display is bounded: the 20-char category prefix plus
+        // the clamped tag (<= MAX_SCHEMA_TAG_CHARS + 1 for the ellipsis) — ~85,
+        // orders of magnitude below the 10 KiB input, and still names the variant.
+        let rendered = err.to_string();
+        let bound = "unsupported schema: ".chars().count() + MAX_SCHEMA_TAG_CHARS + 1;
+        assert!(
+            rendered.chars().count() <= bound,
+            "rendered message must be bounded (<= {bound}), got {}",
+            rendered.chars().count()
+        );
+        assert!(rendered.starts_with("unsupported schema: "));
+    }
+
+    #[test]
+    fn test_clamp_schema_tag_never_panics_on_multibyte_utf8() {
+        // Multi-byte chars: clamping on char boundaries must never split a byte
+        // index and must stay bounded.
+        let multibyte = "🚀".repeat(200);
+        let clamped = clamp_schema_tag(multibyte);
+        assert!(clamped.chars().count() <= MAX_SCHEMA_TAG_CHARS + 1);
+        // A short tag is returned unchanged (no ellipsis).
+        assert_eq!(
+            clamp_schema_tag("ironcondor.bundle.v9".to_owned()),
+            "ironcondor.bundle.v9"
+        );
+    }
+
+    // --- Cheap extra: a ZSTD-compressed table decodes (codec feature works) ----
+
+    /// Write a minimal single-column (`step: INT32`) Parquet file compressed with
+    /// **ZSTD** — proving the enabled `zstd` codec feature actually decodes on
+    /// `load`.
+    fn write_parquet_zstd(path: &Path, num_rows: usize) {
+        use std::sync::Arc;
+
+        use arrow_array::{ArrayRef, Int32Array, RecordBatch};
+        use arrow_schema::{DataType, Field, Schema};
+        use parquet::arrow::ArrowWriter;
+        use parquet::basic::{Compression, ZstdLevel};
+        use parquet::file::properties::WriterProperties;
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "step",
+            DataType::Int32,
+            false,
+        )]));
+        let steps: Vec<i32> = (0..num_rows)
+            .map(|i| i32::try_from(i).unwrap_or(i32::MAX))
+            .collect();
+        let column: ArrayRef = Arc::new(Int32Array::from(steps));
+        let batch = match RecordBatch::try_new(Arc::clone(&schema), vec![column]) {
+            Ok(b) => b,
+            Err(e) => panic!("build record batch: {e}"),
+        };
+        let file = match std::fs::File::create(path) {
+            Ok(f) => f,
+            Err(e) => panic!("create {}: {e}", path.display()),
+        };
+        let props = WriterProperties::builder()
+            .set_compression(Compression::ZSTD(ZstdLevel::default()))
+            .build();
+        let mut writer = match ArrowWriter::try_new(file, schema, Some(props)) {
+            Ok(w) => w,
+            Err(e) => panic!("arrow writer: {e}"),
+        };
+        if let Err(e) = writer.write(&batch) {
+            panic!("write batch: {e}");
+        }
+        if let Err(e) = writer.close() {
+            panic!("close writer: {e}");
+        }
+    }
+
+    #[test]
+    fn test_load_decodes_zstd_compressed_tables() {
+        let dir = temp_bundle_dir();
+        if let Err(e) = std::fs::write(
+            dir.path().join(MANIFEST_FILE),
+            manifest_json_with(SUPPORTED_SCHEMA, [3, 3, 3, 3], false),
+        ) {
+            panic!("write manifest: {e}");
+        }
+        // The four tables written with ZSTD page compression.
+        for (file, _key) in TABLES {
+            write_parquet_zstd(&dir.path().join(file), 3);
+        }
+        let reader = open_ok(dir.path(), ResourceCeilings::default());
+        match reader.load() {
+            Ok(loaded) => assert_eq!(loaded.manifest.schema, SUPPORTED_SCHEMA),
+            Err(e) => {
+                panic!("a ZSTD-compressed bundle must decode under the enabled codec: {e}")
+            }
+        }
     }
 }

@@ -102,21 +102,45 @@ pub enum RegistryError {
 
 /// A failure reading or validating an IronCondor result bundle (replay mode).
 ///
-/// Every variant is `String`-detailed with a **non-secret**, ChainView-authored
-/// message — a bundle is trusted-but-verified local data, never a credential
-/// source (`docs/04-replay-mode.md` §5).
+/// Messages are **non-secret** — a bundle is trusted-but-verified local data,
+/// never a credential source (`docs/04-replay-mode.md` §5). Most are
+/// ChainView-authored; the one exception is
+/// [`UnsupportedSchema`](Self::UnsupportedSchema), which echoes the
+/// `manifest.schema` tag. That tag is **attacker-supplied but non-secret**,
+/// **clamped to a bounded length at construction** (so a length-unbounded junk
+/// tag cannot bloat the message), and further sanitized at the render edge before
+/// it reaches the terminal.
 #[derive(Debug, thiserror::Error)]
 pub enum BundleError {
     /// A required Parquet table (or manifest) was absent from the bundle
     /// directory.
     #[error("missing table: {0}")]
     MissingTable(String),
-    /// The `manifest.schema` tag is not a supported bundle version.
+    /// A filesystem operation on the bundle failed for a reason other than a
+    /// cleanly-absent table — a stat, directory read, or file open that errored
+    /// (e.g. a permission failure, or a path that is not a directory). The
+    /// detail is a **non-secret**, ChainView-authored summary naming the
+    /// operation and the bundle-relative path only — never an environment value
+    /// (`docs/04-replay-mode.md` §5).
+    #[error("bundle io: {0}")]
+    Io(String),
+    /// The `manifest.schema` tag is not a supported bundle version. The echoed
+    /// tag is attacker-supplied-but-non-secret and **clamped to a bounded length
+    /// at construction** (a valid tag is ~20 chars); it is further sanitized at
+    /// the render edge.
     #[error("unsupported schema: {0}")]
     UnsupportedSchema(String),
     /// A cross-table or domain invariant was violated on load.
     #[error("invariant violated: {0}")]
     Invariant(String),
+    /// The operator-supplied [`ResourceCeilings`](crate::ResourceCeilings)
+    /// failed validation on the **enforcement path**
+    /// (`BundleReader::open_with_ceilings`). A misconfigured ceiling is surfaced
+    /// as a typed bundle error — never a silent open with a disabled guard —
+    /// carrying the underlying [`ConfigError`] via `#[from]` so the offending knob
+    /// is named. The message is ChainView-authored and non-secret.
+    #[error("resource ceiling: {0}")]
+    Config(#[from] ConfigError),
     /// A resource ceiling was exceeded before materialisation
     /// (`docs/04-replay-mode.md` §3).
     #[error("bundle too large: {0}")]
@@ -124,12 +148,14 @@ pub enum BundleError {
     /// A Parquet decode error, summarized without leaking file internals.
     #[error("parquet: {0}")]
     Parquet(String),
-    /// The reader body is not yet wired: [`crate::BundleReader::load`] returns
-    /// this placeholder until issue #30 implements the open/decode path. It is a
-    /// **pending-reader** marker, **not** a data-integrity failure — no caller
-    /// should treat it as one — and it is removed when #30 lands.
-    #[error("reader not yet implemented (issue #30)")]
-    NotImplemented,
+    /// The load was aborted at a batch boundary via the caller's cancellation
+    /// probe (the app shutdown token, `docs/02-tui-architecture.md` §12) before
+    /// the bundle finished decoding. It is **not** a data-integrity failure — the
+    /// bundle may be perfectly valid — so callers distinguish a user-driven abort
+    /// from the malformed-bundle variants and never surface it as a bad-bundle
+    /// error.
+    #[error("bundle load cancelled")]
+    Cancelled,
 }
 
 /// A configuration failure surfaced at startup.
@@ -528,6 +554,20 @@ mod tests {
     fn test_bundle_error_display_is_category_prefixed() {
         let err = BundleError::MissingTable("fills.parquet".to_owned());
         assert_eq!(err.to_string(), "missing table: fills.parquet");
+    }
+
+    #[test]
+    fn test_bundle_error_io_display_is_category_prefixed() {
+        let err = BundleError::Io("open positions.parquet: permission denied".to_owned());
+        assert_eq!(
+            err.to_string(),
+            "bundle io: open positions.parquet: permission denied"
+        );
+    }
+
+    #[test]
+    fn test_bundle_error_cancelled_display_is_category_message() {
+        assert_eq!(BundleError::Cancelled.to_string(), "bundle load cancelled");
     }
 
     #[test]

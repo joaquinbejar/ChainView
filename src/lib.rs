@@ -135,20 +135,28 @@ pub use error::{
     BundleError, ChainViewError, ConfigError, NormalizeKind, OverlayError, ProviderError, Redacted,
     RegistryError, TransportDetail, TransportKind,
 };
-// The replay-mode domain types (`src/replay/mod.rs`, issue #29,
-// `docs/01-domain-model.md` §9, `docs/04-replay-mode.md` §2): ChainView's typed,
-// read-only views of the IronCondor result bundle — the permissive
+// The replay-mode domain types (`src/replay/mod.rs`, issues #29/#30,
+// `docs/01-domain-model.md` §9, `docs/04-replay-mode.md` §2/§3): ChainView's
+// typed, read-only views of the IronCondor result bundle — the permissive
 // `BundleManifest`, the narrow `CapitalConfig` projection, the four strict
 // Parquet-backed rows (`Fill`/`EquityPoint`/`PositionRow`/`GreeksAttribution`),
 // the closed `PositionSide`/`ExecMode` enums, the `contract_id` grammar
-// constants, and the `BundleReader`/`LoadedBundle` surface the reader (#30),
-// decoders (#31), and validation (#32) are written against. Money is integer
+// constants, and the `BundleReader`/`LoadedBundle` surface. Money is integer
 // cents; the only `f64` is `EquityPoint::drawdown`. `OptionStyle` is re-exported
 // from `optionstratlib` below.
+//
+// Issue #30 adds the reader body and the untrusted-input hardening spine:
+// `BundleReader::{open, open_with_ceilings, load, load_cancellable}`, the
+// `ResourceCeilings` config knobs and their documented `MAX_*` /
+// `DECODED_OVERHEAD_PERMILLE` defaults, and the `SUPPORTED_SCHEMA` gate. The typed
+// per-column decode (#31) and the cross-table validation chain (#32) are still
+// written against this surface.
 pub use replay::{
     BundleManifest, BundleReader, CONTRACT_ID_FORMAT, CONTRACT_ID_UNDERLYING_PATTERN,
-    CONTRACT_ID_VERSION_PREFIX, CapitalConfig, EquityPoint, ExecMode, Fill, GreeksAttribution,
-    LoadedBundle, PositionRow, PositionSide,
+    CONTRACT_ID_VERSION_PREFIX, CapitalConfig, DECODED_OVERHEAD_PERMILLE, EquityPoint, ExecMode,
+    Fill, GreeksAttribution, LoadedBundle, MAX_BATCH_BYTES, MAX_BATCH_ROWS, MAX_EXPANSION_RATIO,
+    MAX_MANIFEST_BYTES, MAX_TABLE_BYTES, MAX_TABLE_ROWS, MAX_WORKING_SET, PositionRow,
+    PositionSide, ResourceCeilings, SUPPORTED_SCHEMA,
 };
 // The PUBLIC, semver-governed provider port surface (`docs/03-data-providers.md`
 // §2, §11.1): the trait, the capability self-declaration + its builder + every
