@@ -42,7 +42,10 @@
 
 use std::path::PathBuf;
 
+use chrono::{DateTime, Utc};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use optionstratlib::chains::chain::OptionChain;
+use optionstratlib::prelude::Decimal;
 use tokio::sync::mpsc;
 
 use crate::app::keymap::{GlobalCommand, KeyChord, resolve_global};
@@ -107,6 +110,14 @@ pub struct App {
     /// purely in `draw` so the animation never reads a wall clock there; an idle
     /// tick advances it but does **not** set [`dirty`](App::dirty) (§8).
     pub tick_count: u64,
+    /// The wall-clock instant of the most recent tick, stamped off-draw by the
+    /// tick handler from the `std` clock (chrono's `clock` feature is off). It is
+    /// the **decay reference** the chain matrix reads at draw time, so
+    /// the bid-up/ask-down markers decay on wall-time rather than being pinned to
+    /// the last poll (`docs/01-domain-model.md` §6, `docs/02-tui-architecture.md`
+    /// §7). Advanced every tick regardless of [`dirty`](App::dirty); the next
+    /// redraw reads the fresh instant, so `draw` itself never touches a wall clock.
+    pub now: DateTime<Utc>,
     /// A transient one-line keybar hint (e.g. "Depth not available on deribit"),
     /// flashed when an unavailable number key is pressed (`docs/05-views-and-ux.md`
     /// §2). It decays either on the next key or after `HINT_TICKS` ticks
@@ -153,6 +164,7 @@ impl App {
             no_color: false,
             status: StatusLine::default(),
             tick_count: 0,
+            now: now_utc(),
             status_hint: None,
             hint_ttl: 0,
             help_open: false,
@@ -293,6 +305,13 @@ impl App {
     }
 
     fn on_tick(&mut self) {
+        // Advance the wall-clock reference the chain matrix reads for tick-direction
+        // decay, so a bid-up/ask-down marker decays on wall-time instead of persisting
+        // until the next poll (`docs/01-domain-model.md` §6). Stamped off-draw here;
+        // `draw` reads the cached instant and never touches a wall clock (§7). This
+        // sets no `dirty` on its own — under streaming quotes each `Market` update
+        // already redraws and reads this fresh instant.
+        self.now = now_utc();
         // Advance the spinner/clock counter the status bar reads purely in `draw`
         // (`docs/05-views-and-ux.md` §7). `checked_add` avoids the banned
         // `wrapping_add`; the counter resets on the (practically unreachable) u64
@@ -639,6 +658,14 @@ pub struct LiveState {
     pub payoff_builder: PayoffBuilder,
     /// The screen's load lifecycle (loading / ready / error).
     pub load: ScreenLoad,
+    /// The cached ATM strike-row index (ascending strike order) — the chain
+    /// screen's `◀ATM` marker and default scroll anchor. Recomputed **off-draw**
+    /// only when a poll changes the strike ladder or spot ([`new`](LiveState::new)
+    /// and [`apply_chain_snapshot`](LiveState::apply_chain_snapshot)); a quote
+    /// patches a row but never moves the ATM, so it is not recomputed on a quote.
+    /// `draw` reads it via [`atm_index`](LiveState::atm_index) in O(1) instead of
+    /// rescanning the full ladder each frame (the frame-budget rule, `CLAUDE.md`).
+    atm_index: Option<usize>,
 }
 
 impl LiveState {
@@ -657,6 +684,9 @@ impl LiveState {
             chain_present(source.capabilities.chain),
             "a live source must assemble a chain so the default Chain screen is reachable",
         );
+        // Seed the cached ATM index off-draw from the initial chain, so the first
+        // frame reads it without rescanning the ladder.
+        let atm_index = atm_index_of(store.chain());
         Self {
             source,
             overlay: None,
@@ -665,7 +695,17 @@ impl LiveState {
             selection: Selection::default(),
             payoff_builder: PayoffBuilder::new(),
             load: ScreenLoad::Loading,
+            atm_index,
         }
+    }
+
+    /// The cached ATM strike-row index (ascending strike order), or `None` for an
+    /// empty chain — the chain screen's `◀ATM` marker and default scroll anchor.
+    /// Recomputed off-draw on a poll, so `draw` reads it in O(1) rather than
+    /// rescanning the strike ladder each frame.
+    #[must_use]
+    pub fn atm_index(&self) -> Option<usize> {
+        self.atm_index
     }
 
     /// Bind an overlay provider (its health is tracked independently of the
@@ -764,6 +804,9 @@ impl LiveState {
                     aliases,
                 );
                 self.store.apply_poll(fetch, polled);
+                // A poll can move spot or the strike ladder, so refresh the cached
+                // ATM index off-draw here — draw never rescans the ladder.
+                self.atm_index = atm_index_of(self.store.chain());
                 true
             }
             None => false,
@@ -1201,6 +1244,42 @@ fn next_in_cycle<T: PartialEq + Copy>(items: &[T], current: T, forward: bool) ->
         (idx + len - 1) % len
     };
     items.get(next).copied()
+}
+
+/// The current wall-clock instant from `std`'s clock (chrono's `clock` feature is
+/// off, so `Utc::now` is unavailable) — the decay reference the tick handler stamps
+/// onto [`App::now`] so `draw` reads a cached instant and never touches a wall clock
+/// itself (`docs/02-tui-architecture.md` §7). Clamps a pathological system time to
+/// the representable range and never `unwrap`s.
+#[must_use]
+fn now_utc() -> DateTime<Utc> {
+    let since = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or(std::time::Duration::ZERO);
+    let secs = i64::try_from(since.as_secs()).unwrap_or(i64::MAX);
+    DateTime::<Utc>::from_timestamp(secs, since.subsec_nanos()).unwrap_or(DateTime::<Utc>::MIN_UTC)
+}
+
+/// The index (ascending strike order) of the strike nearest spot — the chain
+/// screen's `◀ATM` row and default scroll anchor, cached on [`LiveState`] and
+/// recomputed off-draw on a poll so `draw` never rescans the ladder. `None` for an
+/// empty chain. Uses only `optionstratlib` chain types, so it is a domain-facing
+/// projection the application layer may compute (no dependency on `src/ui`).
+#[must_use]
+fn atm_index_of(chain: &OptionChain) -> Option<usize> {
+    let spot = chain.underlying_price.to_dec();
+    let mut best: Option<(usize, Decimal)> = None;
+    for (idx, od) in chain.options.iter().enumerate() {
+        let diff = (od.strike_price.to_dec() - spot).abs();
+        let better = match best {
+            Some((_, best_diff)) => diff < best_diff,
+            None => true,
+        };
+        if better {
+            best = Some((idx, diff));
+        }
+    }
+    best.map(|(idx, _)| idx)
 }
 
 /// Shared, crate-internal test constructors for a fully-formed [`App`] in any
@@ -1771,6 +1850,69 @@ mod tests {
         // Structure unchanged: the original strike remains, the new one absent.
         assert!(live(&app).store.contains_strike(pos(60_000.0)));
         assert!(!live(&app).store.contains_strike(pos(61_000.0)));
+    }
+
+    // --- ATM cache: computed off-draw at construction and refreshed on a poll --
+
+    #[test]
+    fn test_atm_index_of_finds_nearest_strike() {
+        let chain = chain_with(&[50_000.0, 59_000.0, 70_000.0]);
+        // spot 60000 -> nearest is 59000 at index 1.
+        assert_eq!(super::atm_index_of(&chain), Some(1));
+        assert_eq!(
+            super::atm_index_of(&OptionChain::new(
+                "BTC",
+                pos(1.0),
+                "x".to_owned(),
+                None,
+                None
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn test_live_state_caches_atm_index_and_refreshes_on_poll() {
+        // The cache is seeded off-draw at construction and only recomputed when a
+        // poll changes the ladder — draw reads it without rescanning the strikes.
+        let (tx, _rx) = mpsc::channel::<Command>(8);
+        let state = LiveState::new(
+            source_binding("deribit", full_caps()),
+            store(&[58_000.0, 60_000.0, 62_000.0], "deribit"),
+        );
+        // spot 60000 -> nearest is 60000 at index 1.
+        assert_eq!(state.atm_index(), Some(1), "seeded from the initial chain");
+        let mut app = App::new(Mode::Live(state), ThemeChoice::Auto, tx);
+        // A quote patches a row but never moves the ATM, so the cache is unchanged.
+        app.on_event(AppEvent::Market(MarketUpdate::Quote(quote(
+            "deribit",
+            60_000.0,
+            OptionStyle::Call,
+            Some(1.4),
+            Some(1.6),
+            EXP + 100,
+        ))));
+        assert_eq!(
+            live(&app).atm_index(),
+            Some(1),
+            "a quote does not move the ATM"
+        );
+        // A poll that re-lists strikes around a new spot refreshes the cache.
+        let snapshot = ChainSnapshot {
+            chain_key: (pid("deribit"), "BTC".to_owned(), utc(EXP)),
+            chain: chain_with(&[59_000.0, 60_000.0]),
+            aliases: AliasCatalog::new(),
+            source: ChainSource::Merged,
+            health: StreamHealth::Live,
+            last_full_poll: Some(utc(EXP + 200)),
+        };
+        app.on_event(AppEvent::Market(MarketUpdate::Chain(snapshot)));
+        // The new ladder [59000, 60000] with spot 60000 -> nearest is index 1.
+        assert_eq!(
+            live(&app).atm_index(),
+            Some(1),
+            "the poll refreshed the cached ATM index"
+        );
     }
 
     #[test]

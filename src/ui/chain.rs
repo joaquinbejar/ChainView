@@ -189,10 +189,13 @@ fn project_iv(iv: Positive) -> Option<Positive> {
 /// Project one strike row: both legs plus the shared `K/S` relation.
 ///
 /// The direction indicators are read from the store's retained/decayed baseline as
-/// of `as_of` (the store's last-poll wall-time — the pure-draw reference instant,
-/// since `draw` reads no wall clock); `None` when there is no such instant yields
-/// `Flat`. Building the per-leg [`InstrumentKey`] clones the (short) underlying
-/// ticker, which is why projection runs for the **visible** rows only.
+/// of `as_of` — the tick-stamped wall clock threaded in from [`App::now`], so a
+/// marker decays on wall-time while `draw` itself reads no wall clock; `None` (no
+/// reference instant) yields `Flat`. Building the per-leg [`InstrumentKey`] clones
+/// the (short) underlying ticker, which is why projection runs for the **visible**
+/// rows only.
+///
+/// [`App::now`]: crate::app::App::now
 #[must_use]
 fn project_row(
     od: &OptionData,
@@ -257,9 +260,18 @@ fn leg_dirs(
 /// Draw the chain matrix for the live `state` into `area` — a pure render
 /// (`docs/02-tui-architecture.md` §7). The empty/loading/error states render
 /// before the populated matrix (the states-first rule); the store is borrowed,
-/// never recomputed. `theme` (resolved, `NO_COLOR`-aware) and `tick` (for the
-/// loading spinner) are `Copy`, so purity holds.
-pub fn draw(state: &LiveState, frame: &mut Frame, area: Rect, theme: Theme, tick: u64) {
+/// never recomputed. `theme` (resolved, `NO_COLOR`-aware), `tick` (for the loading
+/// spinner), and `now` (the tick-stamped wall clock the tick-direction markers
+/// decay against) are all `Copy`, so purity holds — `draw` reads `now`, never a
+/// wall clock.
+pub fn draw(
+    state: &LiveState,
+    frame: &mut Frame,
+    area: Rect,
+    theme: Theme,
+    tick: u64,
+    now: DateTime<Utc>,
+) {
     let chain = state.store.chain();
     match &state.load {
         ScreenLoad::Loading => {
@@ -318,7 +330,7 @@ pub fn draw(state: &LiveState, frame: &mut Frame, area: Rect, theme: Theme, tick
                     ]),
                 );
             } else {
-                draw_matrix(state, frame, area, theme);
+                draw_matrix(state, frame, area, theme, now);
             }
         }
     }
@@ -350,13 +362,19 @@ const SLOT_W: u16 = 18;
 
 /// Draw the populated strike × call/put matrix with ATM anchoring, the shaded
 /// strike column, responsive greek columns, and the stale/reconnecting badge.
-fn draw_matrix(state: &LiveState, frame: &mut Frame, area: Rect, theme: Theme) {
+///
+/// `now` is the tick-stamped wall clock the tick-direction markers decay against
+/// (`docs/01-domain-model.md` §6); it is read here, never a wall clock.
+fn draw_matrix(state: &LiveState, frame: &mut Frame, area: Rect, theme: Theme, now: DateTime<Utc>) {
     let store = &state.store;
     let chain = store.chain();
     let spot = chain.underlying_price;
     let health = store.health();
     let stale = !matches!(health, StreamHealth::Live);
-    let as_of = store.last_full_poll();
+    // The tick-direction indicators decay against the tick-stamped wall clock, so a
+    // bid-up/ask-down marker fades ~3 s after its last change on wall-time — NOT
+    // pinned to `last_full_poll`, which would freeze the marker until the next poll.
+    let as_of = Some(now);
 
     // The underlying/expiry for the per-leg InstrumentKey come from the store's
     // canonical chain key (absolute UTC), not the display strings.
@@ -366,6 +384,28 @@ fn draw_matrix(state: &LiveState, frame: &mut Frame, area: Rect, theme: Theme) {
 
     let block = Block::bordered().title(matrix_title(chain, health, theme));
     let inner = block.inner(area);
+
+    // The mandatory column set (strike + bid/ask/mark + IV + Δ) needs BASE_W inner
+    // cols; below that the table would clip into a corrupt chain, so show an honest
+    // "widen the terminal" state instead (`docs/05-views-and-ux.md` §8). Greek
+    // columns still drop responsively ABOVE this floor via `greek_slots_for_width`,
+    // and Δ stays present in every rendered chain (the theme-layer invariant).
+    if inner.width < BASE_W {
+        draw_state_body(
+            frame,
+            area,
+            theme,
+            Text::from(vec![
+                Line::from(Span::styled("chain needs a wider terminal", theme.dim())),
+                Line::from(""),
+                Line::from(Span::styled(
+                    format!("widen to at least {} cols", BASE_W + 2),
+                    theme.dim(),
+                )),
+            ]),
+        );
+        return;
+    }
 
     // v0.1 column set: Δ (always) and Γ (from `OptionData`). Θ/ν are always empty
     // until the v0.2 analytics sidecar, so they are NOT shown — the responsive drop
@@ -380,7 +420,9 @@ fn draw_matrix(state: &LiveState, frame: &mut Frame, area: Rect, theme: Theme) {
 
     let strikes: Vec<&OptionData> = chain.options.iter().collect();
     let len = strikes.len();
-    let atm = atm_index_of(chain);
+    // The ATM index is cached off-draw on `LiveState` (recomputed only on a poll),
+    // so the per-frame cost stays O(visible rows), not O(full ladder).
+    let atm = state.atm_index();
     let anchor = clamp_anchor(state.selection.focused_row, atm, len);
     // The explicit user cursor (clamped to the current chain), distinct from the
     // ATM anchor used for scrolling before any row is focused.
@@ -465,25 +507,6 @@ fn greek_slots_for_width(width: u16) -> usize {
 #[must_use]
 fn floor_sub(a: usize, b: usize) -> usize {
     a.max(b) - b
-}
-
-/// The index (in ascending strike order) of the strike nearest spot — the `◀ATM`
-/// row and the default scroll anchor. `None` for an empty chain.
-#[must_use]
-fn atm_index_of(chain: &OptionChain) -> Option<usize> {
-    let spot = chain.underlying_price.to_dec();
-    let mut best: Option<(usize, Decimal)> = None;
-    for (idx, od) in chain.options.iter().enumerate() {
-        let diff = (od.strike_price.to_dec() - spot).abs();
-        let better = match best {
-            Some((_, best_diff)) => diff < best_diff,
-            None => true,
-        };
-        if better {
-            best = Some((idx, diff));
-        }
-    }
-    best.map(|(idx, _)| idx)
 }
 
 /// The scroll anchor: the clamped user cursor if present, else the ATM index, else
@@ -849,16 +872,15 @@ pub fn handle_key(state: &mut LiveState, key: KeyEvent) -> Option<AppEvent> {
 /// unset cursor reveals it at the ATM anchor; later moves step by one, clamped —
 /// never an out-of-range index.
 fn move_strike(state: &mut LiveState, chord: KeyChord) {
-    let chain = state.store.chain();
-    let len = chain.options.len();
+    let len = state.store.chain().options.len();
     if len == 0 {
         return;
     }
     let down = matches!(chord, KeyChord::Down | KeyChord::Char('j'));
     let current = clamp_anchor(state.selection.focused_row, None, len);
     let next = match state.selection.focused_row {
-        // First move: place the cursor at the ATM anchor rather than jumping.
-        None => atm_index_of(chain).unwrap_or(0),
+        // First move: place the cursor at the cached ATM anchor rather than jumping.
+        None => state.atm_index().unwrap_or(0),
         Some(_) => {
             let row = current.unwrap_or(0);
             if down {
@@ -880,11 +902,8 @@ fn focus_leg(state: &mut LiveState, chord: KeyChord) {
         // focuses the call leg.
         _ => LegFocus::Call,
     };
-    if state.selection.focused_row.is_none() {
-        let chain = state.store.chain();
-        if !chain.options.is_empty() {
-            state.selection.focused_row = Some(atm_index_of(chain).unwrap_or(0));
-        }
+    if state.selection.focused_row.is_none() && !state.store.chain().options.is_empty() {
+        state.selection.focused_row = Some(state.atm_index().unwrap_or(0));
     }
 }
 
@@ -902,8 +921,8 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     use super::{
-        ChainRow, LegView, atm_index_of, clamp_anchor, draw, greek_slots_for_width, handle_key,
-        project_call, project_iv, project_put, project_row, window_start,
+        ChainRow, LegView, clamp_anchor, draw, greek_slots_for_width, handle_key, project_call,
+        project_iv, project_put, project_row, window_start,
     };
     use crate::app::{LegFocus, LiveScreen, LiveState, Mode, ScreenLoad, Selection, SourceBinding};
     use crate::chain::{
@@ -1062,11 +1081,21 @@ mod tests {
     }
 
     /// Draw the chain screen for `live` at `width`×`height` and return the frame
-    /// text (row-major), for render assertions.
+    /// text (row-major), for render assertions. Uses a fixed decay-reference `now`
+    /// equal to the seed poll instant (markers are `Flat` without applied quotes);
+    /// [`rendered_at`] drives a specific `now` for the tick-decay test.
     #[track_caller]
     fn rendered(live: &LiveState, width: u16, height: u16) -> String {
+        rendered_at(live, width, height, utc(EXP))
+    }
+
+    /// Draw the chain screen at `width`×`height` with an explicit tick-stamped `now`
+    /// (the wall-clock the tick-direction markers decay against) and return the
+    /// frame text.
+    #[track_caller]
+    fn rendered_at(live: &LiveState, width: u16, height: u16, now: DateTime<Utc>) -> String {
         let mut term = terminal(width, height);
-        match term.draw(|frame| draw(live, frame, frame.area(), theme(), 0)) {
+        match term.draw(|frame| draw(live, frame, frame.area(), theme(), 0, now)) {
             Ok(_) => {}
             Err(e) => panic!("draw failed: {e}"),
         }
@@ -1238,23 +1267,6 @@ mod tests {
     }
 
     // --- Windowing / anchoring helpers (no out-of-range index) ---------------
-
-    #[test]
-    fn test_atm_index_of_finds_nearest_strike() {
-        let chain = chain_with(&[50_000.0, 59_000.0, 70_000.0]);
-        // spot 60000 -> nearest is 59000 at index 1.
-        assert_eq!(atm_index_of(&chain), Some(1));
-        assert_eq!(
-            atm_index_of(&OptionChain::new(
-                "BTC",
-                pos(1.0),
-                "x".to_owned(),
-                None,
-                None
-            )),
-            None
-        );
-    }
 
     #[test]
     fn test_clamp_anchor_falls_back_when_cursor_out_of_range() {
@@ -1461,6 +1473,63 @@ mod tests {
                 let _ = rendered(live, w, h);
             }
         }
+    }
+
+    // --- Fix: the tick-direction marker decays on the wall clock, not last poll --
+
+    #[test]
+    fn test_draw_direction_marker_decays_on_wall_clock_not_last_poll() {
+        // Two rising call quotes give an Up bid/ask direction with `changed_at` at
+        // EXP+101. Rendered with `now` at the change the ▲ marker shows; rendered
+        // with `now` advanced past the ~3 s decay window it is gone — proving draw
+        // decays against the tick-stamped `now` it is passed, NOT `last_full_poll`
+        // (pinned at EXP, which would keep the marker until the next poll).
+        let mut live = live_with(chain_with(&[60_000.0]), ScreenLoad::Ready);
+        let _ = live
+            .store
+            .apply_quote(&quote(60_000.0, OptionStyle::Call, 1.0, 1.2, EXP + 100));
+        let _ = live
+            .store
+            .apply_quote(&quote(60_000.0, OptionStyle::Call, 1.5, 1.7, EXP + 101));
+        let fresh = rendered_at(&live, 120, 12, utc(EXP + 101));
+        assert!(
+            fresh.contains('▲'),
+            "a just-risen quote shows the up marker"
+        );
+        let decayed = rendered_at(&live, 120, 12, utc(EXP + 200));
+        assert!(
+            !decayed.contains('▲'),
+            "past the decay window the marker decays on wall-time, not the last poll",
+        );
+    }
+
+    // --- Fix: an 80-col terminal shows a widen hint, never a clipped chain -------
+
+    #[test]
+    fn test_draw_narrow_terminal_shows_widen_hint_not_clipped_chain() {
+        // Below the mandatory-column width the chain would clip; at 40 and 80 cols
+        // the screen shows an honest "widen" hint instead of a corrupt/clipped
+        // matrix. NO_COLOR-safe (a dim text hint) and the greek drop order is
+        // untouched.
+        let live = live_with(
+            chain_with(&[59_000.0, 60_000.0, 61_000.0]),
+            ScreenLoad::Ready,
+        );
+        for w in [40u16, 80u16] {
+            let text = rendered(&live, w, 12);
+            assert!(
+                text.contains("widen"),
+                "at {w} cols the chain shows a widen hint, not a clipped table",
+            );
+            assert!(
+                !text.contains("Strike"),
+                "at {w} cols no clipped chain header leaks",
+            );
+        }
+        // Above the mandatory-column width the real chain renders in full.
+        let wide = rendered(&live, 120, 20);
+        assert!(wide.contains("Strike"), "the chain renders at 120 cols");
+        assert!(wide.contains("60000"), "a strike renders at 120 cols");
     }
 
     // --- Draw purity: draw takes &LiveState and mutates nothing --------------

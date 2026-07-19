@@ -110,10 +110,13 @@ pub fn render(app: &App, frame: &mut Frame) {
     match &app.mode {
         Mode::Live(state) => match state.screen {
             // The chain matrix reads the resolved theme (so `NO_COLOR` degrades
-            // its shading to markers) and the tick counter (so its loading
-            // spinner advances) — both `Copy`, so the draw stays pure over the
-            // borrowed state (`docs/02-tui-architecture.md` §7).
-            LiveScreen::Chain => chain::draw(state, frame, root.body, theme, app.tick_count),
+            // its shading to markers), the tick counter (so its loading spinner
+            // advances), and the tick-stamped wall clock `app.now` (so the
+            // bid-up/ask-down markers decay on wall-time) — all `Copy`, so the draw
+            // stays pure over the borrowed state (`docs/02-tui-architecture.md` §7).
+            LiveScreen::Chain => {
+                chain::draw(state, frame, root.body, theme, app.tick_count, app.now)
+            }
             LiveScreen::Depth => depth::draw(state, frame, root.body),
             LiveScreen::Surface => surface::draw(state, frame, root.body),
             LiveScreen::Payoff => payoff::draw(state, frame, root.body),
