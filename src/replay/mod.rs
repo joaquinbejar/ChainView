@@ -677,17 +677,23 @@ fn parquet_err(detail: String) -> BundleError {
 /// the panic path — the caller returns `Err` and never observes the
 /// partially-decoded upstream state again.
 ///
-/// # Caveat: the process panic hook still runs
+/// # The process panic hook is silenced inside this boundary
 ///
-/// `catch_unwind` catches the unwind but does NOT suppress the process panic hook,
-/// which fires (a `stderr` line by default, or the TUI restore hook installed at
-/// startup) before this returns. This reader is a domain seam that must stay free
-/// of terminal knowledge, so it does not touch the global hook; coordinating hook
-/// suppression with the TUI is an app-layer concern, outside this reader's scope.
+/// `catch_unwind` catches the unwind but does not itself suppress the process
+/// panic hook - which would otherwise fire BEFORE this returns and, under a live
+/// TUI, restore raw mode / print into the alternate screen while the render loop
+/// keeps drawing (the #53 second-pass finding). The thread-local
+/// [`ContainedPanicGuard`](crate::terminal::ContainedPanicGuard) held across the
+/// call marks the panic as CONTAINED on this thread, so the hook stays fully
+/// silent (no restore, no chained print) and the outcome is exactly the typed
+/// error returned here. An uncontained panic on any other thread still runs the
+/// full hook. (`terminal` is infra, outside the layered fence, so this leaf
+/// import does not create a domain->ui edge.)
 fn catch_decode_panic<T>(
     file: &str,
     op: impl FnOnce() -> Result<T, BundleError>,
 ) -> Result<T, BundleError> {
+    let _contained = crate::terminal::ContainedPanicGuard::new();
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(op)) {
         Ok(inner) => inner,
         Err(_) => Err(parquet_err(format!(

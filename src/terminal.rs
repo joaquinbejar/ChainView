@@ -264,6 +264,54 @@ fn should_hook_restore(supervisor_owns_restore: bool) -> bool {
     !supervisor_owns_restore
 }
 
+thread_local! {
+    /// Depth of CONTAINED-panic boundaries active on THIS thread. While non-zero,
+    /// the panic hook is fully silent (no restore, no chained print): the caller
+    /// is about to `catch_unwind` the panic and map it to a typed error (the #53
+    /// replay decode boundary), so the process-global side effects — restoring
+    /// raw mode under a live TUI, or printing into the alternate screen — would
+    /// be exactly the damage the boundary exists to prevent. Thread-local (the
+    /// hook runs ON the panicking thread), so an unrelated panic on another
+    /// thread is never suppressed.
+    static CONTAINED_PANIC_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// RAII marker for a contained-panic boundary: while alive, a panic on this
+/// thread runs NO hook side effects (the `catch_unwind` caller owns the outcome
+/// as a typed error). Nesting is counted; `Drop` restores the prior depth.
+pub(crate) struct ContainedPanicGuard;
+
+impl ContainedPanicGuard {
+    /// Enter a contained-panic boundary on this thread.
+    pub(crate) fn new() -> Self {
+        CONTAINED_PANIC_DEPTH.with(|d| {
+            // Checked, not saturating (a banned method); the lint-safe shape is
+            // the explicit if-let (nesting depth cannot realistically overflow).
+            if let Some(next) = d.get().checked_add(1) {
+                d.set(next);
+            }
+        });
+        Self
+    }
+}
+
+impl Drop for ContainedPanicGuard {
+    fn drop(&mut self) {
+        CONTAINED_PANIC_DEPTH.with(|d| {
+            let next = match d.get() {
+                0 => 0,
+                n => n - 1,
+            };
+            d.set(next);
+        });
+    }
+}
+
+/// Whether a contained-panic boundary is active on this thread.
+fn contained_panic_active() -> bool {
+    CONTAINED_PANIC_DEPTH.with(|d| d.get() > 0)
+}
+
 /// Install a panic hook that restores the terminal **before** chaining to the
 /// previously installed hook.
 ///
@@ -275,6 +323,13 @@ fn should_hook_restore(supervisor_owns_restore: bool) -> bool {
 pub fn install_panic_hook() {
     let previous = panic::take_hook();
     panic::set_hook(Box::new(move |info| {
+        if contained_panic_active() {
+            // A catch_unwind boundary on THIS thread owns the outcome as a typed
+            // error (#53): stay fully silent - no restore (a live TUI keeps its
+            // raw mode) and no chained print (nothing lands on the alternate
+            // screen). An uncontained panic elsewhere still runs the full hook.
+            return;
+        }
         restore_then_chain(restore_on_panic, |i| previous(i), info);
     }));
 }
