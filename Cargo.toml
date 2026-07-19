@@ -32,9 +32,23 @@ optionstratlib = { version = "0.18.0", default-features = false }
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 async-trait = "0.1"
 tokio = { version = "1", default-features = false, features = ["sync"] }
+# The terminal stack (ADR-0001, issue #8, first TUI pull). ratatui 0.30 requires
+# rustc 1.88, above our 1.85 MSRV, so the resolver pins 0.29 — which re-exports
+# crossterm 0.28.1. `crossterm` is pinned to that same `0.28` line so cargo
+# unifies to a single instance: the crossterm ChainView calls is exactly the one
+# ratatui drives (no two-version mismatch).
+ratatui = { version = "0.29", features = ["crossterm"] }
+crossterm = "0.28"
 
 [dev-dependencies]
 proptest = "1"
+
+# The panic-injection restore harness is a bare subprocess (no libtest capture),
+# so the child panics on a normal process with the default hook as the chained
+# tail — see `tests/terminal_restore.rs` and `docs/TESTING.md` §7.
+[[test]]
+name = "terminal_restore"
+harness = false
 
 [lints.rust]
 warnings = { level = "deny", priority = -1 }
