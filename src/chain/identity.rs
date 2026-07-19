@@ -163,8 +163,9 @@ pub const RESERVED_PROVIDER_IDS: [&str; 5] = ["deribit", "tastytrade", "dxlink",
 /// The invariant is `^[a-z][a-z0-9]*(?:[_-][a-z0-9]+)*$` with a total length of
 /// 2–32 characters: it starts with a lowercase letter and allows `-`/`_` only
 /// **isolated between alphanumerics** — no leading, trailing, or adjacent
-/// separators. This is a pre-v0.1 tightening of the earlier
-/// `^[a-z][a-z0-9_-]{1,31}$` grammar (a strict superset check) that makes the
+/// separators. This is a pre-v0.1 tightening (a strict **narrowing** — the
+/// accepted set is a proper subset) of the earlier
+/// `^[a-z][a-z0-9_-]{1,31}$` grammar, which makes the
 /// id ↔ environment-segment transliteration (`docs/07-configuration.md` §5.1) a
 /// **total bijection** — see
 /// [ADR-0008](https://github.com/joaquinbejar/ChainView/blob/main/docs/adr/0008-provider-id-grammar-and-env-bijection.md).

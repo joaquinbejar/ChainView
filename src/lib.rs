@@ -25,7 +25,8 @@ pub(crate) mod ui;
 // the capability-read reachability helper. Public so the app builder (#12) and
 // the render loop (#13) can name and drive them.
 pub use app::{
-    App, BundleLoad, LiveScreen, LiveState, LoadedReplay, Mode, OverlayBinding, PayoffBuilder,
+    App, BridgeSenders, BundleLoad, COMMAND_CHANNEL_CAPACITY, CONTROL_CHANNEL_CAPACITY,
+    EventBridge, LiveScreen, LiveState, LoadedReplay, Mode, OverlayBinding, PayoffBuilder,
     Playback, ReplayScreen, ReplayState, ScreenLoad, Selection, SourceBinding, StatusLine,
     is_screen_reachable,
 };

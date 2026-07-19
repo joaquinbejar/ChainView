@@ -14,6 +14,65 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- The two-class bounded, coalescing provider -> app bridge (`src/app/bridge.rs`,
+  issue #10; `docs/02-tui-architecture.md` §5, `docs/06-performance.md` §3.2,
+  `docs/03-data-providers.md` §5). `EventBridge` is the seam that joins the async
+  data layer to the synchronous render-loop fan-in (`App::on_event`), draining
+  only over **bounded** `tokio::sync::mpsc` channels — no unbounded channel exists
+  on the provider -> app path. Key behaviours:
+  - **Two-class backpressure.** A bounded **coalesced** channel carries
+    `Quote`/`Greeks`/`Depth` (capacity from `config.channel_capacity`); a
+    **separate, small** bounded **control** channel carries `Chain`/`Health`. The
+    fan-in wakeup (`pump`/`pump_into`) drains the control channel **first**
+    (priority) so a `Health(Reconnecting)` or a fresh `Chain` is delivered
+    promptly even while the coalesced channel is saturated with stale quote
+    traffic — health can never sit behind a quote burst.
+  - **Consumer-side conflation, O(N) not O(burst).** The coalesced channel drains
+    into a per-instrument staging map keyed by `InstrumentKey` — one slot per
+    instrument, last-value-wins — then the current values flush into
+    `App::on_event`. The map is bounded by the subscribed instrument count N,
+    never by burst rate or session length; a dropped intermediate quote is not a
+    correctness loss (the chain shows the freshest price). Within a slot a quote,
+    a Greeks row, and a depth ladder are held independently, so a Greeks refresh
+    never clobbers a pending quote and the slot count stays exactly N. This is the
+    **consumer-side** stage of the two-stage coalescing design (`docs/02` §5); the
+    **producer-side** overwrite-on-full staging that preserves the freshest value
+    when the bounded channel is *full* is the adapter's contract, pinned in #16 —
+    until it lands, a plain `try_send`-drop producer can transiently deliver a
+    stale value under sustained saturation (self-healing on the next quote).
+  - **HP-3 allocation discipline.** The staging map **reuses** its allocation
+    across bursts — a flush drains via `HashMap::drain` and an unsubscribe prunes
+    via `HashMap::retain`, both of which retain the bucket allocation, and a
+    repeat update for an already-staged instrument clones no key — so once grown
+    to fit N it performs zero steady-state per-burst allocation.
+  - **Lifecycle tracks the subscription set.** A slot is created on the first
+    update, overwritten on subsequent ones, and **removed** when the instrument
+    is unsubscribed: `pump` drains the render -> data command channel and prunes
+    the staging map on each `Command::Unsubscribe` (an absolute-expiry unsubscribe
+    prunes the matching expiry precisely; a relative-days one, which cannot be
+    resolved without a wall clock the fan-in deliberately lacks, prunes the whole
+    underlying), while forwarding every drained command to a caller `route`
+    closure — the clean seam the task supervisor (#11) fills to reach the provider
+    layer.
+  - **Testable with no socket and no wall clock.** The drain is `try_recv`-based
+    and reads no clock; `EventBridge::new(coalesced_capacity)` returns the bridge
+    plus a `BridgeSenders` bundle (the producer halves the supervisor wires to the
+    adapters and to `App`). The adapter that produces updates (#16), the
+    supervisor that owns the channel ends (#11), and the render loop that pumps
+    between frames (#13) are separate issues; the seams for each are explicit.
+    `EventBridge`, `BridgeSenders`, and the `CONTROL_CHANNEL_CAPACITY` /
+    `COMMAND_CHANNEL_CAPACITY` constants are re-exported from the crate root.
+    Tests: 17 in-module — staging-map overwrite / lossless-per-kind (quote+greeks,
+    depth+quote) / control-not-staged / remove-on-unsubscribe (absolute expiry,
+    relative days, other-underlying no-op), capacity-reuse and latest-value-over-
+    burst (HP-3, deterministic memory-flatness by asserting `capacity()` is stable
+    and `len() <= N` across 1000 bursts), plus `EventBridge` priority-drain,
+    health-delivered-while-saturated, burst-beyond-channel-capacity-keeps-memory-
+    flat, every-instrument-receives-latest, unsubscribe-prunes, command-routed,
+    and two `pump`-into-a-live-`App` folds. **No new dependency and no new `tokio`
+    features**: `tokio::sync::mpsc` channels with `try_send`/`try_recv` are
+    runtime-free, so the existing `["sync"]` feature suffices — no `rt`/`macros`/
+    `time` are pulled, keeping runtime features minimal.
 - The application state machine and synchronous event fan-in (`src/app.rs`,
   `src/event.rs`, issue #9; `docs/02-tui-architecture.md` §3, §4). `App` owns all
   render-loop state as a `Live | Replay` `Mode` machine; the fan-in folds every
