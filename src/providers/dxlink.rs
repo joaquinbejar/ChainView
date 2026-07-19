@@ -104,7 +104,7 @@ use dxlink::{DXLinkClient, EventType, FeedSubscription, MarketEvent};
 use super::dxfeed_decode::{DxGreeksEvent, DxQuoteEvent, decode_greeks, decode_quote};
 use super::{
     AuthKind, ChainCapability, ChainPollCapability, GreeksCapability, MarketUpdateSink,
-    OptionStreamCapability, Provider, ProviderCapabilities, SinkSend, SubscriptionHandle,
+    OptionStreamCapability, Provider, ProviderCapabilities, SendState, SubscriptionHandle,
     SubscriptionRequest, UnderlyingRef,
 };
 use crate::chain::{ChainFetch, Instrument, MarketUpdate, ProviderId, StreamHealth};
@@ -507,7 +507,7 @@ async fn run_reconnect_loop<T: DxlinkTransport>(
             () = cancel.cancelled() => return,
             outcome = sink.send(health) => outcome,
         };
-        if health_sent == SinkSend::Closed {
+        if health_sent == SendState::Closed {
             return;
         }
         let delay = backoff_delay(attempt, sample_jitter());
@@ -545,7 +545,7 @@ async fn connect_stream_once<T: DxlinkTransport>(
 
     *attempt = 0;
     let live = MarketUpdate::Health(id.clone(), StreamHealth::Live);
-    if sink.send(live).await == SinkSend::Closed {
+    if sink.send(live).await == SendState::Closed {
         return StreamExit::Shutdown;
     }
 
@@ -560,7 +560,7 @@ async fn connect_stream_once<T: DxlinkTransport>(
             Ok(event) => event,
             Err(_) => return StreamExit::Reconnect,
         };
-        if route_event(&event, &lookup, sink).await == SinkSend::Closed {
+        if route_event(&event, &lookup, sink).await == SendState::Closed {
             return StreamExit::Shutdown;
         }
     }
@@ -607,12 +607,12 @@ fn stream_lookup(instruments: &[Instrument]) -> HashMap<String, Instrument> {
 /// An unknown streamer symbol is a **benign drop** (keep prior; the deferred
 /// `clamp_symbol` echo lands with the tracing sink), and a **crossed** quote is
 /// likewise a benign per-tick drop — neither feeds reconnect/health/error-rate
-/// logic. Returns [`SinkSend::Closed`] once the consumer is gone.
+/// logic. Returns [`SendState::Closed`] once the consumer is gone.
 async fn route_event(
     event: &RawDxEvent,
     lookup: &HashMap<String, Instrument>,
     sink: &mut MarketUpdateSink,
-) -> SinkSend {
+) -> SendState {
     let received = now_utc();
     match event {
         RawDxEvent::Quote {
@@ -627,7 +627,7 @@ async fn route_event(
                 // set is dropped (never resurrects a strike). Once the tracing sink
                 // lands (governance deviation 3) a bounded `clamp_symbol(symbol)`
                 // echo goes here at TRACE — the deribit-adapter house pattern.
-                return SinkSend::Delivered;
+                return SendState::Open;
             };
             let view = DxQuoteEvent {
                 symbol: symbol.clone(),
@@ -646,7 +646,7 @@ async fn route_event(
                 // A momentarily-crossed tick is a benign microstructure event on a
                 // fast feed: keep the prior quote, do NOT feed reconnect/health/error
                 // rate. Once the tracing sink lands a `clamp_symbol` TRACE goes here.
-                Err(_) => SinkSend::Delivered,
+                Err(_) => SendState::Open,
             }
         }
         RawDxEvent::Greeks {
@@ -662,7 +662,7 @@ async fn route_event(
                 // Unknown-symbol guard (see the quote arm): dropped, prior kept. A
                 // bounded `clamp_symbol(symbol)` TRACE goes here once the tracing
                 // sink lands (governance deviation 3).
-                return SinkSend::Delivered;
+                return SendState::Open;
             };
             let view = DxGreeksEvent {
                 symbol: symbol.clone(),
@@ -680,10 +680,10 @@ async fn route_event(
                 // carries the IV as-is (§3) and tags the row `GreeksOrigin::Provider`.
                 Ok(greeks) => sink.send(MarketUpdate::Greeks(greeks)).await,
                 // decode_greeks is total for a well-formed event; a defensive drop.
-                Err(_) => SinkSend::Delivered,
+                Err(_) => SendState::Open,
             }
         }
-        RawDxEvent::Ignored => SinkSend::Delivered,
+        RawDxEvent::Ignored => SendState::Open,
     }
 }
 
@@ -1076,7 +1076,7 @@ mod tests {
         let lookup = stream_lookup(&legs);
         let (mut sink, mut rx_control, mut rx_coalesced) = test_sink(8);
         let sent = block(route_event(event, &lookup, &mut sink));
-        assert_ne!(sent, SinkSend::Closed);
+        assert_ne!(sent, SendState::Closed);
         let mut out = drain(&mut rx_control);
         out.extend(drain(&mut rx_coalesced));
         out
