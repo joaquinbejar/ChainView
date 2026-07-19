@@ -569,7 +569,7 @@ mod tests {
             code_version: "0.3.0".to_owned(),
             lockfile_sha256: "deadbeef".to_owned(),
             seed: 1,
-            config: serde_json::json!({ "capital_cents": 1_000_000 }),
+            config: serde_json::json!({ "initial_capital": 1_000_000 }),
             strategy: serde_json::json!({ "kind": "iron_condor" }),
             data_source: serde_json::json!({ "kind": "simulator" }),
             metrics: serde_json::json!({}),

@@ -2,17 +2,17 @@
 
 | Field      | Value                                       |
 |------------|---------------------------------------------|
-| Status     | v0.1 first baseline                         |
-| Last run   | 2026-07-16                                  |
-| Suite      | `bench_render_chain`, `bench_event_fanin`, `bench_chain_merge` |
-| Issue      | #21                                         |
+| Status     | v0.1 baseline (HP-1…HP-3) + v0.3 HP-4        |
+| Last run   | 2026-07-17 (HP-4); 2026-07-16 (HP-1…HP-3)   |
+| Suite      | `bench_render_chain`, `bench_event_fanin`, `bench_chain_merge`, `bench_replay_decode` |
+| Issue      | #21 (HP-1…HP-3), #36 (HP-4)                  |
 
 These are **real measured runs on the machine below** — not design targets and
 not fabricated. The no-fabricated-benchmarks rule is absolute (`CLAUDE.md`): every
 number here came from `cargo bench --features bench` on this host. Re-run before
-quoting on other hardware. HP-4 (`bench_replay_decode`) is v0.3 and not in this
-baseline; the CI regression gate that fails on a regression past a documented
-threshold is v1.0 (#52), not here.
+quoting on other hardware. HP-4 (`bench_replay_decode`) landed at v0.3 (#36) and
+is the replay decode entry below; the CI regression gate that fails on a
+regression past a documented threshold is v1.0 (#52), not here.
 
 ## 1. Measurement environment
 
@@ -21,9 +21,10 @@ threshold is v1.0 (#52), not here.
 | CPU         | Apple M4 Max (16 physical / 16 logical cores), `Mac16,9`     |
 | Memory      | 64 GiB                                                        |
 | OS          | macOS 26.5.2 (build 25F84) — Darwin 25.5.0, `arm64`          |
-| Toolchain   | `rustc 1.97.0 (2d8144b7 2026-07-07)`, `cargo 1.97.0`, stable |
+| Toolchain   | `rustc 1.97.0 (2d8144b7 2026-07-07)`, `cargo 1.97.0`, stable (HP-1…HP-3); `rustc 1.97.1 (8bab26f4f 2026-07-14)`, `cargo 1.97.1`, stable (HP-4) — same host, a patch bump between runs |
 | Build       | `cargo bench --features bench` (the `bench` profile inherits `[profile.release]`: `opt-level = 3`, `lto = true`, `codegen-units = 1`) |
 | Harness     | `criterion 0.5.1` (timing) + `hdrhistogram 7.5.4` (tail)     |
+| Decode deps | `parquet 59.1.0` + `arrow-array 59.1.0` (+ `zstd 0.13.3`), for HP-4 |
 | Data        | fixture/synthetic producers only — no live venue, no socket, no wall-clock read in the measured path |
 
 Numbers are from an interactive laptop under a normal desktop load (not an
@@ -146,6 +147,38 @@ staging allocation is **flat** across all 2 000 bursts — memory is O(`N`
 subscribed), not O(burst rate) or O(session length). This is the **measured**
 face of NFR-15, demonstrated, not asserted from the design.
 
+### HP-4 — `bench_replay_decode` (replay table decode)
+
+Open + decode a conformance IronCondor result bundle — all four tables
+(`fills` / `equity_curve` / `positions` / `greeks_attribution`) at **20 000
+steps = 80 000 rows** — through the **real, public** `BundleReader` open+load
+path under the default resource ceilings, **including the #32 cross-table
+validation chain**. The unit is **one full open+decode+validate of the bundle**;
+the bundle is generated once (before measurement) by `tests/common/bundle_gen.rs`
+into a tempdir. Figures are in **microseconds**.
+
+| Metric | Value (µs) |
+|--------|-----------:|
+| p50    |   7471.103 |
+| p99    |   8044.543 |
+| p99.9  |   8183.807 |
+| max    |   8237.055 |
+| mean (context) | 7492.403 |
+
+- Samples: **1 000** after **100** warmup iterations.
+- Criterion cross-check: `[7.4449 ms 7.4783 ms 7.5173 ms]` (lower/est./upper mean).
+- Per-row: ≈ **0.10 µs** (p50 7471 µs ÷ 80 000 rows), covering the Parquet decode,
+  the checked wire→domain narrowing (#31), and the full O(n) validation chain (#32).
+- Coordinated omission: **none applied** — a decode has no natural external
+  arrival rate; the reader decodes a bundle **on demand off the render thread**, so
+  this is per-load **service time** back-to-back (no fixed-rate injection, no CO
+  correction).
+- **This is the one-shot load, not a per-frame path.** Decode runs off the draw
+  path ([06 §3.4](docs/06-performance.md#34-replay-decode-hp-4)); at ≈ 7.5 ms for
+  an 80 000-row bundle it opens the replay screen well within an interactive feel.
+  The 16 ms/60 fps p99 **frame** budget applies to the scrub cursor's per-step
+  recompute (a separate interactive path), **not** to this bulk decode.
+
 ## 4. NFR re-baseline
 
 | NFR | Target | Status | Evidence |
@@ -157,10 +190,11 @@ face of NFR-15, demonstrated, not asserted from the design.
 ## 5. Reproduce
 
 ```
-cargo bench --features bench                     # all three (+ lib/bin no-op targets)
+cargo bench --features bench                     # all four (+ lib/bin no-op targets)
 cargo bench --features bench --bench bench_render_chain
 cargo bench --features bench --bench bench_event_fanin
 cargo bench --features bench --bench bench_chain_merge
+cargo bench --features bench --bench bench_replay_decode   # HP-4 (#36)
 ```
 
 The `hdrhistogram` tail report prints first (the headline table above), then

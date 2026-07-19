@@ -1,0 +1,13 @@
+{
+  "schema": "ironcondor.bundle.v1",
+  "run_id": "run-036-conformance",
+  "created_utc": "2026-07-17T00:00:00Z",
+  "code_version": "0.3.0",
+  "lockfile_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "seed": 36,
+  "config": { "initial_capital": 1000000, "execution_mode": "realistic" },
+  "strategy": { "kind": "iron_condor", "params": {} },
+  "data_source": { "kind": "simulator", "seed": 36 },
+  "metrics": { "total_pnl_cents": -11415, "sharpe": 1.25 },
+  "row_counts": { "fills": 500, "equity_curve": 4, "positions": 4, "greeks_attribution": 4 }
+}

@@ -2215,6 +2215,52 @@ mod tests {
         }
     }
 
+    /// Write a **decompression-bomb** Parquet file at `path`: a single
+    /// `step: INT64` column of `num_rows` identical values, PLAIN-encoded (no
+    /// dictionary) and ZSTD-compressed. The uncompressed footer size is `8 ×
+    /// num_rows` but the identical bytes crush to near-nothing, so
+    /// `total_byte_size ≫ file_bytes` clears the default expansion ratio — the
+    /// shape #36's `decompression_bomb` fixture commits. Mirrors
+    /// `tests/common/bundle_gen.rs::bomb_fills_batch`.
+    fn write_bomb_parquet(path: &Path, num_rows: usize) {
+        use std::sync::Arc;
+
+        use arrow_array::{ArrayRef, Int64Array, RecordBatch};
+        use arrow_schema::{DataType, Field, Schema};
+        use parquet::arrow::ArrowWriter;
+        use parquet::basic::{Compression, ZstdLevel};
+        use parquet::file::properties::WriterProperties;
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "step",
+            DataType::Int64,
+            false,
+        )]));
+        let col: ArrayRef = Arc::new(Int64Array::from(vec![0_i64; num_rows]));
+        let batch = match RecordBatch::try_new(Arc::clone(&schema), vec![col]) {
+            Ok(b) => b,
+            Err(e) => panic!("build bomb batch: {e}"),
+        };
+        let file = match std::fs::File::create(path) {
+            Ok(f) => f,
+            Err(e) => panic!("create {}: {e}", path.display()),
+        };
+        let props = WriterProperties::builder()
+            .set_compression(Compression::ZSTD(ZstdLevel::default()))
+            .set_dictionary_enabled(false)
+            .build();
+        let mut writer = match ArrowWriter::try_new(file, schema, Some(props)) {
+            Ok(w) => w,
+            Err(e) => panic!("arrow writer: {e}"),
+        };
+        if let Err(e) = writer.write(&batch) {
+            panic!("write bomb batch: {e}");
+        }
+        if let Err(e) = writer.close() {
+            panic!("close bomb writer: {e}");
+        }
+    }
+
     /// Write a full-schema bundle: `manifest.json` plus the four Parquet tables
     /// with EVERY documented column, so `load`'s typed decoders run end-to-end.
     fn write_full_bundle(
@@ -2542,6 +2588,141 @@ mod tests {
             other => panic!("a batch over the per-batch cap must be TooLarge, got {other:?}"),
         }
         assert_eq!(budget.used(), 0, "a rejected batch is never committed");
+    }
+
+    // --- #36 adversarial bounded reject: the decoder is never invoked ----------
+    //
+    // These drive `scan_table` directly with a probe `decode` closure so the
+    // "reject without materializing the hostile payload" property is asserted
+    // POSITIVELY — the closure (which is where the #31 typed decode allocates the
+    // owned rows) is never called and the working-set budget commits nothing — not
+    // merely on the returned error variant. They are the unit-level counterpart of
+    // the committed `tests/fixtures/bundle/{decompression_bomb,oversized_footer,
+    // rowcount_lie}` fixtures (#36), reusing the #30 machinery.
+
+    /// The absent-others scaffold for a bomb bundle: `manifest.json` (honest
+    /// `fills` count so the footer/`row_counts` cross-check passes) plus three tiny
+    /// stub tables so `open` finds all four present; `fills.parquet` is the bomb.
+    fn write_bomb_bundle(dir: &Path, fills_rows: usize) {
+        let counts = [u64::try_from(fills_rows).unwrap_or(u64::MAX), 1, 1, 1];
+        if let Err(e) = std::fs::write(
+            dir.join(MANIFEST_FILE),
+            manifest_json_with(SUPPORTED_SCHEMA, counts, false),
+        ) {
+            panic!("write manifest: {e}");
+        }
+        write_bomb_parquet(&dir.join("fills.parquet"), fills_rows);
+        write_parquet(&dir.join("equity_curve.parquet"), 1);
+        write_parquet(&dir.join("positions.parquet"), 1);
+        write_parquet(&dir.join("greeks_attribution.parquet"), 1);
+    }
+
+    /// Scan `fills.parquet` through the real ceiling path with a probe decoder,
+    /// returning the scan result plus whether the decoder was ever invoked and the
+    /// working set committed. The decoder flips a flag — if a pre-decode ceiling
+    /// rejects, it is never called and no batch is materialized.
+    #[track_caller]
+    fn scan_fills_probing_decoder(reader: &BundleReader) -> (Result<(), BundleError>, bool, u64) {
+        use std::cell::Cell;
+
+        let mut budget = WorkingSetBudget::new(reader.ceilings());
+        let invoked = Cell::new(false);
+        let result = reader.scan_table(
+            "fills.parquet",
+            "fills",
+            &mut budget,
+            &|| false,
+            &mut |_batch| {
+                invoked.set(true);
+                Ok(0)
+            },
+        );
+        (result, invoked.get(), budget.used())
+    }
+
+    #[test]
+    fn test_decompression_bomb_rejects_before_invoking_the_decoder() {
+        let dir = temp_bundle_dir();
+        // 8 000 identical 8-byte values -> ~64 KiB uncompressed, ~sub-KiB on disk:
+        // the footer's uncompressed size clears the default 20x expansion ratio.
+        write_bomb_bundle(dir.path(), 8_000);
+        let reader = open_ok(dir.path(), ResourceCeilings::default());
+        let (result, invoked, used) = scan_fills_probing_decoder(&reader);
+        match result {
+            Err(BundleError::TooLarge(detail)) => assert!(
+                detail.contains("decompression bomb"),
+                "the bomb must be rejected by the pre-decode bomb check: {detail}"
+            ),
+            other => panic!("a decompression bomb must be TooLarge, got {other:?}"),
+        }
+        assert!(
+            !invoked,
+            "the bomb must be rejected BEFORE the decoder materializes any batch"
+        );
+        assert_eq!(
+            used, 0,
+            "no working set is committed on the pre-decode reject"
+        );
+    }
+
+    #[test]
+    fn test_oversized_footer_rows_reject_before_invoking_the_decoder() {
+        let dir = temp_bundle_dir();
+        write_full_bundle(
+            dir.path(),
+            SUPPORTED_SCHEMA,
+            [8, 8, 8, 8],
+            [8, 8, 8, 8],
+            false,
+            false,
+        );
+        // A per-table row ceiling below the honest 8-row footer trips ceiling 2.
+        let reader = open_ok(
+            dir.path(),
+            ResourceCeilings {
+                max_table_rows: 4,
+                ..ResourceCeilings::default()
+            },
+        );
+        let (result, invoked, used) = scan_fills_probing_decoder(&reader);
+        assert!(
+            matches!(result, Err(BundleError::TooLarge(_))),
+            "an over-ceiling footer must be TooLarge, got {result:?}"
+        );
+        assert!(!invoked, "ceiling 2 rejects before the decoder runs");
+        assert_eq!(
+            used, 0,
+            "no working set is committed on the pre-decode reject"
+        );
+    }
+
+    #[test]
+    fn test_rowcount_lie_rejects_before_invoking_the_decoder() {
+        let dir = temp_bundle_dir();
+        // The fills FILE has 4 rows; the manifest lies and claims 10.
+        write_full_bundle(
+            dir.path(),
+            SUPPORTED_SCHEMA,
+            [4, 10, 8, 10],
+            [10, 10, 8, 10],
+            false,
+            false,
+        );
+        let reader = open_ok(dir.path(), ResourceCeilings::default());
+        let (result, invoked, used) = scan_fills_probing_decoder(&reader);
+        assert!(
+            matches!(result, Err(BundleError::Invariant(_))),
+            "a footer/row_counts lie must be Invariant, got {result:?}"
+        );
+        assert!(
+            !invoked,
+            "the row_counts cross-check rejects before the decoder runs — the hint \
+             never sizes an allocation"
+        );
+        assert_eq!(
+            used, 0,
+            "no working set is committed on the pre-decode reject"
+        );
     }
 
     // --- Checked conversions (never an `as` cast on a footer value) ------------
