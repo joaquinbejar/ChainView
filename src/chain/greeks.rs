@@ -834,7 +834,7 @@ fn days_between(as_of: DateTime<Utc>, expiration_utc: DateTime<Utc>) -> Option<P
 /// exactly at the threshold is still fresh) and clamps a non-positive age (a
 /// `received` at or after `as_of`, from clock skew) to fresh.
 #[must_use]
-fn quote_is_stale(received: DateTime<Utc>, as_of: DateTime<Utc>) -> bool {
+pub(crate) fn quote_is_stale(received: DateTime<Utc>, as_of: DateTime<Utc>) -> bool {
     let age = as_of
         .signed_duration_since(received)
         .to_std()

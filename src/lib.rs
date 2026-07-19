@@ -56,13 +56,13 @@ pub mod bench_support;
 // the UI never receives the registry. Public so the app builder (#12) and the
 // render loop (#13) can name and drive them.
 pub use app::{
-    App, BridgeSenders, BundleLoad, COMMAND_CHANNEL_CAPACITY, CONTROL_CHANNEL_CAPACITY,
-    ChainViewApp, ChainViewAppBuilder, DEFAULT_JOIN_BUDGET, EventBridge, ExitCause, ExitReporter,
-    FinalTeardown, GuardTeardown, LegFocus, LiveScreen, LiveState, LoadedReplay, Mode,
-    OverlayBinding, PayoffBuilder, Playback, ProviderSubscription, ReplayScreen, ReplayState,
-    Resolved, ScreenLoad, Selection, SourceBinding, StatusLine, SupervisedTask, Supervisor,
-    TaskExit, TokioTask, is_replay_screen_reachable, is_screen_reachable,
-    spawn_supervised_subscription,
+    App, BridgeSenders, BuilderLeg, BundleLoad, COMMAND_CHANNEL_CAPACITY, CONTROL_CHANNEL_CAPACITY,
+    ChainViewApp, ChainViewAppBuilder, CommittedStrategy, CurveMode, DEFAULT_JOIN_BUDGET,
+    EventBridge, ExitCause, ExitReporter, FinalTeardown, GuardTeardown, LegError, LegFocus,
+    LiveScreen, LiveState, LoadedReplay, Mode, OverlayBinding, PayoffBuilder, Playback,
+    ProviderSubscription, ReplayScreen, ReplayState, Resolved, ScreenLoad, Selection, Side,
+    SourceBinding, StatusLine, SupervisedTask, Supervisor, TaskExit, TokioTask,
+    is_replay_screen_reachable, is_screen_reachable, spawn_supervised_subscription,
 };
 // The closed event set folded by the state machine and the render -> data
 // command channel (`docs/02-tui-architecture.md` §4).
@@ -116,7 +116,7 @@ pub use ui::theme::{
 pub use app::keymap::{
     Action, Binding, ChainAction, Context, DepthAction, GlobalAction, GlobalCommand, KEYMAP,
     KeyChord, PayoffAction, ReplayAction, SurfaceAction, help_bindings, resolve_chain,
-    resolve_global, resolve_replay,
+    resolve_global, resolve_payoff, resolve_replay,
 };
 
 pub use chain::{

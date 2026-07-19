@@ -357,7 +357,7 @@ pub static KEYMAP: &[Binding] = &[
         help: "Ascend / close",
         deferred: None,
     },
-    // -- Chain (MoveStrike/FocusLeg wired #18; the rest resolve but defer I/O) --
+    // -- Chain (MoveStrike/FocusLeg #18 + AddLeg #26 wired; the rest defer I/O) --
     Binding {
         context: Context::Live(LiveScreen::Chain),
         action: Action::Chain(ChainAction::MoveStrike),
@@ -414,7 +414,7 @@ pub static KEYMAP: &[Binding] = &[
         chords: &[KeyChord::Char('a')],
         keys_label: "a",
         help: "Add leg to builder",
-        deferred: Some("v0.2"),
+        deferred: None,
     },
     // -- Depth (body v0.5) -----------------------------------------------------
     Binding {
@@ -442,14 +442,14 @@ pub static KEYMAP: &[Binding] = &[
         help: "Smile / surface",
         deferred: Some("v0.2"),
     },
-    // -- Payoff (live, builder v0.2) -------------------------------------------
+    // -- Payoff (live, builder wired #26; the t+0 curve renders in #27) ---------
     Binding {
         context: Context::Live(LiveScreen::Payoff),
         action: Action::Payoff(PayoffAction::AddLeg),
         chords: &[KeyChord::Char('a')],
         keys_label: "a",
         help: "Add leg at cursor",
-        deferred: Some("v0.2"),
+        deferred: None,
     },
     Binding {
         context: Context::Live(LiveScreen::Payoff),
@@ -457,7 +457,7 @@ pub static KEYMAP: &[Binding] = &[
         chords: &[KeyChord::Char('x')],
         keys_label: "x",
         help: "Remove cursor leg",
-        deferred: Some("v0.2"),
+        deferred: None,
     },
     Binding {
         context: Context::Live(LiveScreen::Payoff),
@@ -465,7 +465,7 @@ pub static KEYMAP: &[Binding] = &[
         chords: &[KeyChord::Char('+'), KeyChord::Char('-')],
         keys_label: "+ / -",
         help: "Quantity + / -",
-        deferred: Some("v0.2"),
+        deferred: None,
     },
     Binding {
         context: Context::Live(LiveScreen::Payoff),
@@ -473,7 +473,7 @@ pub static KEYMAP: &[Binding] = &[
         chords: &[KeyChord::Char('s')],
         keys_label: "s",
         help: "Toggle buy / sell",
-        deferred: Some("v0.2"),
+        deferred: None,
     },
     Binding {
         context: Context::Live(LiveScreen::Payoff),
@@ -481,7 +481,7 @@ pub static KEYMAP: &[Binding] = &[
         chords: &[KeyChord::Enter],
         keys_label: "Enter",
         help: "Commit strategy",
-        deferred: Some("v0.2"),
+        deferred: None,
     },
     Binding {
         context: Context::Live(LiveScreen::Payoff),
@@ -489,7 +489,7 @@ pub static KEYMAP: &[Binding] = &[
         chords: &[KeyChord::Esc],
         keys_label: "Esc",
         help: "Cancel builder",
-        deferred: Some("v0.2"),
+        deferred: None,
     },
     Binding {
         context: Context::Live(LiveScreen::Payoff),
@@ -497,7 +497,7 @@ pub static KEYMAP: &[Binding] = &[
         chords: &[KeyChord::Char('t')],
         keys_label: "t",
         help: "Expiration / t+0",
-        deferred: Some("v0.2"),
+        deferred: None,
     },
     // -- Replay (scrub wired; playback/speed/fill/end-jump defer to v0.3) ------
     Binding {
@@ -651,6 +651,32 @@ pub fn resolve_chain(chord: KeyChord) -> Option<ChainAction> {
     }
 }
 
+/// Resolve a chord against the **payoff** screen's bindings
+/// (`docs/05-views-and-ux.md` §3), or `None` when no binding matches (the dispatch
+/// then ignores the key).
+///
+/// This is the read side the payoff screen's `handle_key` (`src/ui/payoff.rs`) uses,
+/// so the builder dispatch and the help overlay share the one map — a bound key and
+/// its documentation cannot drift. The concrete direction of the shared
+/// [`PayoffAction::Quantity`] chord (`+` increment vs `-` decrement) is read from the
+/// resolved chord at dispatch time, the same way [`resolve_global`] derives the
+/// screen-switch slot from the pressed digit.
+#[must_use]
+pub fn resolve_payoff(chord: KeyChord) -> Option<PayoffAction> {
+    let binding = KEYMAP
+        .iter()
+        .find(|b| b.context == Context::Live(LiveScreen::Payoff) && b.chords.contains(&chord))?;
+    match binding.action {
+        Action::Payoff(action) => Some(action),
+        Action::Global(_)
+        | Action::Chain(_)
+        | Action::Depth(_)
+        | Action::Surface(_)
+        | Action::Replay(_)
+        | Action::Ascend => None,
+    }
+}
+
 /// Resolve a chord against a **replay** screen's bindings
 /// (`docs/05-views-and-ux.md` §3), or `None` when no binding matches.
 #[must_use]
@@ -794,8 +820,9 @@ mod tests {
 
     #[test]
     fn test_keymap_marks_deferred_chain_keys_not_the_wired_ones() {
-        // The wired chain keys (#18) carry no deferred marker; the four not-yet-wired
-        // ones do, so the overlay advertises honestly which keys are not live.
+        // The wired chain keys (MoveStrike/FocusLeg #18, AddLeg #26) carry no deferred
+        // marker; the three not-yet-wired ones do, so the overlay advertises honestly
+        // which keys are not live.
         let deferral = |action: ChainAction| -> Option<&'static str> {
             KEYMAP
                 .iter()
@@ -808,10 +835,14 @@ mod tests {
             "MoveStrike is wired"
         );
         assert_eq!(deferral(ChainAction::FocusLeg), None, "FocusLeg is wired");
+        assert_eq!(
+            deferral(ChainAction::AddLeg),
+            None,
+            "AddLeg is wired in #26 (chain→a→builder)"
+        );
         assert!(deferral(ChainAction::SwitchExpiry).is_some());
         assert!(deferral(ChainAction::SwitchUnderlying).is_some());
         assert!(deferral(ChainAction::Drill).is_some());
-        assert!(deferral(ChainAction::AddLeg).is_some());
     }
 
     #[test]
@@ -871,6 +902,69 @@ mod tests {
                     "replay chord {chord:?} is dispatched but not in the overlay",
                 );
             }
+        }
+    }
+
+    #[test]
+    fn test_resolve_payoff_every_payoff_chord_resolves_and_is_documented() {
+        // Every chord in a payoff-context binding resolves to a `PayoffAction`
+        // (`ui::payoff::handle_key` acts on it) AND appears in the help overlay, so
+        // the builder dispatch and its documentation cannot drift.
+        let live = live_app_on(LiveScreen::Payoff, ScreenLoad::Ready, false);
+        let documented = help_bindings(&live.mode);
+        for binding in KEYMAP
+            .iter()
+            .filter(|b| b.context == Context::Live(LiveScreen::Payoff))
+        {
+            for &chord in binding.chords {
+                assert!(
+                    resolve_payoff(chord).is_some(),
+                    "payoff chord {chord:?} does not resolve",
+                );
+                assert!(
+                    documented.iter().any(|b| b.chords.contains(&chord)),
+                    "payoff chord {chord:?} is dispatched but not in the overlay",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_resolve_payoff_quantity_shares_plus_and_minus_chords() {
+        // Both `+` and `-` resolve to the one `Quantity` action; the screen reads the
+        // concrete chord to decide increment vs decrement.
+        assert_eq!(
+            resolve_payoff(KeyChord::Char('+')),
+            Some(PayoffAction::Quantity),
+        );
+        assert_eq!(
+            resolve_payoff(KeyChord::Char('-')),
+            Some(PayoffAction::Quantity),
+        );
+        assert_eq!(resolve_payoff(KeyChord::Enter), Some(PayoffAction::Commit));
+        assert_eq!(resolve_payoff(KeyChord::Esc), Some(PayoffAction::Cancel));
+        // A non-payoff chord does not resolve here.
+        assert_eq!(resolve_payoff(KeyChord::Char('q')), None);
+    }
+
+    #[test]
+    fn test_keymap_payoff_builder_keys_are_wired_not_deferred() {
+        // The builder bodies land in #26, so the payoff keys carry no deferred
+        // marker; the help overlay advertises them as live.
+        for action in [
+            PayoffAction::AddLeg,
+            PayoffAction::RemoveLeg,
+            PayoffAction::Quantity,
+            PayoffAction::ToggleSide,
+            PayoffAction::Commit,
+            PayoffAction::Cancel,
+            PayoffAction::ToggleCurve,
+        ] {
+            let deferred = KEYMAP
+                .iter()
+                .find(|b| b.action == Action::Payoff(action))
+                .and_then(|b| b.deferred);
+            assert_eq!(deferred, None, "payoff {action:?} is wired in #26");
         }
     }
 
