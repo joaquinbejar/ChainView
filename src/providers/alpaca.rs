@@ -2999,12 +2999,29 @@ mod tests {
             seeded_at,
         );
 
-        // The spot pseudo-instrument for the underlying ticker (Positive::ONE strike).
-        let spot = spot_instrument(
-            "SPY",
-            utc_rfc3339("2026-03-20T20:00:00+00:00"),
-            &pid("alpaca"),
-        );
+        // The adapter no longer emits any spot pseudo-instrument (#41 removed the
+        // Positive::ONE sentinel and its emission entirely); this test now pins
+        // the STORE-level defense that made the old hazard harmless: an update
+        // keyed by a strike absent from the chain buffers and TTL-expires, never
+        // touching a real row. Build the hypothetical instrument inline.
+        let spot = Instrument {
+            key: InstrumentKey {
+                underlying: "SPY".to_owned(),
+                expiration_utc: utc_rfc3339("2026-03-20T20:00:00+00:00"),
+                strike: Positive::ONE,
+                style: OptionStyle::Call,
+            },
+            provider: pid("alpaca"),
+            native_symbol: "SPY".to_owned(),
+            stream_symbol: Some("SPY".to_owned()),
+            spec: ContractSpecFingerprint {
+                contract_multiplier: 1,
+                settlement: SettlementStyle::Cash,
+                exercise: ExerciseStyle::European,
+                quote_currency: "USD".to_owned(),
+                venue_product_code: "SPY".to_owned(),
+            },
+        };
         assert_eq!(spot.key.strike, Positive::ONE);
 
         let spot_quote = QuoteUpdate {

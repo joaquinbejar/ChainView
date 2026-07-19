@@ -77,7 +77,7 @@ fn deribit_row() -> MatrixRow {
         depth: true,
         greeks: GreeksCapability::Provided,
         option_stream: OptionStreamCapability::ChainQuotes { verified: false },
-        underlying_stream: false,
+        underlying_stream: true,
         chain_poll: true,
         trades_tape: false,
         auth: AuthKind::None,
@@ -103,7 +103,8 @@ fn test_tastytrade_row_reconciles_with_section_8() {
         depth: false,
         greeks: GreeksCapability::Provided,
         option_stream: OptionStreamCapability::ChainQuotes { verified: false },
-        underlying_stream: true,
+        // FALSE since the #40 honesty fix: only option aliases are subscribed.
+        underlying_stream: false,
         chain_poll: true,
         trades_tape: false,
         auth: AuthKind::UserPass,
@@ -128,7 +129,9 @@ fn test_alpaca_row_reconciles_with_section_8() {
         depth: false,
         greeks: GreeksCapability::Provided,
         option_stream: OptionStreamCapability::None,
-        underlying_stream: true,
+        // FALSE since the #41 honesty fix: the spot pseudo-quote emission was
+        // removed; the cell returns when MarketUpdate::UnderlyingQuote lands.
+        underlying_stream: false,
         chain_poll: true,
         trades_tape: false,
         auth: AuthKind::KeySecret,

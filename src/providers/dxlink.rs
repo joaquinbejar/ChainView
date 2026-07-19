@@ -1727,7 +1727,7 @@ mod tests {
         let lookup = stream_lookup(std::slice::from_ref(overlay));
         let (mut sink, mut rx_control, mut rx_coalesced) = test_sink(8);
         let sent = block(route_event(&raw, &lookup, &mut sink));
-        assert_ne!(sent, SinkSend::Closed);
+        assert_ne!(sent, SendState::Closed);
         let mut out = drain(&mut rx_control);
         out.extend(drain(&mut rx_coalesced));
         match out.as_slice() {
