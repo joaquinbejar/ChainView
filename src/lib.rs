@@ -16,6 +16,7 @@ pub mod config;
 pub(crate) mod error;
 pub(crate) mod event;
 pub(crate) mod providers;
+pub(crate) mod replay;
 pub(crate) mod terminal;
 pub(crate) mod ui;
 
@@ -133,6 +134,21 @@ pub use config::{CliOverrides, Config, ModeSelect, ProviderSettings, ThemeChoice
 pub use error::{
     BundleError, ChainViewError, ConfigError, NormalizeKind, OverlayError, ProviderError, Redacted,
     RegistryError, TransportDetail, TransportKind,
+};
+// The replay-mode domain types (`src/replay/mod.rs`, issue #29,
+// `docs/01-domain-model.md` §9, `docs/04-replay-mode.md` §2): ChainView's typed,
+// read-only views of the IronCondor result bundle — the permissive
+// `BundleManifest`, the narrow `CapitalConfig` projection, the four strict
+// Parquet-backed rows (`Fill`/`EquityPoint`/`PositionRow`/`GreeksAttribution`),
+// the closed `PositionSide`/`ExecMode` enums, the `contract_id` grammar
+// constants, and the `BundleReader`/`LoadedBundle` surface the reader (#30),
+// decoders (#31), and validation (#32) are written against. Money is integer
+// cents; the only `f64` is `EquityPoint::drawdown`. `OptionStyle` is re-exported
+// from `optionstratlib` below.
+pub use replay::{
+    BundleManifest, BundleReader, CONTRACT_ID_FORMAT, CONTRACT_ID_UNDERLYING_PATTERN,
+    CONTRACT_ID_VERSION_PREFIX, CapitalConfig, EquityPoint, ExecMode, Fill, GreeksAttribution,
+    LoadedBundle, PositionRow, PositionSide,
 };
 // The PUBLIC, semver-governed provider port surface (`docs/03-data-providers.md`
 // §2, §11.1): the trait, the capability self-declaration + its builder + every

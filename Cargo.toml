@@ -34,6 +34,13 @@ path = "src/main.rs"
 [dependencies]
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
+# The opaque manifest blobs in the replay result-bundle contract
+# (`config`/`strategy`/`data_source`/`metrics` are `serde_json::Value`, issue #29,
+# `docs/04-replay-mode.md` §2.1). Explicit-approval addition (CLAUDE.md "Coding
+# Rules"). Supply-chain: NO new surface — `serde_json` is already in the
+# transitive tree via `deribit-http`/`deribit-websocket`, so this only promotes an
+# existing crate to a direct dependency; audit note in CHANGELOG (ADR-0007).
+serde_json = "1"
 toml = "1"
 humantime = "2"
 clap = { version = "4.5", features = ["derive"] }
