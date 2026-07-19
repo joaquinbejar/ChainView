@@ -14,6 +14,31 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- Normalized streaming update events and freshness clocks
+  (`src/chain/events.rs`, issue #5): the DOMAIN payloads a provider emits across
+  the seam (`docs/01-domain-model.md` §5 and §5.1). `QuoteUpdate` (bid/ask/last/
+  bid_size/ask_size), `GreeksRow` (iv + delta/gamma/theta/vega/rho + a
+  `GreeksOrigin` tag), and `DepthLadder`/`DepthLevel` (best-first bids/asks +
+  an `Option<u64>` `change_id` for Deribit gap-detect/resync) — **every numeric
+  field is `Option`** so a value the feed omits stays `None` and renders as an
+  em dash, never a fabricated zero; quotes/IV/Greeks are `Positive`/`Decimal`
+  **display analytics**, never accounting values. Each event carries the **two
+  clocks** of §5.1: `event_time` (venue timestamp, optional) and `received_time`
+  (normalization time, always present). The closed `MarketUpdate` fan-in enum
+  (`Quote`/`Greeks`/`Depth`/`Chain`/`Health`) matched exhaustively downstream
+  with no wildcard `_` arm, plus **thin forward declarations** of the store
+  types `ChainSnapshot` and `StreamHealth` (self-contained fields only —
+  `aliases: AliasCatalog` and `source: ChainSource` are **completed with the
+  chain store in issues #6/#7**) so the enum can be closed now. The named
+  freshness thresholds with no magic numbers — `QUOTE_STALE_AFTER` (5 s),
+  `GREEKS_STALE_AFTER` (10 s), `FEED_DELAY_WARN` (2 s), `DIRECTION_DECAY` (3 s),
+  and `CHAIN_STALE_SLACK` (2 s) with the `chain_stale_after(refresh_interval)`
+  helper that fixes §5.1's `CHAIN_STALE_AFTER = refresh_interval + slack`
+  formula (the store applies the comparison in #7). The event types, the
+  `MarketUpdate` enum, the forward-declared `ChainSnapshot`/`StreamHealth`, and
+  the threshold constants/helper are re-exported from the crate root. **No new
+  dependency**: Greeks use the `Decimal` (`rust_decimal`) that `optionstratlib`
+  already re-exports through its prelude.
 - Normalized instrument identity (`src/chain/identity.rs`, issue #4): the
   provider-agnostic `InstrumentKey` (`underlying`, absolute-UTC
   `expiration_utc`, `strike`, `style`) with `Eq`/`Hash` over all four fields and
