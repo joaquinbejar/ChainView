@@ -126,6 +126,22 @@ parquet = { version = "59", default-features = false, features = [
     "zstd",
     "lz4",
 ] }
+# The Arrow in-memory array types the typed table decoders read (issue #31,
+# `src/replay/tables.rs`, `docs/04-replay-mode.md` §2.2/§5). The #30 reader hands
+# each table's `RecordBatch` to the #31 decoders, which look up the documented
+# columns by name and downcast them to their concrete Arrow arrays
+# (`Int32Array`/`Int64Array`/`Float64Array`/`BooleanArray`/`StringArray`, plus
+# `DictionaryArray<Int32,Utf8>` handled defensively), then narrow each signed wire
+# integer into the typed row via checked `try_from` — never an `as` cast.
+# Promoted from a #30 DEV-dependency to a direct dependency: NO new crate enters
+# the graph — `arrow-array` is already compiled in the tree as `parquet`'s own
+# transitive dependency and was already a dev-dependency, so this only names it for
+# the production decode path (the same "no new surface" promotion pattern as #29's
+# `serde_json`; supply-chain audit note in CHANGELOG, ADR-0010). `arrow-schema`
+# (schema/`DataType` construction) is needed only by the `#[cfg(test)]` batch
+# writers, so it stays a dev-dependency. Version pinned to `parquet` 59's arrow
+# epoch.
+arrow-array = "59"
 
 [dev-dependencies]
 proptest = "1"
@@ -149,14 +165,15 @@ hdrhistogram = "7"
 # Dev-only, so it never rides in the release binary; the runtime/macros/time
 # features it needs are already in the main `tokio` dependency.
 tokio = { version = "1", default-features = false, features = ["test-util"] }
-# The Parquet test-writer support (issue #30). DEV-ONLY — none rides in the
-# release binary. `arrow-array`/`arrow-schema` (matched to `parquet` 59's arrow
-# epoch) build the `RecordBatch`es the `#[cfg(test)]` writer serialises into tiny
-# real Parquet files for the ceiling round-trips; they are already compiled in the
-# tree as `parquet`'s own transitive deps, so this only names them for the tests.
-# `tempfile` gives each test an auto-cleaned bundle directory (RAII `TempDir`), so
-# no test leaves artifacts behind. All RUSTSEC-clean, well under the 1.88 floor.
-arrow-array = "59"
+# The Parquet test-writer support (issues #30/#31). DEV-ONLY — none rides in the
+# release binary. `arrow-schema` (matched to `parquet` 59's arrow epoch) builds the
+# `Schema`/`Field`/`DataType` values the `#[cfg(test)]` writers use to serialise
+# tiny real Parquet fixtures for the ceiling round-trips and the typed-decode
+# tests; it is already compiled in the tree as `parquet`'s own transitive dep, so
+# this only names it for the tests. `arrow-array` moved to `[dependencies]` at #31
+# because the production decoders read its array types. `tempfile` gives each test
+# an auto-cleaned bundle directory (RAII `TempDir`), so no test leaves artifacts
+# behind. All RUSTSEC-clean, well under the 1.88 floor.
 arrow-schema = "59"
 tempfile = "3"
 

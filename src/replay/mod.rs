@@ -25,9 +25,11 @@
 //! transient peak is ~one batch (bounded by [`MAX_BATCH_ROWS`] × the column
 //! widths), not the whole table; that is the documented residual #36's
 //! adversarial fixtures probe. The **typed per-column decode** into `Vec<Fill>`
-//! etc. (#31) and the **cross-table validation chain** (#32) are still pending —
-//! `load` runs the ceilings and returns a [`LoadedBundle`] whose tables are empty
-//! until #31 wires the typed decode at the documented seam.
+//! etc. (#31, `src/replay/tables.rs`) is wired **inside** that batched,
+//! budget-measured loop, so `load` returns a [`LoadedBundle`] whose four tables
+//! are **populated in file order** (the reader never sorts); the stated sort-key
+//! ordering is a WRITER guarantee the **cross-table validation chain** (#32)
+//! verifies (`Invariant` on violation) before downstream consumers rely on it.
 //!
 //! # Read-only
 //!
@@ -72,12 +74,15 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use arrow_array::RecordBatch;
 use optionstratlib::OptionStyle;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::error::{BundleError, ConfigError};
+
+mod tables;
 
 /// The versioned `contract_id` join-key format, fixed here as the single source
 /// of truth for the round-trip check the validation chain (#32) enforces.
@@ -405,23 +410,27 @@ pub struct GreeksAttribution {
 }
 
 /// A fully materialised bundle — the manifest plus the four decoded tables, each
-/// sorted by its stated sort key (`docs/04-replay-mode.md` §3). Produced by
-/// [`BundleReader::load`].
+/// in **file order** as the writer appended it (`docs/04-replay-mode.md` §3).
+/// Produced by [`BundleReader::load`].
 ///
-/// Issue #30 lands the manifest + the resource-ceiling spine, so `load` returns
-/// this with the validated manifest and **empty** tables; the typed per-column
-/// decode that fills the four `Vec`s (sorted + validated) is issue #31/#32.
+/// Issue #30 lands the manifest + the resource-ceiling spine; issue #31 wires the
+/// **typed per-column decode** (`src/replay/tables.rs`) into that batched,
+/// budget-measured loop, so `load` now returns this with the four `Vec`s
+/// **populated in file order** (the reader never sorts). The stated sort-key
+/// ordering is a WRITER guarantee the cross-table validation chain — the ordering,
+/// equity/attribution identities, and referential-integrity checks of issue #32 —
+/// verifies (`Invariant` on violation).
 #[derive(Debug, Clone, PartialEq)]
 pub struct LoadedBundle {
     /// The validated manifest.
     pub manifest: BundleManifest,
-    /// Fills, sorted by `(step, order_id, fill_seq)`.
+    /// Fills, in file order (writer sort key `(step, order_id, fill_seq)`, #32-verified).
     pub fills: Vec<Fill>,
-    /// Equity curve, sorted by `step`.
+    /// Equity curve, in file order (writer sort key `step`, #32-verified).
     pub equity: Vec<EquityPoint>,
-    /// Position rows, sorted by `(step, position_id)`.
+    /// Position rows, in file order (writer sort key `(step, position_id)`, #32-verified).
     pub positions: Vec<PositionRow>,
-    /// Greeks attribution, sorted by `step`.
+    /// Greeks attribution, in file order (writer sort key `step`, #32-verified).
     pub greeks: Vec<GreeksAttribution>,
 }
 
@@ -477,10 +486,16 @@ pub const MAX_BATCH_ROWS: usize = 65_536;
 /// [`MAX_BATCH_ROWS`] × the column widths), not the whole table — the documented
 /// residual #36's adversarial fixtures probe.
 pub const MAX_BATCH_BYTES: u64 = 256 * 1024 * 1024;
-/// Decoded-overhead multiplier in **per-mille** (1500 = 1.5×). The owned rows +
-/// the sort workspace #31/#32 need cost more than the raw decoded buffers, so the
-/// measured tally inflates each batch by this factor. Held as an integer per-mille
-/// so the budget arithmetic stays exact (no `f64` on the allocation path).
+/// Decoded-overhead multiplier in **per-mille** (1500 = 1.5×). Applied to each
+/// decoded `RecordBatch`'s Arrow array memory size to cover the **transient decode
+/// workspace** — the scratch buffers the Parquet→Arrow decode touches beyond the
+/// batch's own arrays, freed when the batch drops. It does **not** estimate the
+/// **retained** owned rows the typed decode (#31) materialises: those are measured
+/// EXACTLY (`rows * size_of::<RowType>()` plus every owned `String`'s heap bytes) by
+/// each decoder and accounted separately, so a dictionary-encoded UTF8 column —
+/// counted once in the Arrow batch but copied per row into the owned `Vec` — cannot
+/// slip past the working-set ceiling behind this estimate. Held as an integer
+/// per-mille so the budget arithmetic stays exact (no `f64` on the allocation path).
 pub const DECODED_OVERHEAD_PERMILLE: u64 = 1_500;
 /// Decompression-bomb reject ratio (20×) — a footer whose declared uncompressed
 /// size exceeds this multiple of the on-disk/compressed size is rejected before
@@ -930,10 +945,13 @@ impl BundleReader {
     /// seam passes `&|| token.is_cancelled()` from its shutdown token
     /// (`docs/02-tui-architecture.md` §12); the domain stays free of `tokio`.
     ///
-    /// The typed per-column decode that fills the four table `Vec`s (#31) and the
-    /// cross-table validation chain (#32) are wired at the documented seam below;
-    /// #30 lands the open + ceiling + cancellable-decode spine, so the returned
-    /// tables are empty.
+    /// The typed per-column decode (#31, `src/replay/tables.rs`) runs **inside**
+    /// this batched, budget-measured loop: each decoded batch is accounted against
+    /// the working-set budget first, then mapped onto the #29 row types and
+    /// appended into the eager `Vec` the budget measures. Rows stay in **file
+    /// order** — the reader never sorts; the stated sort-key ordering is a writer
+    /// guarantee the cross-table validation chain (#32) verifies (`Invariant` on
+    /// violation).
     ///
     /// # Errors
     ///
@@ -941,8 +959,11 @@ impl BundleReader {
     /// - [`BundleError::TooLarge`] if any of the three ceilings is exceeded;
     /// - [`BundleError::MissingTable`] / [`BundleError::Io`] on a filesystem
     ///   failure, [`BundleError::Parquet`] on a decode failure;
-    /// - [`BundleError::Invariant`] if a footer row count disagrees with
-    ///   `row_counts`.
+    /// - [`BundleError::Schema`] if a required column is missing or wrong-typed;
+    /// - [`BundleError::Invariant`] on a footer/`row_counts` disagreement, a
+    ///   decoded-rows/footer disagreement, or a per-cell decode violation (a
+    ///   negative unsigned value, a NULL in a non-nullable column, a non-finite
+    ///   `drawdown`, or an unrecognized enum wire string).
     pub fn load_cancellable(
         &self,
         cancelled: &dyn Fn() -> bool,
@@ -953,36 +974,88 @@ impl BundleReader {
         }
 
         // The working-set budget spans ALL four tables (§3): the running total is
-        // checked after every batch of every table.
+        // checked after every batch of every table. Each table's rows are decoded
+        // batch-by-batch into its eager `Vec` (grown from ACTUAL decoded batch
+        // sizes, never pre-reserved from the untrusted `row_counts` hint) as the
+        // budget accounts them, and stay in file order (the reader never sorts).
         let mut budget = WorkingSetBudget::new(&self.ceilings);
-        for (file, key) in TABLES {
-            if cancelled() {
-                return Err(BundleError::Cancelled);
-            }
-            self.scan_table(file, key, &mut budget, cancelled)?;
-        }
 
-        // #31 wires the typed per-column decode into these `Vec`s here (reusing the
-        // same batched reader), then #32 sorts + validates them; #30 lands the
-        // ceiling spine only, so they are empty and the manifest is the one
-        // already validated at `open`.
+        let mut fills: Vec<Fill> = Vec::new();
+        if cancelled() {
+            return Err(BundleError::Cancelled);
+        }
+        self.scan_table("fills.parquet", "fills", &mut budget, cancelled, &mut |b| {
+            tables::read_fills(b, &mut fills)
+        })?;
+
+        let mut equity: Vec<EquityPoint> = Vec::new();
+        if cancelled() {
+            return Err(BundleError::Cancelled);
+        }
+        self.scan_table(
+            "equity_curve.parquet",
+            "equity_curve",
+            &mut budget,
+            cancelled,
+            &mut |b| tables::read_equity(b, &mut equity),
+        )?;
+
+        let mut positions: Vec<PositionRow> = Vec::new();
+        if cancelled() {
+            return Err(BundleError::Cancelled);
+        }
+        self.scan_table(
+            "positions.parquet",
+            "positions",
+            &mut budget,
+            cancelled,
+            &mut |b| tables::read_positions(b, &mut positions),
+        )?;
+
+        let mut greeks: Vec<GreeksAttribution> = Vec::new();
+        if cancelled() {
+            return Err(BundleError::Cancelled);
+        }
+        self.scan_table(
+            "greeks_attribution.parquet",
+            "greeks_attribution",
+            &mut budget,
+            cancelled,
+            &mut |b| tables::read_greeks(b, &mut greeks),
+        )?;
+
+        // Rows stay in FILE order — the reader never sorts. The stated sort-key
+        // ordering (§2.2) is a WRITER guarantee the #32 validation chain VERIFIES
+        // (non-decreasing on its sort key, else `Invariant`); repairing it here
+        // would silently mask the exact writer bug #32 must reject and make its
+        // monotonic check vacuous — and cost O(n log n) on up to 5M conformant
+        // rows. Downstream consumers (#33 timeline) rely on the ordering only once
+        // #32 has verified it.
         Ok(LoadedBundle {
             manifest: self.manifest.clone(),
-            fills: Vec::new(),
-            equity: Vec::new(),
-            positions: Vec::new(),
-            greeks: Vec::new(),
+            fills,
+            equity,
+            positions,
+            greeks,
         })
     }
 
     /// Stat, footer-gate, and measure-decode one table under the three ceilings,
-    /// folding its measured working set into `budget`. Strictly read-only.
+    /// folding its measured working set into `budget` and handing each
+    /// budget-accounted batch to `decode` (the #31 typed per-column decode, which
+    /// appends the rows into the caller's eager `Vec`). `decode` RETURNS the exact
+    /// retained-bytes delta it appended (owned row structs + every owned `String`'s
+    /// heap bytes), which is accounted against `budget` in ADDITION to the batch's
+    /// Arrow footprint — so a dictionary-encoded UTF8 column, counted once in the
+    /// Arrow batch but copied per row, cannot slip past the ceiling. Strictly
+    /// read-only.
     fn scan_table(
         &self,
         file: &str,
         key: &str,
         budget: &mut WorkingSetBudget,
         cancelled: &dyn Fn() -> bool,
+        decode: &mut dyn FnMut(&RecordBatch) -> Result<u64, BundleError>,
     ) -> Result<(), BundleError> {
         let path = self.root.join(file);
 
@@ -1098,11 +1171,17 @@ impl BundleReader {
         // `total_uncompressed_size` counts uncompressed PAGES, not the memory the
         // decoded arrays occupy (dictionary/RLE/repeated UTF8 can expand well
         // beyond it), so the measured per-batch tally — not the footer — is the
-        // real guard.
+        // real guard. That tally has TWO parts, each accounted against the budget:
+        // the decoded batch's Arrow footprint (transient, freed when the batch
+        // drops) and the typed decode's RETAINED owned rows (persistent). The Arrow
+        // footprint counts a dictionary-encoded UTF8 column once, while the owned
+        // rows copy the string per row, so the retained part — returned by `decode`
+        // — is what closes that gap.
         let reader = builder
             .with_batch_size(self.ceilings.max_batch_rows)
             .build()
             .map_err(|e| parquet_err(format!("{file}: {e}")))?;
+        let mut decoded_rows: usize = 0;
         for batch in reader {
             // Abort at the batch boundary before decoding/accounting the next one.
             if cancelled() {
@@ -1112,7 +1191,34 @@ impl BundleReader {
             let batch_bytes = u64::try_from(batch.get_array_memory_size())
                 .map_err(|_| too_large(format!("{file}: decoded batch size exceeds u64")))?;
             let measured = apply_overhead(batch_bytes, self.ceilings.decoded_overhead_permille)?;
+            // Account the batch's TRANSIENT decode workspace FIRST — a batch that
+            // would breach the working-set ceiling is rejected before the typed
+            // decode allocates any owned rows.
             budget.account(measured)?;
+            // Then cross the wire→domain boundary, appending this batch's rows into
+            // the caller's eager `Vec` (capacity grown from the ACTUAL batch size).
+            // `decode` returns the EXACT retained-bytes delta (owned row structs +
+            // every owned `String`'s heap bytes); account it against the same budget
+            // so the persistent working set — not just the transient batch estimate
+            // above — is bounded, closing the dictionary-encoding gap.
+            let rows = batch.num_rows();
+            let retained = decode(&batch)?;
+            budget.account(retained)?;
+            decoded_rows = decoded_rows
+                .checked_add(rows)
+                .ok_or_else(|| too_large(format!("{file}: decoded row count overflowed usize")))?;
+        }
+
+        // Cross-check the ACTUAL decoded row total against the footer count (the
+        // footer already agreed with the `row_counts` hint above); a truncated or
+        // corrupt table that yields fewer rows is a typed integrity error, never a
+        // silently-short `Vec`. `row_counts` stays a hint — never an allocation size.
+        let decoded_rows = u64::try_from(decoded_rows)
+            .map_err(|_| too_large(format!("{file}: decoded row count exceeds u64")))?;
+        if decoded_rows != footer_rows {
+            return Err(invariant(format!(
+                "{file}: decoded {decoded_rows} rows but the Parquet footer declares {footer_rows}"
+            )));
         }
 
         Ok(())
@@ -1786,6 +1892,279 @@ mod tests {
         write_parquet(&dir.join(f3), r3);
     }
 
+    // --- Full-schema table writers (#31: the typed decode reaches every column) --
+    //
+    // The #30 single-column `write_parquet` is enough for the ceiling/open paths
+    // (they reject before the typed decode). The tests that drive `load` through
+    // the #31 decoders need REAL tables with every documented column. Each builder
+    // emits `n` valid rows in **ascending** `step` order — a CONFORMANT writer that
+    // already appends in its stated sort key, which the reader preserves in file
+    // order (it never sorts). `order_id`/`position_id` track `step`, so each table's
+    // stated sort key orders the same way.
+
+    fn fills_batch(n: usize) -> RecordBatch {
+        use std::sync::Arc;
+
+        use arrow_array::{ArrayRef, Int32Array, Int64Array, StringArray};
+        use arrow_schema::{DataType, Field, Schema};
+
+        let steps: Vec<i32> = (0..n)
+            .map(|i| i32::try_from(i).unwrap_or(i32::MAX))
+            .collect();
+        let ts: Vec<i64> = steps
+            .iter()
+            .map(|&s| 1_700_000_000_000_000_000 + i64::from(s))
+            .collect();
+        let trade: Vec<i64> = steps.iter().map(|&s| 100 + i64::from(s)).collect();
+        let pos: Vec<i64> = steps.iter().map(|&s| 200 + i64::from(s)).collect();
+        let order: Vec<i64> = steps.iter().map(|&s| i64::from(s)).collect();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("step", DataType::Int32, false),
+            Field::new("ts_ns", DataType::Int64, false),
+            Field::new("strategy_run_id", DataType::Utf8, false),
+            Field::new("trade_id", DataType::Int64, false),
+            Field::new("position_id", DataType::Int64, false),
+            Field::new("order_id", DataType::Int64, false),
+            Field::new("fill_seq", DataType::Int32, false),
+            Field::new("underlying", DataType::Utf8, false),
+            Field::new("expiration_ns", DataType::Int64, false),
+            Field::new("contract_id", DataType::Utf8, false),
+            Field::new("strike_cents", DataType::Int64, false),
+            Field::new("style", DataType::Utf8, false),
+            Field::new("side", DataType::Utf8, false),
+            Field::new("quantity", DataType::Int32, false),
+            Field::new("price_cents", DataType::Int64, false),
+            Field::new("fees_cents", DataType::Int64, false),
+            Field::new("slippage_cents", DataType::Int64, false),
+            Field::new("mode", DataType::Utf8, false),
+        ]));
+        let cols: Vec<ArrayRef> = vec![
+            Arc::new(Int32Array::from(steps)),
+            Arc::new(Int64Array::from(ts)),
+            Arc::new(StringArray::from(vec!["run-abc123"; n])),
+            Arc::new(Int64Array::from(trade)),
+            Arc::new(Int64Array::from(pos)),
+            Arc::new(Int64Array::from(order)),
+            Arc::new(Int32Array::from(vec![0_i32; n])),
+            Arc::new(StringArray::from(vec!["BTC"; n])),
+            Arc::new(Int64Array::from(vec![1_735_286_400_000_000_000_i64; n])),
+            Arc::new(StringArray::from(vec![
+                "v1:BTC:1735286400000000000:6000000:C";
+                n
+            ])),
+            Arc::new(Int64Array::from(vec![6_000_000_i64; n])),
+            Arc::new(StringArray::from(vec!["call"; n])),
+            Arc::new(StringArray::from(vec!["long"; n])),
+            Arc::new(Int32Array::from(vec![1_i32; n])),
+            Arc::new(Int64Array::from(vec![12_500_i64; n])),
+            Arc::new(Int64Array::from(vec![30_i64; n])),
+            Arc::new(Int64Array::from(vec![-15_i64; n])),
+            Arc::new(StringArray::from(vec!["realistic"; n])),
+        ];
+        match RecordBatch::try_new(schema, cols) {
+            Ok(b) => b,
+            Err(e) => panic!("build fills batch: {e}"),
+        }
+    }
+
+    fn equity_batch(n: usize) -> RecordBatch {
+        use std::sync::Arc;
+
+        use arrow_array::{ArrayRef, Float64Array, Int32Array, Int64Array};
+        use arrow_schema::{DataType, Field, Schema};
+
+        let steps: Vec<i32> = (0..n)
+            .map(|i| i32::try_from(i).unwrap_or(i32::MAX))
+            .collect();
+        let ts: Vec<i64> = steps
+            .iter()
+            .map(|&s| 1_700_000_000_000_000_000 + i64::from(s))
+            .collect();
+        let cash: Vec<i64> = steps.iter().map(|&s| 990_000 + i64::from(s)).collect();
+        let equity: Vec<i64> = steps.iter().map(|&s| 988_500 + i64::from(s)).collect();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("step", DataType::Int32, false),
+            Field::new("ts_ns", DataType::Int64, false),
+            Field::new("cash_cents", DataType::Int64, false),
+            Field::new("position_value_cents", DataType::Int64, false),
+            Field::new("equity_cents", DataType::Int64, false),
+            Field::new("drawdown", DataType::Float64, false),
+        ]));
+        let cols: Vec<ArrayRef> = vec![
+            Arc::new(Int32Array::from(steps)),
+            Arc::new(Int64Array::from(ts)),
+            Arc::new(Int64Array::from(cash)),
+            Arc::new(Int64Array::from(vec![-1_500_i64; n])),
+            Arc::new(Int64Array::from(equity)),
+            Arc::new(Float64Array::from(vec![-0.015_f64; n])),
+        ];
+        match RecordBatch::try_new(schema, cols) {
+            Ok(b) => b,
+            Err(e) => panic!("build equity batch: {e}"),
+        }
+    }
+
+    fn positions_batch(n: usize) -> RecordBatch {
+        use std::sync::Arc;
+
+        use arrow_array::{ArrayRef, BooleanArray, Int32Array, Int64Array, StringArray};
+        use arrow_schema::{DataType, Field, Schema};
+
+        let steps: Vec<i32> = (0..n)
+            .map(|i| i32::try_from(i).unwrap_or(i32::MAX))
+            .collect();
+        let ts: Vec<i64> = steps
+            .iter()
+            .map(|&s| 1_700_000_000_000_000_000 + i64::from(s))
+            .collect();
+        let pos: Vec<i64> = steps.iter().map(|&s| i64::from(s)).collect();
+        // The first (earliest) step carries a terminal `exit_reason`; the last
+        // (latest) step is still open at feed exhaustion. Others are open, no exit.
+        let exit: Vec<Option<&str>> = steps
+            .iter()
+            .map(|&s| if s == 0 { Some("expiry") } else { None })
+            .collect();
+        let open_at_end: Vec<bool> = steps
+            .iter()
+            .map(|&s| usize::try_from(s).unwrap_or(usize::MAX) == n - 1)
+            .collect();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("step", DataType::Int32, false),
+            Field::new("ts_ns", DataType::Int64, false),
+            Field::new("position_id", DataType::Int64, false),
+            Field::new("trade_id", DataType::Int64, false),
+            Field::new("contract_id", DataType::Utf8, false),
+            Field::new("side", DataType::Utf8, false),
+            Field::new("quantity", DataType::Int32, false),
+            Field::new("avg_price_cents", DataType::Int64, false),
+            Field::new("mark_cents", DataType::Int64, false),
+            Field::new("unrealized_cents", DataType::Int64, false),
+            Field::new("stale_mark", DataType::Boolean, false),
+            Field::new("exit_reason", DataType::Utf8, true),
+            Field::new("open_at_end", DataType::Boolean, false),
+        ]));
+        let cols: Vec<ArrayRef> = vec![
+            Arc::new(Int32Array::from(steps)),
+            Arc::new(Int64Array::from(ts)),
+            Arc::new(Int64Array::from(pos)),
+            Arc::new(Int64Array::from(vec![7_i64; n])),
+            Arc::new(StringArray::from(vec![
+                "v1:BTC:1735286400000000000:6000000:C";
+                n
+            ])),
+            Arc::new(StringArray::from(vec!["short"; n])),
+            Arc::new(Int32Array::from(vec![1_i32; n])),
+            Arc::new(Int64Array::from(vec![12_000_i64; n])),
+            Arc::new(Int64Array::from(vec![11_800_i64; n])),
+            Arc::new(Int64Array::from(vec![200_i64; n])),
+            Arc::new(BooleanArray::from(vec![false; n])),
+            Arc::new(StringArray::from(exit)),
+            Arc::new(BooleanArray::from(open_at_end)),
+        ];
+        match RecordBatch::try_new(schema, cols) {
+            Ok(b) => b,
+            Err(e) => panic!("build positions batch: {e}"),
+        }
+    }
+
+    fn greeks_batch(n: usize) -> RecordBatch {
+        use std::sync::Arc;
+
+        use arrow_array::{ArrayRef, Int32Array, Int64Array};
+        use arrow_schema::{DataType, Field, Schema};
+
+        let steps: Vec<i32> = (0..n)
+            .map(|i| i32::try_from(i).unwrap_or(i32::MAX))
+            .collect();
+        let ts: Vec<i64> = steps
+            .iter()
+            .map(|&s| 1_700_000_000_000_000_000 + i64::from(s))
+            .collect();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("step", DataType::Int32, false),
+            Field::new("ts_ns", DataType::Int64, false),
+            Field::new("theta_pnl_cents", DataType::Int64, false),
+            Field::new("delta_pnl_cents", DataType::Int64, false),
+            Field::new("vega_pnl_cents", DataType::Int64, false),
+            Field::new("spread_capture_cents", DataType::Int64, false),
+            Field::new("fees_cents", DataType::Int64, false),
+            Field::new("residual_cents", DataType::Int64, false),
+        ]));
+        let cols: Vec<ArrayRef> = vec![
+            Arc::new(Int32Array::from(steps)),
+            Arc::new(Int64Array::from(ts)),
+            Arc::new(Int64Array::from(vec![40_i64; n])),
+            Arc::new(Int64Array::from(vec![-120_i64; n])),
+            Arc::new(Int64Array::from(vec![15_i64; n])),
+            Arc::new(Int64Array::from(vec![10_i64; n])),
+            Arc::new(Int64Array::from(vec![30_i64; n])),
+            Arc::new(Int64Array::from(vec![1_i64; n])),
+        ];
+        match RecordBatch::try_new(schema, cols) {
+            Ok(b) => b,
+            Err(e) => panic!("build greeks batch: {e}"),
+        }
+    }
+
+    /// Serialise one `RecordBatch` to a Parquet file, optionally ZSTD-compressed.
+    fn write_record_batch(path: &Path, batch: &RecordBatch, compressed: bool) {
+        use parquet::arrow::ArrowWriter;
+        use parquet::basic::{Compression, ZstdLevel};
+        use parquet::file::properties::WriterProperties;
+
+        let file = match std::fs::File::create(path) {
+            Ok(f) => f,
+            Err(e) => panic!("create {}: {e}", path.display()),
+        };
+        let props = if compressed {
+            Some(
+                WriterProperties::builder()
+                    .set_compression(Compression::ZSTD(ZstdLevel::default()))
+                    .build(),
+            )
+        } else {
+            None
+        };
+        let mut writer = match ArrowWriter::try_new(file, batch.schema(), props) {
+            Ok(w) => w,
+            Err(e) => panic!("arrow writer: {e}"),
+        };
+        if let Err(e) = writer.write(batch) {
+            panic!("write batch: {e}");
+        }
+        if let Err(e) = writer.close() {
+            panic!("close writer: {e}");
+        }
+    }
+
+    /// Write a full-schema bundle: `manifest.json` plus the four Parquet tables
+    /// with EVERY documented column, so `load`'s typed decoders run end-to-end.
+    fn write_full_bundle(
+        dir: &Path,
+        schema: &str,
+        file_rows: [usize; 4],
+        counts: [u64; 4],
+        extra: bool,
+        compressed: bool,
+    ) {
+        if let Err(e) = std::fs::write(
+            dir.join(MANIFEST_FILE),
+            manifest_json_with(schema, counts, extra),
+        ) {
+            panic!("write manifest: {e}");
+        }
+        let [(f0, _), (f1, _), (f2, _), (f3, _)] = TABLES;
+        let [r0, r1, r2, r3] = file_rows;
+        write_record_batch(&dir.join(f0), &fills_batch(r0), compressed);
+        write_record_batch(&dir.join(f1), &equity_batch(r1), compressed);
+        write_record_batch(&dir.join(f2), &positions_batch(r2), compressed);
+        write_record_batch(&dir.join(f3), &greeks_batch(r3), compressed);
+    }
+
     #[track_caller]
     fn open_ok(root: &Path, ceilings: ResourceCeilings) -> BundleReader {
         match BundleReader::open_with_ceilings(root, ceilings) {
@@ -1822,11 +2201,12 @@ mod tests {
     #[test]
     fn test_open_and_load_happy_path() {
         let dir = temp_bundle_dir();
-        write_bundle(
+        write_full_bundle(
             dir.path(),
             SUPPORTED_SCHEMA,
             [4, 10, 8, 10],
             [4, 10, 8, 10],
+            false,
             false,
         );
         let reader = match BundleReader::open(dir.path()) {
@@ -1839,11 +2219,25 @@ mod tests {
             Err(e) => panic!("a well-formed bundle should load under default ceilings: {e}"),
         };
         assert_eq!(loaded.manifest.run_id, "run-abc123");
-        // #30 lands the ceiling spine; the typed tables are #31, so empty here.
-        assert!(loaded.fills.is_empty());
-        assert!(loaded.equity.is_empty());
-        assert!(loaded.positions.is_empty());
-        assert!(loaded.greeks.is_empty());
+        // #31 wires the typed decode: the four tables are now populated in FILE
+        // order (the reader never sorts). The conformant fixture appends rows
+        // already in sort-key order, so they come back non-decreasing on each key.
+        assert_eq!(loaded.fills.len(), 4);
+        assert_eq!(loaded.equity.len(), 10);
+        assert_eq!(loaded.positions.len(), 8);
+        assert_eq!(loaded.greeks.len(), 10);
+        assert!(
+            loaded
+                .fills
+                .is_sorted_by_key(|f| (f.step, f.order_id, f.fill_seq))
+        );
+        assert!(loaded.equity.is_sorted_by_key(|e| e.step));
+        assert!(
+            loaded
+                .positions
+                .is_sorted_by_key(|p| (p.step, p.position_id))
+        );
+        assert!(loaded.greeks.is_sorted_by_key(|g| g.step));
     }
 
     #[test]
@@ -2127,11 +2521,12 @@ mod tests {
         use std::cell::Cell;
 
         let dir = temp_bundle_dir();
-        write_bundle(
+        write_full_bundle(
             dir.path(),
             SUPPORTED_SCHEMA,
             [8, 8, 8, 8],
             [8, 8, 8, 8],
+            false,
             false,
         );
         // One row per batch -> many batch boundaries to observe cancellation at.
@@ -2165,11 +2560,12 @@ mod tests {
     #[test]
     fn test_load_is_read_only() {
         let dir = temp_bundle_dir();
-        write_bundle(
+        write_full_bundle(
             dir.path(),
             SUPPORTED_SCHEMA,
             [4, 10, 8, 10],
             [4, 10, 8, 10],
+            false,
             false,
         );
         let before = dir_snapshot(dir.path());
@@ -2362,71 +2758,248 @@ mod tests {
         );
     }
 
-    // --- Cheap extra: a ZSTD-compressed table decodes (codec feature works) ----
-
-    /// Write a minimal single-column (`step: INT32`) Parquet file compressed with
-    /// **ZSTD** — proving the enabled `zstd` codec feature actually decodes on
-    /// `load`.
-    fn write_parquet_zstd(path: &Path, num_rows: usize) {
-        use std::sync::Arc;
-
-        use arrow_array::{ArrayRef, Int32Array, RecordBatch};
-        use arrow_schema::{DataType, Field, Schema};
-        use parquet::arrow::ArrowWriter;
-        use parquet::basic::{Compression, ZstdLevel};
-        use parquet::file::properties::WriterProperties;
-
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "step",
-            DataType::Int32,
-            false,
-        )]));
-        let steps: Vec<i32> = (0..num_rows)
-            .map(|i| i32::try_from(i).unwrap_or(i32::MAX))
-            .collect();
-        let column: ArrayRef = Arc::new(Int32Array::from(steps));
-        let batch = match RecordBatch::try_new(Arc::clone(&schema), vec![column]) {
-            Ok(b) => b,
-            Err(e) => panic!("build record batch: {e}"),
-        };
-        let file = match std::fs::File::create(path) {
-            Ok(f) => f,
-            Err(e) => panic!("create {}: {e}", path.display()),
-        };
-        let props = WriterProperties::builder()
-            .set_compression(Compression::ZSTD(ZstdLevel::default()))
-            .build();
-        let mut writer = match ArrowWriter::try_new(file, schema, Some(props)) {
-            Ok(w) => w,
-            Err(e) => panic!("arrow writer: {e}"),
-        };
-        if let Err(e) = writer.write(&batch) {
-            panic!("write batch: {e}");
-        }
-        if let Err(e) = writer.close() {
-            panic!("close writer: {e}");
-        }
-    }
+    // --- Cheap extra: a ZSTD-compressed bundle decodes (codec feature works) ----
 
     #[test]
     fn test_load_decodes_zstd_compressed_tables() {
         let dir = temp_bundle_dir();
-        if let Err(e) = std::fs::write(
-            dir.path().join(MANIFEST_FILE),
-            manifest_json_with(SUPPORTED_SCHEMA, [3, 3, 3, 3], false),
-        ) {
-            panic!("write manifest: {e}");
-        }
-        // The four tables written with ZSTD page compression.
-        for (file, _key) in TABLES {
-            write_parquet_zstd(&dir.path().join(file), 3);
-        }
+        // The four full-schema tables written with ZSTD page compression — proving
+        // the enabled `zstd` codec feature decodes through the typed #31 path.
+        write_full_bundle(
+            dir.path(),
+            SUPPORTED_SCHEMA,
+            [3, 3, 3, 3],
+            [3, 3, 3, 3],
+            false,
+            true,
+        );
         let reader = open_ok(dir.path(), ResourceCeilings::default());
         match reader.load() {
-            Ok(loaded) => assert_eq!(loaded.manifest.schema, SUPPORTED_SCHEMA),
+            Ok(loaded) => {
+                assert_eq!(loaded.manifest.schema, SUPPORTED_SCHEMA);
+                assert_eq!(loaded.fills.len(), 3);
+                assert_eq!(loaded.equity.len(), 3);
+                assert_eq!(loaded.positions.len(), 3);
+                assert_eq!(loaded.greeks.len(), 3);
+            }
             Err(e) => {
                 panic!("a ZSTD-compressed bundle must decode under the enabled codec: {e}")
             }
         }
+    }
+
+    // --- #31: `load` returns the exact rows written, in FILE order (no sort) ------
+
+    #[test]
+    fn test_load_returns_typed_rows_in_file_order() {
+        let dir = temp_bundle_dir();
+        // A CONFORMANT writer: the fixtures append rows already in each table's
+        // stated sort-key order (ascending `step`). The reader NEVER sorts — it
+        // returns rows in FILE order — so a conformant bundle round-trips verbatim.
+        // (An out-of-order bundle would come back out-of-order too; rejecting the
+        // ordering violation is the #32 validation chain's job, not this reader's.)
+        write_full_bundle(
+            dir.path(),
+            SUPPORTED_SCHEMA,
+            [3, 3, 3, 3],
+            [3, 3, 3, 3],
+            false,
+            false,
+        );
+        let reader = open_ok(dir.path(), ResourceCeilings::default());
+        let loaded = match reader.load() {
+            Ok(l) => l,
+            Err(e) => panic!("a well-formed full bundle should load: {e}"),
+        };
+
+        // Exact row equality, field for field, in FILE order — the same ascending
+        // order the conformant fixtures wrote (money stays integer cents, the signed
+        // fields keep their sign, `exit_reason`/`open_at_end` decode per-row).
+        let base_ts = 1_700_000_000_000_000_000_i64;
+        let cid = "v1:BTC:1735286400000000000:6000000:C";
+
+        let expected_fills: Vec<Fill> = (0..3_u32)
+            .map(|s| Fill {
+                step: s,
+                ts_ns: base_ts + i64::from(s),
+                strategy_run_id: "run-abc123".to_owned(),
+                trade_id: 100 + u64::from(s),
+                position_id: 200 + u64::from(s),
+                order_id: u64::from(s),
+                fill_seq: 0,
+                underlying: "BTC".to_owned(),
+                expiration_ns: 1_735_286_400_000_000_000,
+                contract_id: cid.to_owned(),
+                strike_cents: 6_000_000,
+                style: OptionStyle::Call,
+                side: PositionSide::Long,
+                quantity: 1,
+                price_cents: 12_500,
+                fees_cents: 30,
+                slippage_cents: -15,
+                mode: ExecMode::Realistic,
+            })
+            .collect();
+
+        let expected_equity: Vec<EquityPoint> = (0..3_u32)
+            .map(|s| EquityPoint {
+                step: s,
+                ts_ns: base_ts + i64::from(s),
+                cash_cents: 990_000 + i64::from(s),
+                position_value_cents: -1_500,
+                equity_cents: 988_500 + i64::from(s),
+                drawdown: -0.015,
+            })
+            .collect();
+
+        let expected_positions: Vec<PositionRow> = (0..3_u32)
+            .map(|s| PositionRow {
+                step: s,
+                ts_ns: base_ts + i64::from(s),
+                position_id: u64::from(s),
+                trade_id: 7,
+                contract_id: cid.to_owned(),
+                side: PositionSide::Short,
+                quantity: 1,
+                avg_price_cents: 12_000,
+                mark_cents: 11_800,
+                unrealized_cents: 200,
+                stale_mark: false,
+                exit_reason: if s == 0 {
+                    Some("expiry".to_owned())
+                } else {
+                    None
+                },
+                open_at_end: s == 2,
+            })
+            .collect();
+
+        let expected_greeks: Vec<GreeksAttribution> = (0..3_u32)
+            .map(|s| GreeksAttribution {
+                step: s,
+                ts_ns: base_ts + i64::from(s),
+                theta_pnl_cents: 40,
+                delta_pnl_cents: -120,
+                vega_pnl_cents: 15,
+                spread_capture_cents: 10,
+                fees_cents: 30,
+                residual_cents: 1,
+            })
+            .collect();
+
+        assert_eq!(
+            loaded.fills, expected_fills,
+            "fills must round-trip verbatim in file order"
+        );
+        assert_eq!(
+            loaded.equity, expected_equity,
+            "equity must round-trip verbatim in file order"
+        );
+        assert_eq!(
+            loaded.positions, expected_positions,
+            "positions must round-trip verbatim in file order"
+        );
+        assert_eq!(
+            loaded.greeks, expected_greeks,
+            "greeks must round-trip verbatim in file order"
+        );
+    }
+
+    // --- #31 review fix: the working-set budget measures the RETAINED rows --------
+
+    /// A full-schema fills batch whose `contract_id` column is a
+    /// `Dictionary(Int32, Utf8)` holding ONE `value`, keyed by every row — the Arrow
+    /// batch stores that string once, while the typed decode copies it per row.
+    fn fills_batch_with_dict_contract_id(n: usize, value: &str) -> RecordBatch {
+        use std::sync::Arc;
+
+        use arrow_array::types::Int32Type;
+        use arrow_array::{ArrayRef, DictionaryArray, Int32Array, StringArray};
+        use arrow_schema::{DataType, Field, Schema};
+
+        let base = fills_batch(n);
+        let keys = Int32Array::from(vec![0_i32; n]);
+        let values = Arc::new(StringArray::from(vec![value])) as ArrayRef;
+        let dict: ArrayRef = match DictionaryArray::<Int32Type>::try_new(keys, values) {
+            Ok(d) => Arc::new(d),
+            Err(e) => panic!("build dictionary array: {e}"),
+        };
+        let dict_type = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
+
+        let mut fields: Vec<Field> = base
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.as_ref().clone())
+            .collect();
+        let mut cols: Vec<ArrayRef> = base.columns().to_vec();
+        let idx = match base.schema().index_of("contract_id") {
+            Ok(i) => i,
+            Err(e) => panic!("fills batch missing contract_id: {e}"),
+        };
+        if let Some(slot) = fields.get_mut(idx) {
+            *slot = Field::new("contract_id", dict_type, false);
+        }
+        if let Some(slot) = cols.get_mut(idx) {
+            *slot = dict;
+        }
+        match RecordBatch::try_new(Arc::new(Schema::new(fields)), cols) {
+            Ok(b) => b,
+            Err(e) => panic!("build dict fills batch: {e}"),
+        }
+    }
+
+    #[test]
+    fn test_working_set_budget_trips_on_retained_dictionary_bytes() {
+        // The dictionary-encoding gap: a `Dictionary(Int32, Utf8)` stores its long
+        // value ONCE (plus one Int32 key per row), so the Arrow batch footprint stays
+        // small — but the typed decode copies the value into EVERY owned row. The
+        // retained accounting must catch what the batch estimate alone misses.
+        let n = 64;
+        let long = "L".repeat(1024);
+        let batch = fills_batch_with_dict_contract_id(n, &long);
+
+        // What the measured loop accounts for the batch itself: Arrow array memory
+        // size inflated by the transient-overhead factor.
+        let arrow_bytes = u64::try_from(batch.get_array_memory_size()).unwrap_or(u64::MAX);
+        let batch_estimate = match apply_overhead(arrow_bytes, DECODED_OVERHEAD_PERMILLE) {
+            Ok(v) => v,
+            Err(e) => panic!("overhead multiply: {e}"),
+        };
+
+        // What the typed decode retains: owned rows + the value copied into all N rows.
+        let mut out = Vec::new();
+        let retained = match tables::read_fills(&batch, &mut out) {
+            Ok(r) => r,
+            Err(e) => panic!("read_fills should succeed: {e}"),
+        };
+        assert_eq!(out.len(), n);
+        assert!(
+            retained > batch_estimate,
+            "the per-row copied dictionary string must make retained {retained} exceed the \
+             Arrow batch estimate {batch_estimate}"
+        );
+
+        // A ceiling that ADMITS the batch estimate but not the estimate + retained:
+        // the transient batch accounting alone would pass, yet the retained accounting
+        // trips it — exactly the working-set breach the old batch-only tally missed.
+        let ceilings = ResourceCeilings {
+            max_working_set: batch_estimate + retained - 1,
+            max_batch_bytes: retained,
+            ..ResourceCeilings::default()
+        };
+        let mut budget = WorkingSetBudget::new(&ceilings);
+        match budget.account(batch_estimate) {
+            Ok(()) => {}
+            Err(e) => panic!("the transient batch estimate alone must fit under the ceiling: {e}"),
+        }
+        match budget.account(retained) {
+            Err(BundleError::TooLarge(_)) => {}
+            other => panic!("the retained bytes must trip the working-set ceiling, got {other:?}"),
+        }
+        assert!(
+            budget.used() < ceilings.max_working_set,
+            "a rejected retained batch is never committed; used stays under the ceiling"
+        );
     }
 }

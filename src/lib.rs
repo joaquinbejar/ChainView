@@ -148,9 +148,12 @@ pub use error::{
 // Issue #30 adds the reader body and the untrusted-input hardening spine:
 // `BundleReader::{open, open_with_ceilings, load, load_cancellable}`, the
 // `ResourceCeilings` config knobs and their documented `MAX_*` /
-// `DECODED_OVERHEAD_PERMILLE` defaults, and the `SUPPORTED_SCHEMA` gate. The typed
-// per-column decode (#31) and the cross-table validation chain (#32) are still
-// written against this surface.
+// `DECODED_OVERHEAD_PERMILLE` defaults, and the `SUPPORTED_SCHEMA` gate. Issue #31
+// wires the typed per-column decode (`src/replay/tables.rs`) into that batched,
+// budget-measured loop, so `load` returns the four tables populated and sorted;
+// the cross-table validation chain (#32) is still written against this surface.
+// The public surface gains no new item beyond the `BundleError::Schema` decode
+// variant — the decoders themselves are `pub(crate)`.
 pub use replay::{
     BundleManifest, BundleReader, CONTRACT_ID_FORMAT, CONTRACT_ID_UNDERLYING_PATTERN,
     CONTRACT_ID_VERSION_PREFIX, CapitalConfig, DECODED_OVERHEAD_PERMILLE, EquityPoint, ExecMode,

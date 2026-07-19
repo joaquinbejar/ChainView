@@ -133,6 +133,17 @@ pub enum BundleError {
     /// A cross-table or domain invariant was violated on load.
     #[error("invariant violated: {0}")]
     Invariant(String),
+    /// A Parquet column did not match the bundle's declared table schema during
+    /// the typed per-column decode (#31, `docs/04-replay-mode.md` §2.2/§5): a
+    /// **required column is absent**, or a column is present at the **wrong
+    /// Arrow/Parquet type**. The detail is ChainView-authored and non-secret — it
+    /// names the table, the column, and (for a type mismatch) the expected vs
+    /// actual Arrow type; it carries **no cell value or bundle payload**, and any
+    /// echoed dynamic string is length-clamped at construction. An unknown
+    /// **extra** column is never an error — the reader is permissive toward a
+    /// newer minor of the same schema tag (`docs/04-replay-mode.md` §3).
+    #[error("bundle schema mismatch: {0}")]
+    Schema(String),
     /// The operator-supplied [`ResourceCeilings`](crate::ResourceCeilings)
     /// failed validation on the **enforcement path**
     /// (`BundleReader::open_with_ceilings`). A misconfigured ceiling is surfaced
@@ -568,6 +579,15 @@ mod tests {
     #[test]
     fn test_bundle_error_cancelled_display_is_category_message() {
         assert_eq!(BundleError::Cancelled.to_string(), "bundle load cancelled");
+    }
+
+    #[test]
+    fn test_bundle_error_schema_display_is_category_prefixed() {
+        let err = BundleError::Schema("fills: required column `quantity` is absent".to_owned());
+        assert_eq!(
+            err.to_string(),
+            "bundle schema mismatch: fills: required column `quantity` is absent"
+        );
     }
 
     #[test]
