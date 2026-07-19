@@ -269,8 +269,10 @@ fn test_draw_path_runs_without_async_runtime_and_mutates_nothing() {
     app.mark_drawn();
 
     let before = (app.dirty, app.help_open, app.should_quit, app.tick_count);
+    let mut view = crate::ui::view::ViewState::new();
+    view.sync(&app);
     let mut term = terminal(GOLDEN_WIDTH, GOLDEN_HEIGHT);
-    match term.draw(|frame| crate::ui::render(&app, frame)) {
+    match term.draw(|frame| crate::ui::render(&app, &view, frame)) {
         Ok(_) => {}
         Err(e) => panic!("full-frame render failed: {e}"),
     }

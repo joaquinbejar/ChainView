@@ -14,6 +14,67 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- Payoff **curve** render — the expiration and t+0 diagrams from the committed
+  builder (`src/app/payoff_build.rs`, `src/app.rs`, `src/ui/payoff.rs`,
+  `src/ui/view.rs`, `src/ui/driver.rs`, `src/ui/mod.rs`, issue #27; docs 05 §4,
+  02 §7). The committed strategy is sampled into a single
+  `GraphData::Series(Series2D)` per curve mode — price → P&L across a bounded,
+  strike/spot-anchored 121-point grid — **off** the draw path in the application
+  layer: `Profit::calculate_profit_at`-equivalent per-leg `pnl_at_expiration` for
+  the expiration line (IV-independent, so it renders from the frozen marks alone),
+  and the `expiration(S) + Σ_legs[signed_BS(S)·qty − intrinsic(S)]` recipe
+  (`ExpirationDate::Days`, per-leg IV from the #24 sidecar) for the t+0 line — whose
+  entry premium is the **frozen commit-time** mark (P0), so t+0 is a locked-entry
+  mark-to-market that shows the accrued unrealized P&L at spot and converges to the
+  frozen expiration line at the wings (SF-1, the two curves share one cost basis;
+  the prior code re-read the live mark each tick and hid unrealized P&L). The t+0
+  curve additionally requires a **plausible** IV per leg: a sub-0.5% locally-computed
+  leg IV (a #83-style inverse mispricing) makes **only** the t+0 curve unavailable
+  while the expiration curve still renders, and a venue IV is trusted unfloored
+  (SF-2) — gated by the `MIN_PLAUSIBLE_LOCAL_IV` floor **relocated to the domain**
+  (`src/chain/greeks.rs`) so #25's chain matrix and #27's payoff share one
+  definition. All `optionstratlib` math, never hand-rolled Black-Scholes, and
+  deliberately **not** `Graph::graph_data()` (a `MultiSeries` the #23 adapter defers
+  to #47). Break-evens are read off the expiration series' sign changes
+  (linear-interpolated, `O(grid)`) on a grid that **anchors every leg strike** as an
+  explicit sample so each payoff kink and between-adjacent-strike crossing is exact
+  (double-crossings narrower than one uniform step remain a #28 concern) — the #27
+  API-map's sanctioned alternative to `CustomStrategy::new`'s unbounded
+  ~6M-iteration ctor scan, which is constructed on **no** path, so the render thread
+  never freezes on commit and the tick refresh trivially never runs it.
+  `PayoffBuilder::commit(&ChainStore)` builds and caches the geometry + frozen entry
+  positions + break-evens on `CommittedStrategy` and bumps a **new** `graph_revision`
+  (distinct from the cursor-edit `revision`, so a cursor-only edit never
+  over-invalidates); a curve toggle (only when committed), a clear, and a t+0 tick
+  refresh bump it only when the active series actually changes. `LiveState::apply_market`
+  calls `PayoffBuilder::refresh_tplus0(&ChainStore)` only while the t+0 curve is
+  shown, so the hot quote path does nothing under the (IV-independent) expiration
+  view and re-prices the **frozen** commit-time positions directly (mutating only the
+  sampled underlying and the current per-leg IV, never the entry premium) — never
+  reconstructing a strategy. The
+  projection cache is a render-loop-owned **ui** `ViewState` (not on app state, so
+  the arch rule `application ↛ crate::ui` holds): the loop `sync`s it between the
+  event fold and the draw (off the draw path, gated on `App::dirty`), diffing
+  `graph_revision` to re-project only on a real change through the #23
+  `GraphCache`/`project`. `render`, `run_render_loop`/`step`/`draw_frame`, and
+  `payoff::draw` thread `&ViewState`/`&GraphProjection`, so the paint reads only the
+  cached projection and builds no `GraphData`. `payoff::draw` renders states first —
+  the empty "add a leg" hint, the in-progress leg list, the inline validation errors,
+  then the committed line **chart** (a dim zero reference line, the payoff line, the
+  break-even markers, and the current-spot marker, the `t`-selected curve) with a
+  text header carrying spot + break-evens (legible under `NO_COLOR`, one shared
+  number formatter; the spot marker differentiated by `Block` shape, not color) — the
+  drawn y-bounds are widened to include `0` (with regenerated endpoint labels), so the
+  zero line and the y=0 markers never clip when the P&L window sits entirely above or
+  below zero (a fresh position's t+0 curve), payoff-local so the generic `graph.rs`
+  adapter is untouched — or an honest "curve unavailable" state (expiration: no marks
+  or a non-future expiry; t+0: "no reliable IV"), never a fabricated chart. The build
+  is a deterministic pure function of (legs, store snapshot): the reference instant
+  is a stored `last_full_poll` timestamp (never `Utc::now()`), the y-axis is honest
+  premium-currency × contracts (no ×100 multiplier), and a NaN/degenerate coordinate
+  routes to the empty state via the #23 finite gate. (The break-even/max-P&L-vs-
+  `optionstratlib` goldens land in #28; the geometry here is verified against
+  `Profit::calculate_profit_at`.)
 - Multi-leg payoff builder state, keybindings, and validation (`src/app.rs`,
   `src/ui/payoff.rs`, `src/app/keymap.rs`, issue #26; docs 05 §3, §6) — the
   interaction layer the payoff screen (#27) will render, state + keys + validation

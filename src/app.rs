@@ -45,7 +45,9 @@ use std::path::PathBuf;
 use chrono::{DateTime, Utc};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use optionstratlib::chains::chain::OptionChain;
+use optionstratlib::model::Position;
 use optionstratlib::prelude::{Decimal, Positive};
+use optionstratlib::visualization::GraphData;
 use optionstratlib::{ExpirationDate, OptionStyle};
 use tokio::sync::mpsc;
 
@@ -61,6 +63,7 @@ use crate::providers::{ChainCapability, GreeksCapability, ProviderCapabilities};
 
 mod bridge;
 pub(crate) mod keymap;
+mod payoff_build;
 mod registry;
 mod supervisor;
 
@@ -776,13 +779,40 @@ impl LiveState {
     /// arm. `Depth` has no store path yet (the depth-ladder store lands with the
     /// depth screen, v0.5) — folding it is a documented no-op here.
     fn apply_market(&mut self, update: MarketUpdate) -> bool {
-        match update {
+        let changed = match update {
             MarketUpdate::Quote(quote) => merged(self.store.apply_quote(&quote)),
             MarketUpdate::Greeks(greeks) => merged(self.store.apply_greeks(&greeks)),
             MarketUpdate::Depth(_) => false,
             MarketUpdate::Chain(snapshot) => self.apply_chain_snapshot(snapshot),
             MarketUpdate::Health(provider, health) => self.apply_health(&provider, health),
+        };
+        // A data-changing fold may move the committed payoff's t+0 curve (its
+        // per-leg IV is re-read from the just-updated sidecar). The refresh runs
+        // **only** while the t+0 curve is the shown one — the hot quote path does
+        // nothing when the (IV-independent) expiration curve is displayed — and
+        // re-prices the committed legs directly, never reconstructing a
+        // `CustomStrategy` (#27, off the draw path).
+        if changed {
+            self.refresh_committed_tplus0();
         }
+        changed
+    }
+
+    /// Re-price the committed strategy's t+0 curve against the current store
+    /// snapshot when it is the shown curve. A cheap no-op otherwise (two field
+    /// reads), so a streaming quote never rebuilds a hidden curve.
+    fn refresh_committed_tplus0(&mut self) {
+        if self.payoff_builder.curve() != CurveMode::TPlus0
+            || self.payoff_builder.committed().is_none()
+        {
+            return;
+        }
+        let LiveState {
+            store,
+            payoff_builder,
+            ..
+        } = self;
+        payoff_builder.refresh_tplus0(store);
     }
 
     /// Reconcile the store's structure against a fresh full re-poll delivered as
@@ -1092,16 +1122,35 @@ impl std::fmt::Display for LegError {
     }
 }
 
-/// A validated, committed multi-leg strategy (`docs/05-views-and-ux.md` §3). Built
-/// only by [`PayoffBuilder::validate`] from a strategy that passed every check, so
-/// the payoff screen (#27) can draw it **without re-validating**. `#[non_exhaustive]`
-/// so the cached payoff `GraphData` the render adapter (#23/#27) adds is a
-/// source-compatible addition.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A validated, committed multi-leg strategy (`docs/05-views-and-ux.md` §3, §4).
+/// Built by [`PayoffBuilder::validate`] from a strategy that passed every check,
+/// then enriched on commit with the payoff **geometry** — the expiration and t+0
+/// curves, the shared price grid, and the break-even points — all sampled from
+/// `optionstratlib` **off** the draw path, so the payoff screen (#27) draws the
+/// cached series **without re-validating or re-pricing**.
+/// `#[non_exhaustive]` so those cached fields stay a source-compatible addition; no
+/// `Eq` because the cached [`GraphData`] carries display `f64` line widths.
+#[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct CommittedStrategy {
     /// The validated legs, in the order they were built.
     legs: Vec<BuilderLeg>,
+    /// The shared underlying-price x-grid both curves and the t+0 refresh reuse
+    /// (empty when the geometry could not be priced).
+    grid: Vec<Positive>,
+    /// The **frozen** commit-time positions (entry premium P0 per leg). The t+0
+    /// tick refresh reprices these — mutating only the sampled underlying and the
+    /// current IV — so the entry premium never re-reads the live mark and both
+    /// curves share one cost basis (#27 SF-1). Empty when the geometry could not be
+    /// priced.
+    entry_positions: Vec<Position>,
+    /// The expiration payoff as a single `GraphData::Series` (price → P&L).
+    expiration: GraphData,
+    /// The t+0 (mark-based) curve as a single `GraphData::Series` (price → P&L), or
+    /// an empty series when a leg lacks a plausible IV (the "t+0 unavailable" state).
+    tplus0: GraphData,
+    /// The break-even underlying prices, read off the expiration series (#27).
+    break_evens: Vec<Positive>,
 }
 
 impl CommittedStrategy {
@@ -1109,6 +1158,71 @@ impl CommittedStrategy {
     #[must_use]
     pub fn legs(&self) -> &[BuilderLeg] {
         &self.legs
+    }
+
+    /// The cached break-even underlying prices (empty when the curve could not be
+    /// priced), overlaid as markers by the payoff screen (#27).
+    #[must_use]
+    pub fn break_even_points(&self) -> &[Positive] {
+        &self.break_evens
+    }
+
+    /// Whether the cached, IV-independent **expiration** series carries renderable
+    /// points — so the payoff screen can tell a t+0 curve that is unavailable purely
+    /// for lack of a plausible IV (expiration still renders) from a strategy that
+    /// cannot be priced at all (#27 SF-2). Exhaustive over [`GraphData`], no wildcard.
+    #[must_use]
+    fn has_expiration_curve(&self) -> bool {
+        match &self.expiration {
+            GraphData::Series(series) => !series.x.is_empty(),
+            GraphData::MultiSeries(_) | GraphData::GraphSurface(_) => false,
+        }
+    }
+
+    /// The cached payoff series for `curve` — the expiration or t+0
+    /// `GraphData::Series` — exhaustive over [`CurveMode`] with no wildcard.
+    #[must_use]
+    fn active_graph(&self, curve: CurveMode) -> &GraphData {
+        match curve {
+            CurveMode::Expiration => &self.expiration,
+            CurveMode::TPlus0 => &self.tplus0,
+        }
+    }
+
+    /// Enrich a freshly-validated strategy with the payoff geometry sampled from
+    /// the `store` snapshot, **off** the draw path. Leaves the geometry empty when
+    /// the legs cannot be priced (a missing IV or a non-future expiry) — the
+    /// screen then renders a deliberate "curve unavailable" state rather than a
+    /// fabricated line.
+    fn populate_geometry(&mut self, store: &ChainStore) {
+        if let Some(geometry) = payoff_build::build_geometry(&self.legs, store) {
+            self.grid = geometry.grid;
+            self.entry_positions = geometry.entry_positions;
+            self.expiration = geometry.expiration;
+            self.tplus0 = geometry.tplus0;
+            self.break_evens = geometry.break_evens;
+        }
+    }
+
+    /// Re-price the t+0 curve against the current `store` snapshot on the committed
+    /// grid by repricing the **frozen** entry positions (the entry premium stays P0;
+    /// only the sampled underlying and the current per-leg IV move), returning
+    /// whether the series changed. A leg that loses its plausible IV flips the t+0
+    /// curve to the empty "unavailable" series. Constructs **no** `CustomStrategy`
+    /// and never touches the expiration curve or break-evens — the tick-path refresh
+    /// (#27 SF-1/SF-2).
+    fn refresh_tplus0(&mut self, store: &ChainStore) -> bool {
+        if self.grid.is_empty() {
+            return false;
+        }
+        let series =
+            payoff_build::rebuild_tplus0(&self.legs, store, &self.grid, &self.entry_positions);
+        if series != self.tplus0 {
+            self.tplus0 = series;
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -1124,7 +1238,7 @@ impl CommittedStrategy {
 /// as it diffs the chain [`Selection`] (`docs/02-tui-architecture.md` §8): a builder
 /// edit emits **no** [`AppEvent`], so the revision is how the loop learns the frame
 /// changed.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct PayoffBuilder {
     /// The ordered legs being built.
     legs: Vec<BuilderLeg>,
@@ -1142,6 +1256,30 @@ pub struct PayoffBuilder {
     committed: Option<CommittedStrategy>,
     /// A monotonic edit counter the render loop diffs to schedule a redraw.
     revision: u64,
+    /// A monotonic counter, **distinct** from [`revision`](Self::revision), bumped
+    /// only when the **active** payoff `GraphData` changes (a commit, a curve
+    /// toggle, a t+0 refresh that moved the series, or a clear) — never on a
+    /// cursor-only edit that would over-invalidate the projection cache (#27).
+    graph_revision: u64,
+    /// The empty payoff series returned by [`active_graph_data`](Self::active_graph_data)
+    /// while nothing is committed — the #23 adapter renders it as the deliberate
+    /// "add a leg" empty projection.
+    empty_graph: GraphData,
+}
+
+impl Default for PayoffBuilder {
+    fn default() -> Self {
+        Self {
+            legs: Vec::new(),
+            cursor: 0,
+            curve: CurveMode::default(),
+            errors: Vec::new(),
+            committed: None,
+            revision: 0,
+            graph_revision: 0,
+            empty_graph: payoff_build::empty_series(),
+        }
+    }
 }
 
 /// The default quantity of a freshly appended leg (one contract).
@@ -1205,6 +1343,52 @@ impl PayoffBuilder {
     #[must_use]
     pub fn revision(&self) -> u64 {
         self.revision
+    }
+
+    /// The monotonic **payoff-curve** revision, bumped only when the active payoff
+    /// `GraphData` changes (`docs/05-views-and-ux.md` §4). Distinct from
+    /// [`revision`](Self::revision): the ui view-cache (`src/ui/view.rs`) diffs
+    /// this to decide when to re-project the payoff series **off** the draw path, so
+    /// a cursor-only edit (which bumps `revision` but not this) never re-projects
+    /// (#27).
+    #[must_use]
+    pub fn graph_revision(&self) -> u64 {
+        self.graph_revision
+    }
+
+    /// The active payoff [`GraphData`] for the current [`CurveMode`] — the
+    /// committed expiration or t+0 series, or a stored empty series while nothing
+    /// is committed. The ui view-cache clones this off the draw path and projects
+    /// it through `src/ui/graph.rs`; `draw` never builds it (#27).
+    #[must_use]
+    pub fn active_graph_data(&self) -> &GraphData {
+        match self.committed.as_ref() {
+            Some(committed) => committed.active_graph(self.curve),
+            None => &self.empty_graph,
+        }
+    }
+
+    /// The committed strategy's break-even underlying prices (empty while nothing
+    /// is committed or the curve could not be priced), overlaid as markers by the
+    /// payoff screen (#27).
+    #[must_use]
+    pub fn break_even_points(&self) -> &[Positive] {
+        match self.committed.as_ref() {
+            Some(committed) => committed.break_even_points(),
+            None => &[],
+        }
+    }
+
+    /// Whether the committed strategy's (IV-independent) **expiration** curve has
+    /// renderable data. `false` while nothing is committed. The payoff screen reads
+    /// this to render the honest "t+0 unavailable — no reliable IV" state when only
+    /// the t+0 curve is missing while the expiration curve still renders (#27 SF-2).
+    #[must_use]
+    pub fn has_expiration_curve(&self) -> bool {
+        match self.committed.as_ref() {
+            Some(committed) => committed.has_expiration_curve(),
+            None => false,
+        }
     }
 
     // --- Mutations (each edit clears the stale commit + errors and bumps the
@@ -1277,12 +1461,32 @@ impl PayoffBuilder {
         }
     }
 
-    /// Toggle the payoff curve expiration ⇄ t+0 (`t`). The curve **render** lands in
-    /// #27; this owns the view-mode state so the key is never orphaned. Does not
-    /// touch the built legs, so it keeps any commit/errors.
+    /// Toggle the payoff curve expiration ⇄ t+0 (`t`). Selects which cached series
+    /// the screen shows (#27); does not touch the built legs, so it keeps any
+    /// commit/errors. Bumps [`graph_revision`](Self::graph_revision) **only when a
+    /// strategy is committed** — the toggle switches the **active** payoff `GraphData`
+    /// only then (with nothing committed both curves resolve to the same stored empty
+    /// series), so it is symmetric with `clear`/`on_edit` and never triggers a
+    /// redundant empty reprojection.
     pub(crate) fn toggle_curve(&mut self) {
         self.curve = self.curve.toggled();
         self.bump();
+        if self.committed.is_some() {
+            self.bump_graph();
+        }
+    }
+
+    /// Re-price the committed strategy's t+0 curve against the current `store`
+    /// snapshot, bumping [`graph_revision`](Self::graph_revision) only when the
+    /// series changed. Called from the market-tick fold (never `draw`) and never
+    /// reconstructs a `CustomStrategy` — a no-op with no committed strategy (#27).
+    pub(crate) fn refresh_tplus0(&mut self, store: &ChainStore) {
+        let Some(committed) = self.committed.as_mut() else {
+            return;
+        };
+        if committed.refresh_tplus0(store) {
+            self.bump_graph();
+        }
     }
 
     /// Discard the uncommitted strategy and return to the empty state (`Esc`): clear
@@ -1292,31 +1496,43 @@ impl PayoffBuilder {
         if self.legs.is_empty() && self.errors.is_empty() && self.committed.is_none() {
             return;
         }
+        // Clearing a committed strategy returns the active payoff `GraphData` to the
+        // empty series, so the projection cache must re-project.
+        let had_committed = self.committed.is_some();
         self.legs.clear();
         self.cursor = 0;
         self.errors.clear();
         self.committed = None;
         self.bump();
+        if had_committed {
+            self.bump_graph();
+        }
     }
 
-    /// Validate the built strategy against `chain` and, when valid, store the
-    /// committed strategy (`Enter`); on failure store the per-leg errors and commit
-    /// nothing. Returns whether the strategy committed.
+    /// Validate the built strategy against the store's chain and, when valid,
+    /// enrich it with the payoff geometry and store it (`Enter`); on failure store
+    /// the per-leg errors and commit nothing. Returns whether the strategy
+    /// committed.
     ///
-    /// The chain is borrowed immutably while `self` is borrowed mutably — the caller
-    /// passes disjoint field borrows (`store.chain()` vs `payoff_builder`), so the
-    /// draw path stays free of any pricing or I/O; validation is a pure read.
-    pub(crate) fn commit(
-        &mut self,
-        chain: &OptionChain,
-        clocks: &QuoteClocks,
-        as_of: DateTime<Utc>,
-    ) -> bool {
-        match self.validate(chain, clocks, as_of) {
-            Ok(strategy) => {
+    /// The whole `store` is borrowed immutably while `self` is borrowed mutably —
+    /// the caller passes disjoint field borrows (`store` vs `payoff_builder`) — so
+    /// the geometry build (the payoff series + break-evens, sampled from
+    /// `optionstratlib`) runs here, **off** the draw path, and a successful commit
+    /// bumps [`graph_revision`](Self::graph_revision) so the projection cache
+    /// re-projects. Freshness reaches validation as data (#26): the store's
+    /// stream-quote receipt clocks + the analytics reference instant, so a leg
+    /// whose feed died is rejected with `StaleMark` instead of committing its
+    /// cached midpoint. No I/O and no wall-clock read (#27).
+    pub(crate) fn commit(&mut self, store: &ChainStore) -> bool {
+        let clocks = store.quote_clocks();
+        let as_of = store.analytics_as_of();
+        match self.validate(store.chain(), &clocks, as_of) {
+            Ok(mut strategy) => {
+                strategy.populate_geometry(store);
                 self.committed = Some(strategy);
                 self.errors.clear();
                 self.bump();
+                self.bump_graph();
                 true
             }
             Err(errors) => {
@@ -1386,8 +1602,16 @@ impl PayoffBuilder {
             }
         }
         if errors.is_empty() {
+            // The geometry is priced separately by [`commit`] (off the draw path);
+            // `validate` stays a pure leg/mark check, so the returned strategy
+            // carries empty geometry until enriched.
             Ok(CommittedStrategy {
                 legs: self.legs.clone(),
+                grid: Vec::new(),
+                entry_positions: Vec::new(),
+                expiration: payoff_build::empty_series(),
+                tplus0: payoff_build::empty_series(),
+                break_evens: Vec::new(),
             })
         } else {
             Err(errors)
@@ -1395,11 +1619,17 @@ impl PayoffBuilder {
     }
 
     /// Shared post-edit bookkeeping: a strategy edit invalidates the last commit and
-    /// its errors, then bumps the revision so the loop redraws.
+    /// its errors, then bumps the revision so the loop redraws. Clearing a committed
+    /// strategy also returns the active payoff `GraphData` to the empty series, so
+    /// the projection cache is invalidated (only then, never on a cursor-only edit).
     fn on_edit(&mut self) {
+        let had_committed = self.committed.is_some();
         self.committed = None;
         self.errors.clear();
         self.bump();
+        if had_committed {
+            self.bump_graph();
+        }
     }
 
     /// Advance the redraw revision, wrapping to `0` on the (practically unreachable)
@@ -1407,6 +1637,12 @@ impl PayoffBuilder {
     /// tick counter (`docs/02-tui-architecture.md` §8).
     fn bump(&mut self) {
         self.revision = self.revision.checked_add(1).unwrap_or(0);
+    }
+
+    /// Advance the payoff-curve revision (the projection-cache invalidation signal),
+    /// wrapping to `0` on the (practically unreachable) `u64` overflow.
+    fn bump_graph(&mut self) {
+        self.graph_revision = self.graph_revision.checked_add(1).unwrap_or(0);
     }
 }
 

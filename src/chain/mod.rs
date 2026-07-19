@@ -61,7 +61,8 @@ pub use fetch::{AliasCatalog, ChainFetch, ExpirySource};
 pub(crate) use greeks::quote_is_stale;
 pub use greeks::{
     DEFAULT_DIVIDEND_YIELD, DEFAULT_RISK_FREE_RATE, GreeksSidecar, LegGreeks, LegStatus,
-    PricingInputs, PricingModel, QuoteClocks, QuoteSelect, compute_leg_greeks,
+    MIN_PLAUSIBLE_LOCAL_IV, PricingInputs, PricingModel, QuoteClocks, QuoteSelect,
+    compute_leg_greeks,
 };
 pub use identity::{
     ContractSpecFingerprint, ExerciseStyle, Instrument, InstrumentKey, ProviderId,
