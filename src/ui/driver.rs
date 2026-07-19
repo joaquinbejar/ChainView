@@ -72,7 +72,7 @@ use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 
 use super::render;
-use crate::app::{App, EventBridge, KeyRoute, LiveScreen, Mode, ReplayScreen};
+use crate::app::{App, EventBridge, KeyRoute, LiveScreen, Mode, ReplayScreen, Selection};
 use crate::error::ChainViewError;
 use crate::event::{AppEvent, Command};
 use crate::ui::{chain, depth, payoff, replay, surface};
@@ -234,10 +234,33 @@ fn dispatch_key(app: &mut App, key: KeyEvent) {
     match app.dispatch_key_global(key) {
         KeyRoute::Consumed => {}
         KeyRoute::ToScreen => {
-            if let Some(follow) = screen_handle_key(app, key) {
+            // A screen-local navigation change — the chain strike cursor or the
+            // focused leg (#18) — mutates `LiveState` directly and produces **no**
+            // `AppEvent`, so it would not otherwise mark the app dirty. Detect it by
+            // diffing the live `Selection` (a `Copy` value) across the forward and
+            // request a redraw when it changed, so the cursor actually paints while
+            // a truly-unbound key that the screen ignores leaves the frame clean
+            // (the idle-redraw property of `docs/05-views-and-ux.md` §8 holds).
+            let before = live_selection(app);
+            let follow = screen_handle_key(app, key);
+            if live_selection(app) != before {
+                app.dirty = true;
+            }
+            if let Some(follow) = follow {
                 app.on_event(follow);
             }
         }
+    }
+}
+
+/// The live-mode [`Selection`] as a `Copy` snapshot, or `None` in replay mode
+/// (which has no strike cursor) — the diff basis that turns a screen-local
+/// navigation change into a redraw request.
+#[must_use]
+fn live_selection(app: &App) -> Option<Selection> {
+    match &app.mode {
+        Mode::Live(live) => Some(live.selection),
+        Mode::Replay(_) => None,
     }
 }
 
@@ -383,7 +406,7 @@ mod tests {
         to_app_event,
     };
     use crate::app::tests_support::{live_app, replay_app};
-    use crate::app::{EventBridge, LiveScreen, ReplayScreen, ScreenLoad};
+    use crate::app::{EventBridge, LiveScreen, Mode, ReplayScreen, ScreenLoad};
     use crate::event::{AppEvent, Command, SeekTo};
 
     #[track_caller]
@@ -550,14 +573,37 @@ mod tests {
     }
 
     #[test]
-    fn test_fold_event_live_screen_key_is_a_placeholder_noop() {
-        // A live-screen nav key is forwarded but the placeholder consumes nothing
-        // (chain nav lands in #18) — no command, no quit, no dirty flip.
-        let (mut app, mut rx) = live_app(LiveScreen::Chain, ScreenLoad::Loading, false);
+    fn test_fold_event_chain_move_strike_selects_and_marks_dirty() {
+        // A chain strike-nav key (`j`) is forwarded to the chain screen (#18),
+        // which places the strike cursor — a screen-local change that emits no
+        // command, so the loop detects the `Selection` change and requests a
+        // redraw.
+        let (mut app, mut rx) = live_app(LiveScreen::Chain, ScreenLoad::Ready, false);
         fold_event(&mut app, AppEvent::Key(key(KeyCode::Char('j'))));
         assert!(!app.should_quit);
-        assert!(!app.dirty);
-        assert!(rx.try_recv().is_err());
+        assert!(app.dirty, "moving the strike cursor requests a redraw");
+        assert!(rx.try_recv().is_err(), "local nav emits no command");
+        match &app.mode {
+            Mode::Live(live) => assert!(
+                live.selection.focused_row.is_some(),
+                "the strike cursor is placed",
+            ),
+            Mode::Replay(_) => panic!("expected a live app"),
+        }
+    }
+
+    #[test]
+    fn test_fold_event_chain_unbound_key_makes_no_change_no_dirty() {
+        // A key bound to nothing (`z`) is forwarded to the chain screen, which
+        // ignores it — no `Selection` change, so no redundant redraw (§8).
+        let (mut app, _rx) = live_app(LiveScreen::Chain, ScreenLoad::Ready, false);
+        assert!(!app.dirty, "the app is clean after its initial frame");
+        fold_event(&mut app, AppEvent::Key(key(KeyCode::Char('z'))));
+        assert!(
+            !app.dirty,
+            "an unbound key changes nothing and requests no redraw"
+        );
+        assert!(!app.should_quit);
     }
 
     // --- crossterm Event normalization -----------------------------------------

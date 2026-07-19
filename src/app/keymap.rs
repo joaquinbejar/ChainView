@@ -271,6 +271,13 @@ pub struct Binding {
     pub keys_label: &'static str,
     /// The one-line description shown in the overlay.
     pub help: &'static str,
+    /// `Some(version)` when the key **resolves and is documented** but its body is
+    /// **not yet wired** (its `handle_key` is a no-op pending later I/O plumbing) —
+    /// the help overlay renders a dim `(<version>)` suffix so `?` honestly advertises
+    /// which advertised keys are not live yet, instead of presenting a dead key as a
+    /// working feature (`docs/05-views-and-ux.md` §3, the honesty ethos). `None` for
+    /// a live, wired key. This marks + documents only; it never changes resolution.
+    pub deferred: Option<&'static str>,
 }
 
 /// The single source of truth for every key ChainView acts on
@@ -279,13 +286,14 @@ pub struct Binding {
 /// `help_sections`) read this one table, so a bound key and its documentation
 /// cannot drift.
 pub static KEYMAP: &[Binding] = &[
-    // -- Global ----------------------------------------------------------------
+    // -- Global (all wired) ----------------------------------------------------
     Binding {
         context: Context::Global,
         action: Action::Global(GlobalAction::Quit),
         chords: &[KeyChord::Char('q'), KeyChord::Ctrl('c')],
         keys_label: "q / Ctrl-C",
         help: "Quit",
+        deferred: None,
     },
     Binding {
         context: Context::Global,
@@ -293,6 +301,7 @@ pub static KEYMAP: &[Binding] = &[
         chords: &[KeyChord::Char('?')],
         keys_label: "?",
         help: "Toggle help",
+        deferred: None,
     },
     Binding {
         context: Context::Global,
@@ -305,6 +314,7 @@ pub static KEYMAP: &[Binding] = &[
         ],
         keys_label: "1-4",
         help: "Switch screen",
+        deferred: None,
     },
     Binding {
         context: Context::Global,
@@ -312,6 +322,7 @@ pub static KEYMAP: &[Binding] = &[
         chords: &[KeyChord::Tab],
         keys_label: "Tab",
         help: "Next screen",
+        deferred: None,
     },
     Binding {
         context: Context::Global,
@@ -319,6 +330,7 @@ pub static KEYMAP: &[Binding] = &[
         chords: &[KeyChord::BackTab],
         keys_label: "S-Tab",
         help: "Previous screen",
+        deferred: None,
     },
     Binding {
         context: Context::Global,
@@ -326,6 +338,7 @@ pub static KEYMAP: &[Binding] = &[
         chords: &[KeyChord::Char('r')],
         keys_label: "r",
         help: "Reconnect provider",
+        deferred: None,
     },
     Binding {
         context: Context::Global,
@@ -333,6 +346,7 @@ pub static KEYMAP: &[Binding] = &[
         chords: &[KeyChord::Char('R')],
         keys_label: "R",
         help: "Reload / re-open",
+        deferred: None,
     },
     // -- Any -------------------------------------------------------------------
     Binding {
@@ -341,8 +355,9 @@ pub static KEYMAP: &[Binding] = &[
         chords: &[KeyChord::Esc],
         keys_label: "Esc",
         help: "Ascend / close",
+        deferred: None,
     },
-    // -- Chain -----------------------------------------------------------------
+    // -- Chain (MoveStrike/FocusLeg wired #18; the rest resolve but defer I/O) --
     Binding {
         context: Context::Live(LiveScreen::Chain),
         action: Action::Chain(ChainAction::MoveStrike),
@@ -354,6 +369,7 @@ pub static KEYMAP: &[Binding] = &[
         ],
         keys_label: "↑↓ / kj",
         help: "Move strike",
+        deferred: None,
     },
     Binding {
         context: Context::Live(LiveScreen::Chain),
@@ -366,6 +382,7 @@ pub static KEYMAP: &[Binding] = &[
         ],
         keys_label: "←→ / hl",
         help: "Switch expiration",
+        deferred: Some("soon"),
     },
     Binding {
         context: Context::Live(LiveScreen::Chain),
@@ -373,6 +390,7 @@ pub static KEYMAP: &[Binding] = &[
         chords: &[KeyChord::Char('['), KeyChord::Char(']')],
         keys_label: "[ ]",
         help: "Prev / next underlying",
+        deferred: Some("soon"),
     },
     Binding {
         context: Context::Live(LiveScreen::Chain),
@@ -380,6 +398,7 @@ pub static KEYMAP: &[Binding] = &[
         chords: &[KeyChord::Char('c'), KeyChord::Char('p')],
         keys_label: "c / p",
         help: "Focus call / put leg",
+        deferred: None,
     },
     Binding {
         context: Context::Live(LiveScreen::Chain),
@@ -387,6 +406,7 @@ pub static KEYMAP: &[Binding] = &[
         chords: &[KeyChord::Enter],
         keys_label: "Enter",
         help: "Drill into strike",
+        deferred: Some("soon"),
     },
     Binding {
         context: Context::Live(LiveScreen::Chain),
@@ -394,22 +414,25 @@ pub static KEYMAP: &[Binding] = &[
         chords: &[KeyChord::Char('a')],
         keys_label: "a",
         help: "Add leg to builder",
+        deferred: Some("v0.2"),
     },
-    // -- Depth -----------------------------------------------------------------
+    // -- Depth (body v0.5) -----------------------------------------------------
     Binding {
         context: Context::Live(LiveScreen::Depth),
         action: Action::Depth(DepthAction::Scroll),
         chords: &[KeyChord::Up, KeyChord::Down],
         keys_label: "↑↓",
         help: "Scroll ladder",
+        deferred: Some("v0.5"),
     },
-    // -- Surface ---------------------------------------------------------------
+    // -- Surface (body v0.2) ---------------------------------------------------
     Binding {
         context: Context::Live(LiveScreen::Surface),
         action: Action::Surface(SurfaceAction::CycleGreek),
         chords: &[KeyChord::Char('g'), KeyChord::Char('G')],
         keys_label: "g / G",
         help: "Cycle Greek axis",
+        deferred: Some("v0.2"),
     },
     Binding {
         context: Context::Live(LiveScreen::Surface),
@@ -417,14 +440,16 @@ pub static KEYMAP: &[Binding] = &[
         chords: &[KeyChord::Char('x')],
         keys_label: "x",
         help: "Smile / surface",
+        deferred: Some("v0.2"),
     },
-    // -- Payoff (live) ---------------------------------------------------------
+    // -- Payoff (live, builder v0.2) -------------------------------------------
     Binding {
         context: Context::Live(LiveScreen::Payoff),
         action: Action::Payoff(PayoffAction::AddLeg),
         chords: &[KeyChord::Char('a')],
         keys_label: "a",
         help: "Add leg at cursor",
+        deferred: Some("v0.2"),
     },
     Binding {
         context: Context::Live(LiveScreen::Payoff),
@@ -432,6 +457,7 @@ pub static KEYMAP: &[Binding] = &[
         chords: &[KeyChord::Char('x')],
         keys_label: "x",
         help: "Remove cursor leg",
+        deferred: Some("v0.2"),
     },
     Binding {
         context: Context::Live(LiveScreen::Payoff),
@@ -439,6 +465,7 @@ pub static KEYMAP: &[Binding] = &[
         chords: &[KeyChord::Char('+'), KeyChord::Char('-')],
         keys_label: "+ / -",
         help: "Quantity + / -",
+        deferred: Some("v0.2"),
     },
     Binding {
         context: Context::Live(LiveScreen::Payoff),
@@ -446,6 +473,7 @@ pub static KEYMAP: &[Binding] = &[
         chords: &[KeyChord::Char('s')],
         keys_label: "s",
         help: "Toggle buy / sell",
+        deferred: Some("v0.2"),
     },
     Binding {
         context: Context::Live(LiveScreen::Payoff),
@@ -453,6 +481,7 @@ pub static KEYMAP: &[Binding] = &[
         chords: &[KeyChord::Enter],
         keys_label: "Enter",
         help: "Commit strategy",
+        deferred: Some("v0.2"),
     },
     Binding {
         context: Context::Live(LiveScreen::Payoff),
@@ -460,6 +489,7 @@ pub static KEYMAP: &[Binding] = &[
         chords: &[KeyChord::Esc],
         keys_label: "Esc",
         help: "Cancel builder",
+        deferred: Some("v0.2"),
     },
     Binding {
         context: Context::Live(LiveScreen::Payoff),
@@ -467,14 +497,16 @@ pub static KEYMAP: &[Binding] = &[
         chords: &[KeyChord::Char('t')],
         keys_label: "t",
         help: "Expiration / t+0",
+        deferred: Some("v0.2"),
     },
-    // -- Replay ----------------------------------------------------------------
+    // -- Replay (scrub wired; playback/speed/fill/end-jump defer to v0.3) ------
     Binding {
         context: Context::Replay(ReplayScreen::Replay),
         action: Action::Replay(ReplayAction::PlayPause),
         chords: &[KeyChord::Char(' ')],
         keys_label: "Space",
         help: "Play / pause",
+        deferred: Some("v0.3"),
     },
     Binding {
         context: Context::Replay(ReplayScreen::Replay),
@@ -482,6 +514,7 @@ pub static KEYMAP: &[Binding] = &[
         chords: &[KeyChord::Char('-')],
         keys_label: "-",
         help: "Speed slower",
+        deferred: Some("v0.3"),
     },
     Binding {
         context: Context::Replay(ReplayScreen::Replay),
@@ -489,6 +522,7 @@ pub static KEYMAP: &[Binding] = &[
         chords: &[KeyChord::Char('+')],
         keys_label: "+",
         help: "Speed faster",
+        deferred: Some("v0.3"),
     },
     Binding {
         context: Context::Replay(ReplayScreen::Replay),
@@ -496,6 +530,7 @@ pub static KEYMAP: &[Binding] = &[
         chords: &[KeyChord::Left, KeyChord::Char('h')],
         keys_label: "← / h",
         help: "Step back",
+        deferred: None,
     },
     Binding {
         context: Context::Replay(ReplayScreen::Replay),
@@ -503,6 +538,7 @@ pub static KEYMAP: &[Binding] = &[
         chords: &[KeyChord::Right, KeyChord::Char('l')],
         keys_label: "→ / l",
         help: "Step forward",
+        deferred: None,
     },
     Binding {
         context: Context::Replay(ReplayScreen::Replay),
@@ -510,6 +546,7 @@ pub static KEYMAP: &[Binding] = &[
         chords: &[KeyChord::Char(',')],
         keys_label: ",",
         help: "Previous fill",
+        deferred: Some("v0.3"),
     },
     Binding {
         context: Context::Replay(ReplayScreen::Replay),
@@ -517,6 +554,7 @@ pub static KEYMAP: &[Binding] = &[
         chords: &[KeyChord::Char('.')],
         keys_label: ".",
         help: "Next fill",
+        deferred: Some("v0.3"),
     },
     Binding {
         context: Context::Replay(ReplayScreen::Replay),
@@ -524,6 +562,7 @@ pub static KEYMAP: &[Binding] = &[
         chords: &[KeyChord::Home],
         keys_label: "Home",
         help: "Jump to start",
+        deferred: None,
     },
     Binding {
         context: Context::Replay(ReplayScreen::Replay),
@@ -531,6 +570,7 @@ pub static KEYMAP: &[Binding] = &[
         chords: &[KeyChord::End],
         keys_label: "End",
         help: "Jump to end",
+        deferred: Some("v0.3"),
     },
 ];
 
@@ -582,6 +622,33 @@ fn slot_from_chord(chord: KeyChord) -> Option<u8> {
         return None;
     };
     c.to_digit(10).and_then(|d| u8::try_from(d).ok())
+}
+
+/// Resolve a chord against the **chain** screen's bindings
+/// (`docs/05-views-and-ux.md` §3), or `None` when no binding matches (the
+/// dispatch then ignores the key, e.g. `Esc`, which is a [`Context::Any`] binding,
+/// not a chain one).
+///
+/// This is the read side the chain screen's `handle_key` (`src/ui/chain.rs`) uses,
+/// so the chain dispatch and the help overlay share the one map — a bound key and
+/// its documentation cannot drift (the cross-check test below proves it). The concrete
+/// direction (`↑` vs `↓`, `←` vs `→`, `[` vs `]`, `c` vs `p`) is read from the
+/// resolved chord at dispatch time, the same way [`resolve_global`] derives the
+/// screen-switch slot from the pressed digit.
+#[must_use]
+pub fn resolve_chain(chord: KeyChord) -> Option<ChainAction> {
+    let binding = KEYMAP
+        .iter()
+        .find(|b| b.context == Context::Live(LiveScreen::Chain) && b.chords.contains(&chord))?;
+    match binding.action {
+        Action::Chain(action) => Some(action),
+        Action::Global(_)
+        | Action::Depth(_)
+        | Action::Surface(_)
+        | Action::Payoff(_)
+        | Action::Replay(_)
+        | Action::Ascend => None,
+    }
 }
 
 /// Resolve a chord against a **replay** screen's bindings
@@ -681,6 +748,109 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_resolve_chain_every_chain_chord_resolves_and_is_documented() {
+        // Every chord in a chain-context binding resolves to a `ChainAction`
+        // (`ui::chain::handle_key` acts on it) AND appears in the help overlay
+        // (documented), so the chain dispatch and its documentation cannot drift.
+        let live = live_app_on(LiveScreen::Chain, ScreenLoad::Ready, false);
+        let documented = help_bindings(&live.mode);
+        for binding in KEYMAP
+            .iter()
+            .filter(|b| b.context == Context::Live(LiveScreen::Chain))
+        {
+            for &chord in binding.chords {
+                assert!(
+                    resolve_chain(chord).is_some(),
+                    "chain chord {chord:?} does not resolve",
+                );
+                assert!(
+                    documented.iter().any(|b| b.chords.contains(&chord)),
+                    "chain chord {chord:?} is dispatched but not in the overlay",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_resolve_chain_ignores_non_chain_chords() {
+        // A global chord (`q`) and the `Context::Any` `Esc` are not chain bindings,
+        // so the chain screen forwards nothing for them.
+        assert_eq!(resolve_chain(KeyChord::Char('q')), None);
+        assert_eq!(resolve_chain(KeyChord::Esc), None);
+        assert_eq!(resolve_chain(KeyChord::Char('z')), None);
+        // A chain chord resolves to its action.
+        assert_eq!(
+            resolve_chain(KeyChord::Char('j')),
+            Some(ChainAction::MoveStrike),
+        );
+        assert_eq!(
+            resolve_chain(KeyChord::Char('c')),
+            Some(ChainAction::FocusLeg)
+        );
+    }
+
+    #[test]
+    fn test_keymap_marks_deferred_chain_keys_not_the_wired_ones() {
+        // The wired chain keys (#18) carry no deferred marker; the four not-yet-wired
+        // ones do, so the overlay advertises honestly which keys are not live.
+        let deferral = |action: ChainAction| -> Option<&'static str> {
+            KEYMAP
+                .iter()
+                .find(|b| b.action == Action::Chain(action))
+                .and_then(|b| b.deferred)
+        };
+        assert_eq!(
+            deferral(ChainAction::MoveStrike),
+            None,
+            "MoveStrike is wired"
+        );
+        assert_eq!(deferral(ChainAction::FocusLeg), None, "FocusLeg is wired");
+        assert!(deferral(ChainAction::SwitchExpiry).is_some());
+        assert!(deferral(ChainAction::SwitchUnderlying).is_some());
+        assert!(deferral(ChainAction::Drill).is_some());
+        assert!(deferral(ChainAction::AddLeg).is_some());
+    }
+
+    #[test]
+    fn test_keymap_marks_deferred_replay_keys_not_the_wired_scrubs() {
+        // The wired scrub keys carry no marker; the deferred playback/speed/fill/
+        // end-jump keys do (the same cross-screen honesty pattern as chain).
+        let deferral = |action: ReplayAction| -> Option<&'static str> {
+            KEYMAP
+                .iter()
+                .find(|b| b.action == Action::Replay(action))
+                .and_then(|b| b.deferred)
+        };
+        assert_eq!(deferral(ReplayAction::StepBack), None);
+        assert_eq!(deferral(ReplayAction::StepForward), None);
+        assert_eq!(deferral(ReplayAction::JumpStart), None);
+        assert!(deferral(ReplayAction::PlayPause).is_some());
+        assert!(deferral(ReplayAction::SpeedFaster).is_some());
+        assert!(deferral(ReplayAction::PrevFill).is_some());
+        assert!(deferral(ReplayAction::JumpEnd).is_some());
+    }
+
+    #[test]
+    fn test_keymap_deferred_keys_still_resolve_and_are_documented() {
+        // Deferral marks + documents only — it never changes resolution: a deferred
+        // chain key still resolves to its action AND stays in the overlay.
+        let live = live_app_on(LiveScreen::Chain, ScreenLoad::Ready, false);
+        let documented = help_bindings(&live.mode);
+        assert_eq!(
+            resolve_chain(KeyChord::Enter),
+            Some(ChainAction::Drill),
+            "a deferred key still resolves",
+        );
+        assert!(
+            documented
+                .iter()
+                .any(|b| b.chords.contains(&KeyChord::Enter)
+                    && b.context == Context::Live(LiveScreen::Chain)),
+            "a deferred key stays documented",
+        );
     }
 
     #[test]
