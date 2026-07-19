@@ -398,6 +398,13 @@ pub enum NormalizeKind {
     UnparseableExpiry,
     /// An option style could not be resolved to call or put.
     UnknownStyle,
+    /// A discovery/response ceiling was reached with more data still pending, so
+    /// a COMPLETE chain cannot be proven — a bounded-memory guard hit its limit
+    /// while the venue still had a next-page token or an omitted contract. Names
+    /// the cap via a compile-time `&'static str` (e.g. a page or contract cap),
+    /// never a value or the venue payload. Reaching a cap with data outstanding is
+    /// an honest failure, never a silently truncated chain returned as complete.
+    LimitExceeded(&'static str),
 }
 
 impl fmt::Display for NormalizeKind {
@@ -408,6 +415,7 @@ impl fmt::Display for NormalizeKind {
             Self::NonFinite(field) => write!(f, "non-finite field `{field}`"),
             Self::UnparseableExpiry => f.write_str("unparseable expiry"),
             Self::UnknownStyle => f.write_str("unknown option style"),
+            Self::LimitExceeded(cap) => write!(f, "limit exceeded: {cap}"),
         }
     }
 }
@@ -479,6 +487,19 @@ mod tests {
             kind: NormalizeKind::OutOfRange("delta"),
         };
         assert_eq!(err.to_string(), "normalize: out-of-range field `delta`");
+    }
+
+    #[test]
+    fn test_normalize_kind_limit_exceeded_display_names_cap_not_value() {
+        // The cap name rides along (a compile-time `&'static str`); no venue value
+        // or payload can occupy the slot.
+        let kind = NormalizeKind::LimitExceeded("discovery page cap");
+        assert_eq!(kind.to_string(), "limit exceeded: discovery page cap");
+        let err = ProviderError::Normalize { kind };
+        assert_eq!(
+            err.to_string(),
+            "normalize: limit exceeded: discovery page cap"
+        );
     }
 
     #[test]

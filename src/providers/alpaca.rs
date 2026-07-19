@@ -68,30 +68,43 @@
 //! as venue-supplied (not locally computed). ChainView never hand-rolls
 //! Black-Scholes for Alpaca (`greeks: Provided`).
 //!
-//! # Streaming: underlying only, over a ChainView-owned bounded bridge
+//! # Streaming: connection lifecycle + backfill only (no surfaced underlying)
 //!
 //! Alpaca's WebSocket carries **no** option-contract stream — only underlying
 //! Trade/Quote/Bar — so [`capabilities`](Provider::capabilities) declares
-//! `option_stream: None`, `underlying_stream: true`, `chain_poll: Poll`. The chain
-//! is **always polled**; the WS overlays the spot ticker only. The upstream
-//! `MarketDataStream` is drained into the ChainView-owned **bounded** two-class
-//! [`MarketUpdateSink`] (never handed raw to the app), and the adapter re-runs
-//! `subscribe_market_data` on reconnect (`docs/03-data-providers.md` §5). On an
-//! upstream `Lagged` signal the adapter **re-syncs** by re-polling the chain rather
-//! than rendering a torn view. Because `MarketUpdate` has no underlying-spot
-//! variant, the underlying quote is delivered as a [`QuoteUpdate`] for a spot
-//! pseudo-instrument (the underlying ticker, a spot-sentinel strike); folding it
-//! into `underlying_price` is the app/store seam's concern.
+//! `option_stream: None`, `chain_poll: Poll`, and (honestly)
+//! `underlying_stream: false`: ChainView has **no** closed-set
+//! `MarketUpdate::UnderlyingQuote` variant to fold a spot into
+//! `OptionChain::underlying_price`, so the adapter does **not** fabricate a spot
+//! pseudo-quote. The underlying Trade/Quote/Bar events are drained for connection
+//! liveness only and dropped, never turned into a domain update. The chain is
+//! **always polled**; the WS subscription exists so the adapter observes the
+//! connection lifecycle and re-polls (the backfill) to reconcile drift. The
+//! underlying-stream capability **returns to `true`** — with the already-plumbed
+//! subscription surfacing spot — only once a real
+//! `MarketUpdate::UnderlyingQuote` closed-set variant lands and the store folds
+//! `underlying_price` by that marker (the compile-fenced future extension; NEVER by
+//! a strike sentinel).
+//!
+//! The upstream `MarketDataStream` is drained into the ChainView-owned **bounded**
+//! two-class [`MarketUpdateSink`] (never handed raw to the app), and the adapter
+//! re-runs `subscribe_market_data` on reconnect (`docs/03-data-providers.md` §5).
+//! On an upstream `Lagged` signal the adapter **re-syncs** by re-polling the chain
+//! rather than rendering a torn view.
 //!
 //! # Reconnect + two update classes (`docs/03-data-providers.md` §5, [ADR-0009])
 //!
 //! The reconnect/resubscribe loop is **ChainView's**, driven behind the
 //! [`SubscriptionHandle`]; on a dropped stream it emits `Health(Reconnecting)`,
 //! backs off with jittered exponential backoff, re-polls the chain to reconcile
-//! drift (the backfill), re-emits the venue overlays, and re-subscribes the
-//! underlying. Every [`MarketUpdate`] is handed to the two-class
-//! [`MarketUpdateSink`], which routes `Chain`/`Health` to the control channel and
-//! coalesces `Quote`/`Greeks`.
+//! drift (the backfill), re-emits the venue overlays, and re-subscribes. The
+//! upstream client's own connection-lifecycle events are surfaced honestly too:
+//! its `Reconnecting`/`Disconnected` signals map to `Health(Reconnecting)`, and a
+//! completed `Reconnected` triggers the SAME re-poll/backfill used after a lag (a
+//! fresh `Chain` snapshot through the control class) so the store never keeps
+//! showing the provider LIVE across a silent upstream reconnect. Every
+//! [`MarketUpdate`] is handed to the two-class [`MarketUpdateSink`], which routes
+//! `Chain`/`Health` to the control channel and coalesces `Quote`/`Greeks`.
 //!
 //! [ADR-0009]: https://github.com/joaquinbejar/ChainView/blob/main/docs/adr/0009-provider-sink-two-class-routing.md
 
@@ -110,11 +123,11 @@ use alpaca_http::{
     AlpacaError, AlpacaHttpClient, Credentials, Environment, OptionContractParams, OptionType,
 };
 use alpaca_websocket::messages::SubscribeMessage;
-use alpaca_websocket::{AlpacaWebSocketClient, DataFeed, MarketDataEvent, MarketDataUpdate};
+use alpaca_websocket::{AlpacaWebSocketClient, DataFeed, MarketDataEvent};
 
 use super::{
     AuthKind, ChainCapability, ChainPollCapability, GreeksCapability, MarketUpdateSink,
-    OptionStreamCapability, Provider, ProviderCapabilities, SinkSend, SubscriptionHandle,
+    OptionStreamCapability, Provider, ProviderCapabilities, SendState, SubscriptionHandle,
     SubscriptionRequest, UnderlyingRef,
 };
 use crate::chain::{
@@ -164,6 +177,16 @@ const MAX_DISCOVERY_PAGES: usize = 64;
 /// single US-equity expiry is a few hundred contracts; this ceiling is a safety
 /// valve, never a normal limit.
 const MAX_CONTRACTS: usize = 8_192;
+
+/// The cap name carried by the typed limit error when discovery exhausts
+/// [`MAX_DISCOVERY_PAGES`] with a next-page token still pending (a compile-time
+/// `&'static str`, never a value).
+const DISCOVERY_PAGE_CAP: &str = "alpaca discovery page cap";
+
+/// The cap name carried by the typed limit error when discovery fills
+/// [`MAX_CONTRACTS`] with a contract still remaining (a compile-time `&'static
+/// str`, never a value).
+const DISCOVERY_CONTRACT_CAP: &str = "alpaca discovery contract cap";
 
 /// The upstream WebSocket connect retry budget handed to
 /// [`connect_with_reconnect`](alpaca_websocket::AlpacaWebSocketClient::connect_with_reconnect).
@@ -380,12 +403,20 @@ fn alpaca_provider_id() -> ProviderId {
 /// Alpaca's honest capability self-declaration — the `docs/03-data-providers.md`
 /// §8 row: a native REST chain (composed + completeness-provable), **no** option
 /// depth (crypto order books only, outside the v1 option product), venue-provided
-/// Greeks, **no** option-contract stream, an underlying stream, REST chain polling,
-/// no trades tape, and `KeySecret` auth.
+/// Greeks, **no** option-contract stream, **no surfaced underlying stream**, REST
+/// chain polling, no trades tape, and `KeySecret` auth.
 ///
-/// The `option_stream: None` + `underlying_stream: true` + `chain_poll: Poll` split
+/// The `option_stream: None` + `underlying_stream: false` + `chain_poll: Poll` split
 /// is the whole point of the three-dimensional streaming model: it makes it
 /// **impossible** to mis-badge Alpaca's polled option chain as a real-time stream.
+///
+/// `underlying_stream` is **`false`** even though Alpaca's WebSocket *does* carry
+/// the underlying: ChainView has no closed-set `MarketUpdate::UnderlyingQuote`
+/// variant to fold a spot into `OptionChain::underlying_price`, so the adapter
+/// declines to surface (and never fabricates) a spot pseudo-quote. The cell flips
+/// back to `true` when that variant lands and the store folds `underlying_price` by
+/// an explicit marker — the compile-fenced future extension (the plumbing already
+/// subscribes the underlying for connection liveness).
 #[must_use]
 pub(crate) fn alpaca_capabilities() -> ProviderCapabilities {
     ProviderCapabilities::builder()
@@ -393,7 +424,7 @@ pub(crate) fn alpaca_capabilities() -> ProviderCapabilities {
         .depth(false)
         .greeks(GreeksCapability::Provided)
         .option_stream(OptionStreamCapability::None)
-        .underlying_stream(true)
+        .underlying_stream(false)
         .chain_poll(ChainPollCapability::Poll {
             interval_hint_secs: REFRESH_HINT_SECS,
         })
@@ -993,7 +1024,21 @@ async fn compose_chain<S: ChainDataSource + ?Sized>(
 
 /// Loop `next_page_token` until it is absent (discovery provably exhausted),
 /// accumulating contracts filtered to the requested expiry. Bounded by
-/// [`MAX_DISCOVERY_PAGES`] pages and [`MAX_CONTRACTS`] contracts (runaway guards).
+/// [`MAX_DISCOVERY_PAGES`] pages and [`MAX_CONTRACTS`] contracts.
+///
+/// The caps stay (they bound memory), but reaching one while more data is pending
+/// is an **honest failure**, not a silent partial: a next-page token still present
+/// at the page cap, or a contract still remaining at the contract cap, returns a
+/// typed [`ProviderError::Normalize`] with
+/// [`NormalizeKind::LimitExceeded`](crate::error::NormalizeKind::LimitExceeded)
+/// naming the cap — so a trader can distinguish a truncated response from a
+/// complete venue answer, never a fabricated "complete" chain.
+///
+/// # Errors
+///
+/// [`NormalizeKind::LimitExceeded`](crate::error::NormalizeKind::LimitExceeded)
+/// ([`DISCOVERY_CONTRACT_CAP`] / [`DISCOVERY_PAGE_CAP`]) when a ceiling is reached
+/// with more data pending; a transport failure propagates from `discover_page`.
 async fn discover_contracts<S: ChainDataSource + ?Sized>(
     source: &S,
     underlying: &str,
@@ -1007,18 +1052,32 @@ async fn discover_contracts<S: ChainDataSource + ?Sized>(
             .await?;
         for contract in page.contracts {
             // Belt-and-suspenders: keep only the requested expiry (the API already
-            // filters), and stop accumulating at the bounded ceiling.
-            if contract.expiration_date == expiration_date && all.len() < MAX_CONTRACTS {
-                all.push(contract);
+            // filters).
+            if contract.expiration_date != expiration_date {
+                continue;
             }
+            // The contract ceiling is full but the venue still has a contract for
+            // us: the response would truncate, so fail honestly rather than return
+            // a partial chain as complete.
+            if all.len() >= MAX_CONTRACTS {
+                return Err(ProviderError::Normalize {
+                    kind: NormalizeKind::LimitExceeded(DISCOVERY_CONTRACT_CAP),
+                });
+            }
+            all.push(contract);
         }
         match page.next_page_token {
             Some(token) if !token.is_empty() => page_token = Some(token),
-            // No further pages (or an empty token) -> discovery is exhausted.
-            _ => break,
+            // No further pages (or an empty token) -> discovery is provably
+            // exhausted, so the accumulated set is the complete venue answer.
+            _ => return Ok(all),
         }
     }
-    Ok(all)
+    // Walked every allowed page and a next-page token still remains: more pages are
+    // pending beyond the ceiling, so the response cannot be proven complete.
+    Err(ProviderError::Normalize {
+        kind: NormalizeKind::LimitExceeded(DISCOVERY_PAGE_CAP),
+    })
 }
 
 /// Hydrate every discovered OCC symbol into snapshots, chunked into
@@ -1201,26 +1260,25 @@ struct TransportGone;
 /// `MarketDataEvent` is mapped onto this inside [`LiveTransport`] and never escapes.
 #[derive(Debug, Clone)]
 enum RawStreamEvent {
-    /// An underlying quote: `bid`/`ask` prices, `bid_size`/`ask_size`, and a venue
-    /// timestamp.
-    UnderlyingQuote {
-        symbol: String,
-        bid: f64,
-        ask: f64,
-        bid_size: u64,
-        ask_size: u64,
-        time: DateTime<Utc>,
-    },
-    /// An underlying trade — carries a `last` price and a venue timestamp.
-    UnderlyingTrade {
-        symbol: String,
-        price: f64,
-        time: DateTime<Utc>,
-    },
     /// The consumer fell behind and the upstream dropped `missed` updates — the
     /// signal to re-sync (re-poll) per the bounded-bridge lag policy.
     Lagged,
-    /// A bar or lifecycle event the adapter does not overlay — ignored.
+    /// The upstream socket dropped and the client's own reconnect is in progress
+    /// (with the upstream attempt count); the socket is still alive. Surfaced as
+    /// `Health(Reconnecting)` without tearing down the ChainView loop.
+    Reconnecting {
+        /// The upstream's own reconnect attempt count (1-based).
+        attempt: u32,
+    },
+    /// The upstream re-established the connection and re-issued the subscription —
+    /// the trigger to re-poll (the backfill) so the store reconciles drift.
+    Reconnected,
+    /// The upstream connection is permanently down (retries exhausted); the last
+    /// event before the stream ends. ChainView's outer reconnect loop takes over.
+    Disconnected,
+    /// A data or bar event the adapter does not surface — the underlying
+    /// Trade/Quote/Bar drained for connection liveness only (`underlying_stream` is
+    /// false), never turned into a domain update.
     Ignored,
 }
 
@@ -1319,31 +1377,19 @@ impl AlpacaTransport for LiveTransport {
 }
 
 /// Map a raw Alpaca `MarketDataEvent` onto the neutral [`RawStreamEvent`] — the one
-/// place a raw upstream event is touched (it never escapes [`LiveTransport`]).
+/// place a raw upstream event is touched (it never escapes [`LiveTransport`]). The
+/// connection-lifecycle events are surfaced (they drive the health + backfill), and
+/// the underlying Trade/Quote/Bar updates are collapsed to
+/// [`Ignored`](RawStreamEvent::Ignored): they are received for liveness only and
+/// never turned into a domain update (`underlying_stream` is false), so no spot
+/// pseudo-quote is fabricated.
 fn map_stream_event(event: MarketDataEvent) -> RawStreamEvent {
     match event {
-        MarketDataEvent::Update(MarketDataUpdate::Quote { symbol, quote }) => {
-            RawStreamEvent::UnderlyingQuote {
-                symbol,
-                bid: quote.bid_price,
-                ask: quote.ask_price,
-                bid_size: u64::from(quote.bid_size),
-                ask_size: u64::from(quote.ask_size),
-                time: quote.timestamp,
-            }
-        }
-        MarketDataEvent::Update(MarketDataUpdate::Trade { symbol, trade }) => {
-            RawStreamEvent::UnderlyingTrade {
-                symbol,
-                price: trade.price,
-                time: trade.timestamp,
-            }
-        }
         MarketDataEvent::Lagged { .. } => RawStreamEvent::Lagged,
-        MarketDataEvent::Update(MarketDataUpdate::Bar { .. })
-        | MarketDataEvent::Reconnecting { .. }
-        | MarketDataEvent::Reconnected
-        | MarketDataEvent::Disconnected { .. } => RawStreamEvent::Ignored,
+        MarketDataEvent::Reconnecting { attempt, .. } => RawStreamEvent::Reconnecting { attempt },
+        MarketDataEvent::Reconnected => RawStreamEvent::Reconnected,
+        MarketDataEvent::Disconnected { .. } => RawStreamEvent::Disconnected,
+        MarketDataEvent::Update(_) => RawStreamEvent::Ignored,
     }
 }
 
@@ -1359,53 +1405,12 @@ enum StreamExit {
     Shutdown,
 }
 
-/// The spot pseudo-instrument for the underlying ticker. Because `MarketUpdate` has
-/// no underlying-spot variant, the streamed underlying quote is delivered as a
-/// [`QuoteUpdate`] for this instrument (native symbol = the underlying ticker, a
-/// spot-sentinel [`Positive::ONE`] strike, `Call` style). Folding it into
-/// `underlying_price` is the app/store seam's concern; keying it here gives the
-/// coalescing bridge one stable per-instrument slot.
-///
-/// **COLLISION HAZARD (binding on the #46 fold):** `Positive::ONE` is NOT
-/// provably disjoint from a real strike — a sub-$5 underlying can list a
-/// genuine $1.00 call whose `InstrumentKey` EQUALS this pseudo-instrument's.
-/// Today that is harmless only because the update buffers as pending and
-/// TTL-expires (no chain row matches on liquid underlyings, and the adapter is
-/// gated). The #46 store fold MUST route the underlying spot by an explicit
-/// marker (or a new closed-set `MarketUpdate::UnderlyingQuote` variant), and
-/// must NEVER fold a spot update into a chain row by strike match — folding by
-/// this key would write the underlying's bid/ask onto a real $1 call row.
-fn spot_instrument(
-    underlying: &str,
-    expiration_utc: DateTime<Utc>,
-    provider: &ProviderId,
-) -> Instrument {
-    Instrument {
-        key: InstrumentKey {
-            underlying: underlying.to_ascii_uppercase(),
-            expiration_utc,
-            strike: Positive::ONE,
-            style: OptionStyle::Call,
-        },
-        provider: provider.clone(),
-        native_symbol: underlying.to_ascii_uppercase(),
-        stream_symbol: None,
-        spec: ContractSpecFingerprint {
-            contract_multiplier: 1,
-            settlement: SettlementStyle::Physical,
-            exercise: ExerciseStyle::American,
-            quote_currency: QUOTE_CURRENCY.to_owned(),
-            venue_product_code: underlying.to_ascii_uppercase(),
-        },
-    }
-}
-
 /// The adapter-owned reconnect/resubscribe loop (`docs/03-data-providers.md` §5).
-/// Connect + subscribe the underlying, re-poll the composed chain (backfill + venue
-/// overlays), drain underlying quotes; on a drop emit `Health(Reconnecting{attempt})`,
-/// back off with jitter, and reconnect (which re-polls and resubscribes).
-/// Cancellation is observed at every `.await`, so the loop never opens a stream after
-/// cancellation and never hot-loops.
+/// Connect + subscribe the underlying (for connection liveness), re-poll the
+/// composed chain (backfill + venue overlays), drain the stream; on a drop emit
+/// `Health(Reconnecting{attempt})`, back off with jitter, and reconnect (which
+/// re-polls and resubscribes). Cancellation is observed at every `.await`, so the
+/// loop never opens a stream after cancellation and never hot-loops.
 async fn run_reconnect_loop<T: AlpacaTransport>(
     mut transport: T,
     id: ProviderId,
@@ -1414,7 +1419,6 @@ async fn run_reconnect_loop<T: AlpacaTransport>(
     mut sink: MarketUpdateSink,
     cancel: CancellationToken,
 ) {
-    let spot = spot_instrument(&underlying, expiration_utc, &id);
     let mut attempt: u32 = 0;
     loop {
         if cancel.is_cancelled() || sink.is_closed() {
@@ -1423,7 +1427,7 @@ async fn run_reconnect_loop<T: AlpacaTransport>(
         let exit = tokio::select! {
             biased;
             () = cancel.cancelled() => return,
-            exit = connect_stream_once(&mut transport, &id, &underlying, expiration_utc, &spot, &mut sink, &cancel, &mut attempt) => exit,
+            exit = connect_stream_once(&mut transport, &id, &underlying, expiration_utc, &mut sink, &cancel, &mut attempt) => exit,
         };
         if matches!(exit, StreamExit::Shutdown) || cancel.is_cancelled() {
             return;
@@ -1436,7 +1440,7 @@ async fn run_reconnect_loop<T: AlpacaTransport>(
             () = cancel.cancelled() => return,
             outcome = sink.send(health) => outcome,
         };
-        if health_sent == SinkSend::Closed {
+        if health_sent == SendState::Closed {
             return;
         }
         let delay = backoff_delay(attempt, sample_jitter());
@@ -1448,17 +1452,24 @@ async fn run_reconnect_loop<T: AlpacaTransport>(
     }
 }
 
-/// One connection attempt: connect + subscribe the underlying, emit the composed
-/// backfill (Chain + venue overlays), then drain underlying quotes until the stream
+/// One connection attempt: connect + subscribe the underlying (for liveness), emit
+/// the composed backfill (Chain + venue overlays), then drain the stream until it
 /// drops or the subscription is cancelled. `attempt` resets to 0 on a successful
 /// (re)connect.
-#[allow(clippy::too_many_arguments)]
+///
+/// The underlying Trade/Quote/Bar updates arrive as
+/// [`Ignored`](RawStreamEvent::Ignored) and are dropped (no spot pseudo-quote). The
+/// connection-lifecycle events are surfaced honestly: an upstream
+/// [`Reconnecting`](RawStreamEvent::Reconnecting) or
+/// [`Disconnected`](RawStreamEvent::Disconnected) emits `Health(Reconnecting)`, and
+/// a completed [`Reconnected`](RawStreamEvent::Reconnected) — like a
+/// [`Lagged`](RawStreamEvent::Lagged) re-sync — re-polls the chain (the backfill) so
+/// the store never keeps rendering LIVE across a silent upstream reconnect.
 async fn connect_stream_once<T: AlpacaTransport>(
     transport: &mut T,
     id: &ProviderId,
     underlying: &str,
     expiration_utc: DateTime<Utc>,
-    spot: &Instrument,
     sink: &mut MarketUpdateSink,
     cancel: &CancellationToken,
     attempt: &mut u32,
@@ -1473,14 +1484,12 @@ async fn connect_stream_once<T: AlpacaTransport>(
     }
 
     *attempt = 0;
-    let live = MarketUpdate::Health(id.clone(), StreamHealth::Live);
-    if sink.send(live).await == SinkSend::Closed {
-        return StreamExit::Shutdown;
-    }
-
-    // Backfill = CURRENT STATE: re-poll the chain and emit the Chain snapshot plus
-    // the venue Quote/Greeks overlays (so venue Greeks reach the sidecar, #24/#25).
-    if backfill(transport, underlying, expiration_utc, sink, cancel).await == SinkSend::Closed {
+    // The (re)connect is live: emit Health(Live) then the CURRENT-STATE backfill
+    // (Chain snapshot + venue Quote/Greeks overlays, so venue Greeks reach the
+    // sidecar, #24/#25).
+    if go_live_and_backfill(transport, id, underlying, expiration_utc, sink, cancel).await
+        == SendState::Closed
+    {
         return StreamExit::Shutdown;
     }
 
@@ -1494,25 +1503,81 @@ async fn connect_stream_once<T: AlpacaTransport>(
             Ok(event) => event,
             Err(_) => return StreamExit::Reconnect,
         };
-        // A lag signal re-syncs by re-polling (the bounded-bridge lag policy), never
-        // renders a torn view.
-        if matches!(event, RawStreamEvent::Lagged) {
-            if backfill(transport, underlying, expiration_utc, sink, cancel).await
-                == SinkSend::Closed
-            {
-                return StreamExit::Shutdown;
+        let step = match event {
+            // A lag re-syncs by re-polling (the bounded-bridge lag policy), never
+            // renders a torn view.
+            RawStreamEvent::Lagged => {
+                backfill(transport, underlying, expiration_utc, sink, cancel).await
             }
-            continue;
-        }
-        if route_underlying_event(&event, spot, sink).await == SinkSend::Closed {
+            // The upstream client is reconnecting internally (socket still alive):
+            // surface the transition honestly, keep the ChainView loop up.
+            RawStreamEvent::Reconnecting {
+                attempt: upstream_attempt,
+            } => emit_reconnecting(id, upstream_attempt, sink, cancel).await,
+            // A completed upstream reconnect: back to Live, then re-poll (backfill)
+            // so the store reconciles any drift during the outage.
+            RawStreamEvent::Reconnected => {
+                go_live_and_backfill(transport, id, underlying, expiration_utc, sink, cancel).await
+            }
+            // Permanently down (retries exhausted); the last event before the stream
+            // ends. Surface the reconnect, then let the outer loop take over on the
+            // stream end.
+            RawStreamEvent::Disconnected => {
+                emit_reconnecting(id, (*attempt).saturating_add(1), sink, cancel).await
+            }
+            // Underlying Trade/Quote/Bar: liveness only, never emitted.
+            RawStreamEvent::Ignored => SendState::Open,
+        };
+        if step == SendState::Closed {
             return StreamExit::Shutdown;
         }
     }
 }
 
+/// Emit the Live health then the re-polled backfill (Chain + venue overlays) — the
+/// shared "(re)connect established" step used on the initial connect and on a
+/// completed upstream reconnect. Cancellation short-circuits (returns
+/// [`SendState::Open`] so the caller's next `.await` observes the cancel);
+/// [`SendState::Closed`] once the consumer is gone.
+async fn go_live_and_backfill<T: AlpacaTransport>(
+    transport: &mut T,
+    id: &ProviderId,
+    underlying: &str,
+    expiration_utc: DateTime<Utc>,
+    sink: &mut MarketUpdateSink,
+    cancel: &CancellationToken,
+) -> SendState {
+    let live = MarketUpdate::Health(id.clone(), StreamHealth::Live);
+    let sent = tokio::select! {
+        biased;
+        () = cancel.cancelled() => return SendState::Open,
+        outcome = sink.send(live) => outcome,
+    };
+    if sent == SendState::Closed {
+        return SendState::Closed;
+    }
+    backfill(transport, underlying, expiration_utc, sink, cancel).await
+}
+
+/// Emit a `Health(Reconnecting{attempt})` control-class transition, racing the send
+/// against the cancel token so a full channel cannot defer cancellation.
+async fn emit_reconnecting(
+    id: &ProviderId,
+    attempt: u32,
+    sink: &mut MarketUpdateSink,
+    cancel: &CancellationToken,
+) -> SendState {
+    let health = MarketUpdate::Health(id.clone(), StreamHealth::Reconnecting { attempt });
+    tokio::select! {
+        biased;
+        () = cancel.cancelled() => SendState::Open,
+        outcome = sink.send(health) => outcome,
+    }
+}
+
 /// Re-poll the composed chain and emit the reconciled structure as a control-class
 /// `Chain` plus the per-leg venue `Quote`/`Greeks` overlays. Cancellation
-/// short-circuits; a failed poll keeps prior. Returns [`SinkSend::Closed`] once the
+/// short-circuits; a failed poll keeps prior. Returns [`SendState::Closed`] once the
 /// consumer is gone.
 async fn backfill<T: AlpacaTransport>(
     transport: &mut T,
@@ -1520,37 +1585,37 @@ async fn backfill<T: AlpacaTransport>(
     expiration_utc: DateTime<Utc>,
     sink: &mut MarketUpdateSink,
     cancel: &CancellationToken,
-) -> SinkSend {
+) -> SendState {
     let expiration = ExpirationDate::DateTime(expiration_utc);
     let composed = tokio::select! {
         biased;
-        () = cancel.cancelled() => return SinkSend::Delivered,
+        () = cancel.cancelled() => return SendState::Open,
         result = transport.poll(underlying, &expiration, now_utc()) => result,
     };
     let Some(composed) = composed else {
-        return SinkSend::Delivered;
+        return SendState::Open;
     };
 
     let snapshot = MarketUpdate::Chain(chain_snapshot(&composed.fetch, now_utc()));
     let snapshot_sent = tokio::select! {
         biased;
-        () = cancel.cancelled() => return SinkSend::Delivered,
+        () = cancel.cancelled() => return SendState::Open,
         outcome = sink.send(snapshot) => outcome,
     };
-    if snapshot_sent == SinkSend::Closed {
-        return SinkSend::Closed;
+    if snapshot_sent == SendState::Closed {
+        return SendState::Closed;
     }
     for overlay in composed.overlays {
         let sent = tokio::select! {
             biased;
-            () = cancel.cancelled() => return SinkSend::Delivered,
+            () = cancel.cancelled() => return SendState::Open,
             outcome = sink.send(overlay) => outcome,
         };
-        if sent == SinkSend::Closed {
-            return SinkSend::Closed;
+        if sent == SendState::Closed {
+            return SendState::Closed;
         }
     }
-    SinkSend::Delivered
+    SendState::Open
 }
 
 /// Assemble a streaming-current [`ChainSnapshot`] from a re-polled [`ChainFetch`] —
@@ -1569,66 +1634,6 @@ fn chain_snapshot(fetch: &ChainFetch, last_poll: DateTime<Utc>) -> ChainSnapshot
         source: ChainSource::Merged,
         health: StreamHealth::Live,
         last_full_poll: Some(last_poll),
-    }
-}
-
-/// Route one underlying stream event onto the spot pseudo-instrument's
-/// [`QuoteUpdate`]. An event whose symbol is not this underlying is a **benign drop**
-/// (the unknown-symbol guard). A crossed quote drops the update (keep prior).
-async fn route_underlying_event(
-    event: &RawStreamEvent,
-    spot: &Instrument,
-    sink: &mut MarketUpdateSink,
-) -> SinkSend {
-    let received = now_utc();
-    match event {
-        RawStreamEvent::UnderlyingQuote {
-            symbol,
-            bid,
-            ask,
-            bid_size,
-            ask_size,
-            time,
-        } => {
-            if !symbol.eq_ignore_ascii_case(&spot.native_symbol) {
-                return SinkSend::Delivered; // unknown-symbol guard
-            }
-            let Ok(quote) = normalize_quote(Some(*bid), Some(*ask)) else {
-                return SinkSend::Delivered; // crossed -> keep prior
-            };
-            let update = QuoteUpdate {
-                instrument: spot.clone(),
-                bid: quote.bid,
-                ask: quote.ask,
-                last: None,
-                bid_size: size_to_positive(*bid_size),
-                ask_size: size_to_positive(*ask_size),
-                event_time: Some(*time),
-                received_time: received,
-            };
-            sink.send(MarketUpdate::Quote(update)).await
-        }
-        RawStreamEvent::UnderlyingTrade {
-            symbol,
-            price,
-            time,
-        } => {
-            if !symbol.eq_ignore_ascii_case(&spot.native_symbol) {
-                return SinkSend::Delivered;
-            }
-            let update = QuoteUpdate {
-                instrument: spot.clone(),
-                bid: None,
-                ask: None,
-                last: positive_or_drop(*price),
-                bid_size: None,
-                ask_size: None,
-                event_time: Some(*time),
-                received_time: received,
-            };
-            sink.send(MarketUpdate::Quote(update)).await
-        }
-        RawStreamEvent::Lagged | RawStreamEvent::Ignored => SinkSend::Delivered,
     }
 }
 
@@ -1937,10 +1942,14 @@ mod tests {
             "option depth is crypto-only, out of the v1 product"
         );
         assert_eq!(caps.greeks, GreeksCapability::Provided);
-        // The whole point of the three-dimensional split: no option stream, but an
-        // underlying stream and a polled chain.
+        // The whole point of the three-dimensional split: no option stream, and NO
+        // surfaced underlying stream (no MarketUpdate::UnderlyingQuote variant to fold
+        // a spot yet, so no fabricated pseudo-quote), with a polled chain.
         assert_eq!(caps.option_stream, OptionStreamCapability::None);
-        assert!(caps.underlying_stream);
+        assert!(
+            !caps.underlying_stream,
+            "no underlying stream is surfaced until a real UnderlyingQuote variant lands"
+        );
         assert_eq!(
             caps.chain_poll,
             ChainPollCapability::Poll {
@@ -2376,141 +2385,211 @@ mod tests {
         assert_eq!(iv, Some(pos(0.2841)), "venue IV survives as-is, no /100");
     }
 
-    // === Underlying stream: bounded-bridge burst coalescing ===================
+    // === Discovery ceilings: a cap with pending data is a typed error =========
 
-    #[tokio::test]
-    async fn test_underlying_burst_coalesces_last_value_wins_per_instrument() {
-        // A cap-1 coalesced channel, never drained beyond the first: a burst of
-        // underlying quotes for one spot instrument coalesces last-value-wins without
-        // unbounded growth (the Alpaca unbounded upstream path specifically).
-        let spot = spot_instrument(
-            "SPY",
-            utc_rfc3339("2026-03-20T20:00:00+00:00"),
+    /// A synthetic discovered contract for the requested `expiration_date`, so the
+    /// belt-and-suspenders expiry filter keeps it. Distinct strike per index.
+    fn synth_contract(index: usize, expiration_date: &str) -> RawContract {
+        RawContract {
+            symbol: format!("SPY{index}"),
+            underlying: "SPY".to_owned(),
+            expiration_date: expiration_date.to_owned(),
+            strike_price: format!("{}", index + 1),
+            style: if index.is_multiple_of(2) {
+                OptionStyle::Call
+            } else {
+                OptionStyle::Put
+            },
+            exercise: ExerciseStyle::American,
+            root_symbol: "SPY".to_owned(),
+            size: Some("100".to_owned()),
+            open_interest: None,
+        }
+    }
+
+    #[test]
+    fn test_discover_page_cap_reached_with_pending_is_limit_error() {
+        // A source that NEVER exhausts its next-page token: discovery walks every
+        // allowed page and a token still remains -> a typed LimitExceeded error
+        // naming the page cap, never a silently truncated chain.
+        struct NeverExhausts;
+        #[async_trait]
+        impl ChainDataSource for NeverExhausts {
+            async fn discover_page(
+                &self,
+                _underlying: &str,
+                expiration_date: &str,
+                _page_token: Option<String>,
+            ) -> Result<ContractPage, ProviderError> {
+                Ok(ContractPage {
+                    contracts: vec![synth_contract(0, expiration_date)],
+                    next_page_token: Some("more".to_owned()),
+                })
+            }
+            async fn hydrate_batch(
+                &self,
+                _symbols: &[String],
+            ) -> Result<HashMap<String, RawSnapshot>, ProviderError> {
+                Ok(HashMap::new())
+            }
+        }
+        let received = utc_rfc3339("2026-03-19T15:00:00+00:00");
+        match block(compose_chain(
+            &NeverExhausts,
+            "spy",
+            &expiry(),
             &pid("alpaca"),
-        );
-        let (tx_control, _rx_control) = mpsc::channel::<MarketUpdate>(8);
-        let (tx_coalesced, mut rx_coalesced) = mpsc::channel::<MarketUpdate>(1);
-        let mut sink = MarketUpdateSink::new(tx_control, tx_coalesced);
+            received,
+        )) {
+            Err(ProviderError::Normalize {
+                kind: NormalizeKind::LimitExceeded(cap),
+            }) => assert!(cap.contains("page"), "names the page cap, got `{cap}`"),
+            other => panic!("expected a LimitExceeded page-cap error, got {other:?}"),
+        }
+    }
 
-        for round in 0..500u32 {
-            let bid = 100.0 + f64::from(round) * 0.01;
-            let event = RawStreamEvent::UnderlyingQuote {
-                symbol: "SPY".to_owned(),
-                bid,
-                ask: bid + 0.02,
-                bid_size: 3,
-                ask_size: 4,
-                time: utc_rfc3339("2026-03-20T15:00:00+00:00"),
+    #[test]
+    fn test_discover_contract_cap_reached_with_pending_is_limit_error() {
+        // A single page carrying one MORE than the contract ceiling: discovery fills
+        // MAX_CONTRACTS and a contract still remains -> a typed LimitExceeded error
+        // naming the contract cap.
+        struct OverCap;
+        #[async_trait]
+        impl ChainDataSource for OverCap {
+            async fn discover_page(
+                &self,
+                _underlying: &str,
+                expiration_date: &str,
+                _page_token: Option<String>,
+            ) -> Result<ContractPage, ProviderError> {
+                let contracts = (0..=MAX_CONTRACTS)
+                    .map(|index| synth_contract(index, expiration_date))
+                    .collect();
+                Ok(ContractPage {
+                    contracts,
+                    next_page_token: None,
+                })
+            }
+            async fn hydrate_batch(
+                &self,
+                _symbols: &[String],
+            ) -> Result<HashMap<String, RawSnapshot>, ProviderError> {
+                Ok(HashMap::new())
+            }
+        }
+        let received = utc_rfc3339("2026-03-19T15:00:00+00:00");
+        match block(compose_chain(
+            &OverCap,
+            "spy",
+            &expiry(),
+            &pid("alpaca"),
+            received,
+        )) {
+            Err(ProviderError::Normalize {
+                kind: NormalizeKind::LimitExceeded(cap),
+            }) => assert!(
+                cap.contains("contract"),
+                "names the contract cap, got `{cap}`"
+            ),
+            other => panic!("expected a LimitExceeded contract-cap error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_discover_exactly_at_contract_cap_is_ok() {
+        // EXACTLY MAX_CONTRACTS contracts with no next page is a COMPLETE answer, not
+        // a truncation: it must succeed (the cap is a ceiling, not an off-by-one).
+        struct AtCap;
+        #[async_trait]
+        impl ChainDataSource for AtCap {
+            async fn discover_page(
+                &self,
+                _underlying: &str,
+                expiration_date: &str,
+                _page_token: Option<String>,
+            ) -> Result<ContractPage, ProviderError> {
+                let contracts = (0..MAX_CONTRACTS)
+                    .map(|index| synth_contract(index, expiration_date))
+                    .collect();
+                Ok(ContractPage {
+                    contracts,
+                    next_page_token: None,
+                })
+            }
+            async fn hydrate_batch(
+                &self,
+                _symbols: &[String],
+            ) -> Result<HashMap<String, RawSnapshot>, ProviderError> {
+                Ok(HashMap::new())
+            }
+        }
+        let received = utc_rfc3339("2026-03-19T15:00:00+00:00");
+        match block(compose_chain(
+            &AtCap,
+            "spy",
+            &expiry(),
+            &pid("alpaca"),
+            received,
+        )) {
+            Ok(composed) => assert!(!composed.fetch.chain.options.is_empty()),
+            Err(e) => panic!("exactly-at-cap must be a complete Ok chain, got: {e}"),
+        }
+    }
+
+    // === No spot pseudo-quote is ever emitted (the Positive::ONE hazard is gone) =
+
+    #[tokio::test(start_paused = true)]
+    async fn test_no_spot_pseudo_quote_emitted() {
+        // The underlying stream is not surfaced: underlying events are Ignored and
+        // produce NO coalesced update, and NOTHING is ever keyed by the retired
+        // Positive::ONE spot sentinel. Only the backfill's real-strike venue overlays
+        // appear (500/510/520), and the underlying ticker never appears as an
+        // instrument.
+        let cancel = CancellationToken::new();
+        let connects = Arc::new(StdMutex::new(0));
+        let polls = Arc::new(StdMutex::new(0));
+        let transport = MockTransport {
+            attempts: vec![vec![RawStreamEvent::Ignored, RawStreamEvent::Ignored]],
+            attempt_idx: 0,
+            cursor: 0,
+            backfill: Some(compose_fixture_async().await),
+            connects: Arc::clone(&connects),
+            polls: Arc::clone(&polls),
+            cancel: cancel.clone(),
+        };
+        let (sink, mut rx_control, mut rx_coalesced) = test_sink(256);
+        run_reconnect_loop(
+            transport,
+            pid("alpaca"),
+            "SPY".to_owned(),
+            utc_rfc3339("2026-03-20T20:00:00+00:00"),
+            sink,
+            cancel,
+        )
+        .await;
+
+        let coalesced = drain(&mut rx_coalesced);
+        for update in &coalesced {
+            let (strike, native) = match update {
+                MarketUpdate::Quote(q) => {
+                    (q.instrument.key.strike, q.instrument.native_symbol.as_str())
+                }
+                MarketUpdate::Greeks(g) => {
+                    (g.instrument.key.strike, g.instrument.native_symbol.as_str())
+                }
+                other => panic!("only venue Quote/Greeks overlays are coalesced, got {other:?}"),
             };
-            assert_eq!(
-                route_underlying_event(&event, &spot, &mut sink).await,
-                SinkSend::Delivered
+            assert_ne!(
+                strike,
+                Positive::ONE,
+                "no update is keyed by the retired Positive::ONE spot sentinel"
+            );
+            assert_ne!(
+                native, "SPY",
+                "the underlying ticker is never emitted as a pseudo option"
             );
         }
-        // Only a bounded number of updates ever materialized on the channel; the
-        // freshest is preserved by the producer staging on the next flush.
-        let first = rx_coalesced.try_recv();
-        assert!(first.is_ok(), "at least the first quote is on the channel");
-        // A final send flushes the freshest staged value.
-        let last_bid = 100.0 + f64::from(500u32) * 0.01;
-        let final_event = RawStreamEvent::UnderlyingQuote {
-            symbol: "SPY".to_owned(),
-            bid: last_bid,
-            ask: last_bid + 0.02,
-            bid_size: 3,
-            ask_size: 4,
-            time: utc_rfc3339("2026-03-20T15:00:00+00:00"),
-        };
-        let _ = route_underlying_event(&final_event, &spot, &mut sink).await;
-        // Whatever remains is a bounded handful, never the full 500-burst.
-        let remaining = drain(&mut rx_coalesced);
-        assert!(
-            remaining.len() <= 2,
-            "the burst coalesced, never grew unbounded"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_underlying_quote_routes_to_spot_instrument() {
-        let spot = spot_instrument(
-            "SPY",
-            utc_rfc3339("2026-03-20T20:00:00+00:00"),
-            &pid("alpaca"),
-        );
-        let (mut sink, _rx_control, mut rx_coalesced) = test_sink(8);
-        let event = RawStreamEvent::UnderlyingQuote {
-            symbol: "spy".to_owned(), // case-insensitive match
-            bid: 500.10,
-            ask: 500.20,
-            bid_size: 10,
-            ask_size: 20,
-            time: utc_rfc3339("2026-03-20T15:30:00+00:00"),
-        };
-        assert_eq!(
-            route_underlying_event(&event, &spot, &mut sink).await,
-            SinkSend::Delivered
-        );
-        match rx_coalesced.try_recv() {
-            Ok(MarketUpdate::Quote(q)) => {
-                assert_eq!(q.bid, Some(pos(500.10)));
-                assert_eq!(q.ask, Some(pos(500.20)));
-                assert_eq!(q.instrument.native_symbol, "SPY");
-                assert!(q.event_time.is_some());
-            }
-            other => panic!("expected a routed spot Quote, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_underlying_unknown_symbol_is_benign_drop() {
-        let spot = spot_instrument(
-            "SPY",
-            utc_rfc3339("2026-03-20T20:00:00+00:00"),
-            &pid("alpaca"),
-        );
-        let (mut sink, _rx_control, mut rx_coalesced) = test_sink(8);
-        let event = RawStreamEvent::UnderlyingQuote {
-            symbol: "QQQ".to_owned(),
-            bid: 1.0,
-            ask: 1.1,
-            bid_size: 1,
-            ask_size: 1,
-            time: utc_rfc3339("2026-03-20T15:30:00+00:00"),
-        };
-        assert_eq!(
-            route_underlying_event(&event, &spot, &mut sink).await,
-            SinkSend::Delivered
-        );
-        assert!(
-            rx_coalesced.try_recv().is_err(),
-            "an unknown symbol publishes nothing"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_underlying_crossed_quote_is_benign_drop() {
-        let spot = spot_instrument(
-            "SPY",
-            utc_rfc3339("2026-03-20T20:00:00+00:00"),
-            &pid("alpaca"),
-        );
-        let (mut sink, _rx_control, mut rx_coalesced) = test_sink(8);
-        let event = RawStreamEvent::UnderlyingQuote {
-            symbol: "SPY".to_owned(),
-            bid: 2.0,
-            ask: 1.0, // crossed
-            bid_size: 1,
-            ask_size: 1,
-            time: utc_rfc3339("2026-03-20T15:30:00+00:00"),
-        };
-        assert_eq!(
-            route_underlying_event(&event, &spot, &mut sink).await,
-            SinkSend::Delivered
-        );
-        assert!(
-            rx_coalesced.try_recv().is_err(),
-            "a crossed quote publishes nothing"
-        );
+        let _ = drain(&mut rx_control);
     }
 
     // === Reconnect loop over a MOCK transport (no socket, no wall clock) =======
@@ -2595,26 +2674,16 @@ mod tests {
         }
     }
 
-    fn quote_event(bid: f64) -> RawStreamEvent {
-        RawStreamEvent::UnderlyingQuote {
-            symbol: "SPY".to_owned(),
-            bid,
-            ask: bid + 0.02,
-            bid_size: 5,
-            ask_size: 5,
-            time: utc_rfc3339("2026-03-20T15:00:00+00:00"),
-        }
-    }
-
     #[tokio::test(start_paused = true)]
     async fn test_reconnect_loop_resubscribes_and_backfills() {
-        // Attempt 0 emits a spot quote then drops; attempt 1 emits another then the
-        // loop stops. Each connect re-polls the chain (backfill) and re-subscribes.
+        // Attempt 0 drains an (ignored) underlying event then drops; attempt 1 the
+        // same, then the loop stops. Each connect re-polls the chain (backfill) and
+        // re-subscribes.
         let cancel = CancellationToken::new();
         let connects = Arc::new(StdMutex::new(0));
         let polls = Arc::new(StdMutex::new(0));
         let transport = MockTransport {
-            attempts: vec![vec![quote_event(500.0)], vec![quote_event(501.0)]],
+            attempts: vec![vec![RawStreamEvent::Ignored], vec![RawStreamEvent::Ignored]],
             attempt_idx: 0,
             cursor: 0,
             backfill: Some(compose_fixture_async().await),
@@ -2664,13 +2733,127 @@ mod tests {
             "a Live health was emitted"
         );
 
-        // The coalesced channel carried the spot quotes + venue overlays.
+        // The coalesced channel carried the venue Greeks overlays from the backfill.
         let coalesced = drain(&mut rx_coalesced);
         assert!(
             coalesced
                 .iter()
                 .any(|u| matches!(u, MarketUpdate::Greeks(_))),
             "venue Greeks overlays reached the coalesced channel"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_upstream_reconnect_lifecycle_surfaces_health_and_backfill() {
+        // The upstream client reports its OWN reconnect (Reconnecting then
+        // Reconnected) without dropping the stream: ChainView must surface
+        // Health(Reconnecting) AND re-poll a fresh Chain backfill on the completed
+        // reconnect, so the store never keeps showing LIVE across a silent
+        // upstream reconnect.
+        let cancel = CancellationToken::new();
+        let connects = Arc::new(StdMutex::new(0));
+        let polls = Arc::new(StdMutex::new(0));
+        let transport = MockTransport {
+            attempts: vec![vec![
+                RawStreamEvent::Reconnecting { attempt: 2 },
+                RawStreamEvent::Reconnected,
+            ]],
+            attempt_idx: 0,
+            cursor: 0,
+            backfill: Some(compose_fixture_async().await),
+            connects: Arc::clone(&connects),
+            polls: Arc::clone(&polls),
+            cancel: cancel.clone(),
+        };
+        let (sink, mut rx_control, _rx_coalesced) = test_sink(256);
+        run_reconnect_loop(
+            transport,
+            pid("alpaca"),
+            "SPY".to_owned(),
+            utc_rfc3339("2026-03-20T20:00:00+00:00"),
+            sink,
+            cancel,
+        )
+        .await;
+
+        // The socket never dropped, so only ONE connect happened...
+        assert_eq!(
+            *connects.lock().unwrap_or_else(|e| e.into_inner()),
+            1,
+            "the upstream reconnect kept the socket alive (no ChainView reconnect)"
+        );
+        // ...but the completed upstream reconnect drove a SECOND poll (the backfill).
+        assert!(
+            *polls.lock().unwrap_or_else(|e| e.into_inner()) >= 2,
+            "the completed reconnect re-polled the chain"
+        );
+
+        let control = drain(&mut rx_control);
+        assert!(
+            control.iter().any(|u| matches!(
+                u,
+                MarketUpdate::Health(_, StreamHealth::Reconnecting { attempt: 2 })
+            )),
+            "the upstream reconnect surfaced Health(Reconnecting) with its attempt"
+        );
+        let chains = control
+            .iter()
+            .filter(|u| matches!(u, MarketUpdate::Chain(_)))
+            .count();
+        assert!(
+            chains >= 2,
+            "a fresh Chain backfill followed the completed reconnect, got {chains}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_disconnect_surfaces_reconnecting_then_backfills() {
+        // The upstream reports a terminal Disconnected (retries exhausted): ChainView
+        // surfaces Health(Reconnecting) and, on the next (outer) reconnect, emits a
+        // fresh Chain backfill so the store reconciles drift.
+        let cancel = CancellationToken::new();
+        let connects = Arc::new(StdMutex::new(0));
+        let polls = Arc::new(StdMutex::new(0));
+        let transport = MockTransport {
+            attempts: vec![vec![RawStreamEvent::Disconnected], vec![]],
+            attempt_idx: 0,
+            cursor: 0,
+            backfill: Some(compose_fixture_async().await),
+            connects: Arc::clone(&connects),
+            polls: Arc::clone(&polls),
+            cancel: cancel.clone(),
+        };
+        let (sink, mut rx_control, _rx_coalesced) = test_sink(256);
+        run_reconnect_loop(
+            transport,
+            pid("alpaca"),
+            "SPY".to_owned(),
+            utc_rfc3339("2026-03-20T20:00:00+00:00"),
+            sink,
+            cancel,
+        )
+        .await;
+
+        assert_eq!(
+            *connects.lock().unwrap_or_else(|e| e.into_inner()),
+            2,
+            "the terminal disconnect drove a ChainView reconnect"
+        );
+        let control = drain(&mut rx_control);
+        assert!(
+            control.iter().any(|u| matches!(
+                u,
+                MarketUpdate::Health(_, StreamHealth::Reconnecting { .. })
+            )),
+            "the disconnect surfaced Health(Reconnecting)"
+        );
+        assert!(
+            control
+                .iter()
+                .filter(|u| matches!(u, MarketUpdate::Chain(_)))
+                .count()
+                >= 2,
+            "a fresh Chain backfill followed the reconnect"
         );
     }
 
