@@ -86,6 +86,15 @@ pub struct App {
     /// sends a [`Command`] here; it never performs the I/O inline. Private so the
     /// only way to enqueue work is a typed [`Command`].
     tx_command: mpsc::Sender<Command>,
+    /// How many control commands (reconnect / rediscover / reload / seek) were
+    /// dropped because the command channel was full or closed. A recovery
+    /// keypress must never be a **silent** no-op: instead of swallowing the send
+    /// failure, `send_command` records it here so the status line can surface it.
+    /// Monotonic, stopping at the ceiling (a checked increment, never wrapping);
+    /// `0` is the healthy steady state (commands are user-driven, so the bounded
+    /// channel is never expected to fill — a non-zero value means the data layer
+    /// is gone or wedged).
+    pub commands_dropped: u64,
 }
 
 impl App {
@@ -103,6 +112,7 @@ impl App {
             should_quit: false,
             dirty: true,
             tx_command,
+            commands_dropped: 0,
         }
     }
 
@@ -218,12 +228,24 @@ impl App {
         }
     }
 
-    /// Enqueue a command for the data layer, non-blocking. On a full or closed
-    /// command channel the command is dropped (best-effort): a command storm is
-    /// impossible because commands are user-driven (`docs/02` §5), and dropping
-    /// here never blocks or awaits the render loop.
-    fn send_command(&self, command: Command) {
-        let _ = self.tx_command.try_send(command);
+    /// Enqueue a command for the data layer, non-blocking. Never blocks or awaits
+    /// the render loop. A full or closed command channel does **not** silently
+    /// swallow a recovery keypress: the failure is counted in
+    /// [`commands_dropped`](App::commands_dropped) so the status line can surface
+    /// it. A command storm is impossible (commands are user-driven, `docs/02`
+    /// §5), so a full channel is not expected; a closed channel means the data
+    /// layer is gone, which the surfaced count now makes visible rather than
+    /// hidden.
+    fn send_command(&mut self, command: Command) {
+        if self.tx_command.try_send(command).is_err() {
+            // Checked, not `saturating_add` (a banned method): increment only
+            // when it does not overflow, so the counter stops at the ceiling
+            // rather than wrapping. Reaching `u64::MAX` dropped commands is not a
+            // reachable state; the check is defensive.
+            if let Some(next) = self.commands_dropped.checked_add(1) {
+                self.commands_dropped = next;
+            }
+        }
     }
 }
 
@@ -942,6 +964,22 @@ mod tests {
     #[track_caller]
     fn key(code: KeyCode) -> AppEvent {
         AppEvent::Key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    #[test]
+    fn test_send_command_on_a_closed_channel_is_surfaced_not_silently_dropped() {
+        let (app, rx) = live_app(full_caps());
+        let mut app = app;
+        assert_eq!(app.commands_dropped, 0, "healthy steady state");
+        // Close the channel: the data layer is gone.
+        drop(rx);
+        app.send_command(Command::Reconnect);
+        assert_eq!(
+            app.commands_dropped, 1,
+            "a dropped recovery command must be counted, never silently swallowed"
+        );
+        app.send_command(Command::Rediscover);
+        assert_eq!(app.commands_dropped, 2);
     }
 
     // --- dirty: mutating vs idle ---------------------------------------------
