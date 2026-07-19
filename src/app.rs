@@ -65,8 +65,12 @@ mod supervisor;
 pub use bridge::{BridgeSenders, COMMAND_CHANNEL_CAPACITY, CONTROL_CHANNEL_CAPACITY, EventBridge};
 // `ProviderRegistry` stays crate-internal to `registry` (the UI never receives
 // it, and external code composes through the builder), so only the builder entry
-// points are re-exported here.
-pub use registry::{ChainViewApp, ChainViewAppBuilder};
+// points, the drivable resolution, and the supervised-subscription composition
+// seam are re-exported here.
+pub use registry::{
+    ChainViewApp, ChainViewAppBuilder, ProviderSubscription, Resolved,
+    spawn_supervised_subscription,
+};
 pub use supervisor::{
     DEFAULT_JOIN_BUDGET, ExitCause, ExitReporter, FinalTeardown, GuardTeardown, SupervisedTask,
     Supervisor, TaskExit, TokioTask,

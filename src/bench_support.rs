@@ -36,9 +36,7 @@ use optionstratlib::chains::chain::OptionChain;
 use optionstratlib::prelude::{Decimal, Positive};
 use tokio::sync::mpsc;
 
-use crate::app::{
-    App, BridgeSenders, EventBridge, LiveScreen, LiveState, Mode, ScreenLoad, SourceBinding,
-};
+use crate::app::{App, EventBridge, LiveScreen, LiveState, Mode, ScreenLoad, SourceBinding};
 use crate::chain::{
     AliasCatalog, ChainFetch, ChainSource, ChainStore, ContractSpecFingerprint, ExerciseStyle,
     ExpirySource, Instrument, InstrumentKey, MarketUpdate, MergeOutcome, ProviderId,
@@ -260,7 +258,6 @@ fn fold_into_store(store: &mut ChainStore, update: MarketUpdate) -> bool {
 pub struct ChainMergeHarness {
     store: ChainStore,
     bridge: EventBridge,
-    senders: BridgeSenders,
     producer: BenchProducerStaging,
     legs: Vec<Instrument>,
     received: DateTime<Utc>,
@@ -270,17 +267,19 @@ impl ChainMergeHarness {
     /// Build the harness over an `strikes`-strike synthetic Deribit chain
     /// (`2·strikes` subscribed legs), with the coalesced channel bounded at
     /// `channel_capacity`. A capacity below the burst size forces the coalescer to
-    /// exercise its overflow path.
+    /// exercise its overflow path. The two-class [`MarketUpdateSink`](crate::MarketUpdateSink)
+    /// the producer owns keeps the bridge's coalesced channel alive for the
+    /// harness's lifetime.
     #[must_use]
     pub fn new(strikes: usize, channel_capacity: usize) -> Self {
         let (legs, _aliases) = synthetic_legs(strikes);
         let store = seeded_store(strikes);
         let (bridge, senders) = EventBridge::new(channel_capacity);
+        let producer = BenchProducerStaging::new(senders.market_update_sink());
         Self {
             store,
             bridge,
-            senders,
-            producer: BenchProducerStaging::new(),
+            producer,
             legs,
             received: base_time(),
         }
@@ -347,12 +346,9 @@ impl ChainMergeHarness {
     /// burst size (exercised by the saturation test) the producer genuinely
     /// overflows and the newest survives.
     fn publish(&mut self, round: u64) {
-        let _ = self.producer.publish_burst(
-            &self.senders.tx_coalesced,
-            &self.legs,
-            round,
-            self.received,
-        );
+        let _ = self
+            .producer
+            .publish_burst(&self.legs, round, self.received);
     }
 }
 
@@ -365,6 +361,7 @@ mod tests {
 
     use super::{base_time, pos, synthetic_legs};
     use crate::chain::{InstrumentKey, MarketUpdate};
+    use crate::providers::MarketUpdateSink;
     use crate::providers::deribit::BenchProducerStaging;
 
     /// The `base` quote/depth value `bench_stream_burst` assigns to `round` — a
@@ -388,15 +385,18 @@ mod tests {
         const CAPACITY: usize = 4; // FAR below the burst: the channel truly saturates
         let (legs, _aliases) = synthetic_legs(STRIKES);
         let (tx, mut rx) = mpsc::channel::<MarketUpdate>(CAPACITY);
-        let mut producer = BenchProducerStaging::new();
+        // The bench sink over a single bounded coalesced channel (control unused by
+        // a coalesced-only burst): both class channels alias `tx` so the test drains
+        // the whole stream from one receiver.
+        let mut producer = BenchProducerStaging::new(MarketUpdateSink::new(tx.clone(), tx.clone()));
         let received = base_time();
         let old = 3_u64; // round_base(3) = 1.15
         let new = 9_u64; // round_base(9) = 1.45 — distinct from `old`
 
         // Two bursts with the consumer NOT draining between: the channel saturates
         // and the producer stages the residue, the `new` burst overwriting `old`.
-        assert!(producer.publish_burst(&tx, &legs, old, received));
-        assert!(producer.publish_burst(&tx, &legs, new, received));
+        assert!(producer.publish_burst(&legs, old, received));
+        assert!(producer.publish_burst(&legs, new, received));
 
         // Drain to quiescence, recording the LAST value seen per instrument/kind:
         // the residue is retried onto the channel as it drains (the streaming
@@ -405,7 +405,7 @@ mod tests {
         let mut depth_bid: HashMap<InstrumentKey, Positive> = HashMap::new();
         let mut greeks_seen: HashSet<InstrumentKey> = HashSet::new();
         loop {
-            assert!(producer.flush(&tx), "the consumer receiver stays alive");
+            assert!(producer.flush(), "the consumer receiver stays alive");
             let mut drained = false;
             while let Ok(update) = rx.try_recv() {
                 drained = true;

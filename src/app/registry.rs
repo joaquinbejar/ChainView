@@ -38,32 +38,43 @@
 //! (`docs/02-tui-architecture.md` §11 implementation note). [`Provider`] is
 //! `Send + Sync`, so `Arc<dyn Provider>` is registry- and task-ready.
 //!
-//! # Scope of this issue (#12) and the seams left for later
+//! # Validation + resolution here; the render-loop composition is in the binary
 //!
-//! This lands the registry, the builder, the startup validation, the
-//! `--provider` resolution against the registry, and the capability-driven
-//! composite-source guard. [`with_builtins`](ChainViewAppBuilder::with_builtins)
-//! registers the real Deribit adapter (#15) — the zero-config poll leg — but this
-//! module still does **not** spin the event loop: the seeded
-//! [`ChainStore`](crate::chain::ChainStore) comes from the provider's first fetch
-//! (#15), the streaming overlay is #16, and the tokio runtime, the
-//! [`Supervisor`](super::Supervisor), the bounded channels (#10), and the render
-//! loop (#13) are assembled at the documented seam inside
-//! [`run`](ChainViewAppBuilder::run).
+//! This module owns the registry, the builder, startup validation, `--provider`
+//! resolution, and the capability-driven composite-source guard.
+//! [`with_builtins`](ChainViewAppBuilder::with_builtins) registers the real Deribit
+//! adapter — the zero-config poll leg. [`run`](ChainViewAppBuilder::run) validates
+//! and resolves and returns `Ok(())`; a binary that drives the TUI calls
+//! [`resolve`](ChainViewAppBuilder::resolve) instead to obtain the drivable
+//! [`Resolved`] pieces (the provider, the [`SourceBinding`], the [`Config`]) and
+//! composes the loop over them. The render-loop composition — the tokio runtime,
+//! the bounded [`EventBridge`](super::EventBridge), the
+//! [`Supervisor`](super::Supervisor), the provider stream task registered via
+//! [`spawn_supervised_subscription`], and the render loop — lives in the **binary**
+//! (`main.rs`), because the render loop is in the `ui` layer and the application
+//! layer must not import `crate::ui` (the arch fence, `tests/arch.rs`). The seeded
+//! [`ChainStore`](crate::chain::ChainStore) comes from the provider's first
+//! `fetch_chain`; the streaming overlay is routed through the two-class
+//! [`MarketUpdateSink`](crate::MarketUpdateSink) (ADR-0009).
 //!
 //! [ADR-0006]: https://github.com/joaquinbejar/ChainView/blob/main/docs/adr/0006-open-provider-extension.md
 
 use std::collections::HashMap;
 use std::fmt;
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::chain::{ProviderId, StreamHealth};
-use crate::config::{CliOverrides, Config, ModeSelect};
-use crate::error::{ChainViewError, ConfigError, RegistryError};
-use crate::providers::Provider;
-use crate::providers::deribit::DeribitAdapter;
+use chrono::{DateTime, Utc};
+use tokio::task::AbortHandle;
+use tokio_util::sync::CancellationToken;
 
-use super::{SourceBinding, chain_present};
+use crate::chain::{Instrument, ProviderId, StreamHealth};
+use crate::config::{CliOverrides, Config, ModeSelect};
+use crate::error::{ChainViewError, ConfigError, ProviderError, RegistryError};
+use crate::providers::deribit::DeribitAdapter;
+use crate::providers::{Provider, SubscriptionRequest};
+
+use super::{BridgeSenders, SourceBinding, Supervisor, chain_present};
 
 // ---------------------------------------------------------------------------
 // ProviderRegistry: the application-owned set of adapters, keyed by ProviderId.
@@ -134,16 +145,18 @@ impl fmt::Debug for ProviderRegistry {
 /// The assembled ChainView application — the entry point every binary starts
 /// from (`docs/02-tui-architecture.md` §11, [ADR-0006] §3).
 ///
-/// A thin handle whose sole role today is to expose [`builder`](Self::builder):
-/// the stock binary and any external binary compose the app through the
-/// [`ChainViewAppBuilder`] and drive it with
-/// [`run`](ChainViewAppBuilder::run).
+/// A thin handle whose sole role is to expose [`builder`](Self::builder): the
+/// stock binary and any external binary register their adapters through the
+/// [`ChainViewAppBuilder`], then either [`run`](ChainViewAppBuilder::run) to
+/// validate + resolve, or [`resolve`](ChainViewAppBuilder::resolve) to obtain the
+/// drivable [`Resolved`] pieces the binary composes the render loop over
+/// (`main.rs`).
 ///
 /// ```no_run
 /// use chainview::ChainViewApp;
 ///
 /// # fn main() -> Result<(), chainview::ChainViewError> {
-/// // Stock binary: register the gate-clear built-ins and run.
+/// // Stock binary: register the gate-clear built-ins and validate + resolve.
 /// ChainViewApp::builder().with_builtins().run()?;
 /// # Ok(())
 /// # }
@@ -266,27 +279,20 @@ impl ChainViewAppBuilder {
         self
     }
 
-    /// Validate the registry, resolve the selected provider, and compose the app
+    /// Validate the registry, resolve the selected mode/source, and — for a live
+    /// TUI — hand the resolved pieces to the caller to drive
     /// (`docs/02-tui-architecture.md` §11).
     ///
-    /// The order is: (1) a build-phase collision / gated-builtin error (recorded
-    /// first-wins) is surfaced; (2) the startup [`Config`] is resolved (injected,
-    /// or the zero-config default loaded here); (3) in [`ModeSelect::Live`] the
-    /// registry is validated non-empty ([`RegistryError::Empty`]), `--provider` is
-    /// resolved against it ([`ConfigError::UnknownProvider`] when absent), the
-    /// selected provider's capabilities are read **once**, the capability-driven
-    /// composite-source guard runs, and the [`SourceBinding`] is built.
-    /// [`ModeSelect::Replay`] needs no live provider, so it skips provider
-    /// resolution.
-    ///
-    /// # Deferred to later issues
-    ///
-    /// The tokio runtime, the [`Supervisor`](super::Supervisor), the bounded
-    /// channels (#10), the seeded [`ChainStore`](crate::chain::ChainStore) (from
-    /// the provider's first fetch, #15), and the render loop (#13) are assembled
-    /// at the documented seam below. This issue validates the registry and
-    /// resolves the live source; it does **not** spin the loop, so it returns
-    /// `Ok(())` once resolution succeeds.
+    /// [`run`](Self::run) is the library **validation + resolution** entry: it
+    /// returns `Ok(())` once resolution succeeds. It does **not** spin the render
+    /// loop, because the loop lives in the `ui` layer and the composition that
+    /// drives it (the tokio runtime + terminal + bounded
+    /// [`EventBridge`](super::EventBridge) + [`Supervisor`](super::Supervisor) +
+    /// provider [`spawn_supervised_subscription`] + render loop) is assembled in the
+    /// **binary** (`main.rs`) — the application layer must not import `crate::ui`
+    /// (the arch fence, `tests/arch.rs`). A binary drives the TUI by calling
+    /// [`resolve`](Self::resolve) instead and composing the loop
+    /// over the returned [`Resolved`] pieces.
     ///
     /// # Errors
     ///
@@ -295,6 +301,30 @@ impl ChainViewAppBuilder {
     /// selected provider or a chain-less source without an overlay chain; and a
     /// [`Config`]-load failure from the zero-config fallback.
     pub fn run(self) -> Result<(), ChainViewError> {
+        // Resolution is the validation: an empty registry / unknown provider /
+        // chain-less source / build-phase collision all surface here. The binary
+        // (`main.rs`) uses `resolve()` directly to obtain the drivable pieces.
+        let _resolved = self.resolve()?;
+        Ok(())
+    }
+
+    /// Validate the registry, resolve the startup [`Config`], and produce the
+    /// drivable [`Resolved`] pieces the binary composes the runtime + render loop
+    /// over (`docs/02-tui-architecture.md` §11, ADR-0009).
+    ///
+    /// The order is: (1) a build-phase collision / gated-builtin error (recorded
+    /// first-wins) is surfaced; (2) the startup [`Config`] is resolved (injected,
+    /// or the zero-config default loaded here); (3) in [`ModeSelect::Live`] the
+    /// registry is validated non-empty ([`RegistryError::Empty`]), `--provider` is
+    /// resolved against it ([`ConfigError::UnknownProvider`] when absent), the
+    /// selected provider's capabilities are read **once**, the capability-driven
+    /// composite-source guard runs, and the resolved provider + [`SourceBinding`]
+    /// are returned. [`ModeSelect::Replay`] needs no live provider.
+    ///
+    /// # Errors
+    ///
+    /// The same set as [`run`](Self::run).
+    pub fn resolve(self) -> Result<Resolved, ChainViewError> {
         let Self {
             registry,
             config,
@@ -316,24 +346,24 @@ impl ChainViewAppBuilder {
             None => Config::load(CliOverrides::default())?,
         };
 
-        // (3) Compose per mode.
-        match config.mode {
+        // (3) Resolve per mode.
+        match &config.mode {
             ModeSelect::Live => {
-                let _source = resolve_source(&registry, &config)?;
-                // SEAM (#13/#15/#11): assemble the tokio runtime, the bounded
-                // channels (#10), the `Supervisor` (#11), the render loop (#13),
-                // and the `App` whose `LiveState` is seeded from `_source` plus the
-                // `ChainStore` built off the provider's first `fetch_chain` (#15).
-                // This issue stops after resolving + validating the live source.
+                let (provider, source) = resolve_source(&registry, &config)?;
+                Ok(Resolved::Live {
+                    provider,
+                    source,
+                    config,
+                })
             }
-            ModeSelect::Replay(_) => {
+            ModeSelect::Replay(dir) => {
                 // Replay renders an IronCondor bundle read-only and needs NO live
                 // provider, so the registry emptiness / `--provider` resolution do
-                // not apply. The bundle reader + timeline wiring land in v0.3
-                // (#34).
+                // not apply. The bundle reader + timeline wiring land in v0.3 (#34).
+                let dir = dir.clone();
+                Ok(Resolved::Replay { dir, config })
             }
         }
-        Ok(())
     }
 
     // --- Internal helpers -----------------------------------------------------
@@ -405,7 +435,7 @@ impl ChainViewAppBuilder {
 fn resolve_source(
     registry: &ProviderRegistry,
     config: &Config,
-) -> Result<SourceBinding, ChainViewError> {
+) -> Result<(Arc<dyn Provider>, SourceBinding), ChainViewError> {
     // An empty registry has no live provider to select.
     if registry.is_empty() {
         return Err(RegistryError::Empty.into());
@@ -444,11 +474,144 @@ fn resolve_source(
     // the pre-connection `Reconnecting { attempt: 1 }` (first connect in
     // progress); the reconnect loop (#16) drives it to `Live` on the first data
     // and to a later `Reconnecting`/`Stale` on a drop.
-    Ok(SourceBinding::new(
+    let binding = SourceBinding::new(
         config.provider.clone(),
         capabilities,
         StreamHealth::Reconnecting { attempt: 1 },
-    ))
+    );
+    Ok((Arc::clone(provider), binding))
+}
+
+// ---------------------------------------------------------------------------
+// The drivable resolution + the supervised subscription composition seam.
+// ---------------------------------------------------------------------------
+
+/// The resolved startup pieces a binary composes the runtime + render loop over
+/// (`docs/02-tui-architecture.md` §11). Returned by
+/// [`ChainViewAppBuilder::resolve`]; the TUI composition lives in the binary
+/// (`main.rs`) because the render loop is in the `ui` layer and the application
+/// layer must not import `crate::ui` (the arch fence).
+#[allow(clippy::large_enum_variant)]
+pub enum Resolved {
+    /// A live TUI: the resolved provider (the poll + stream source), the UI-facing
+    /// [`SourceBinding`] (capabilities + id + health), and the assembled [`Config`].
+    Live {
+        /// The resolved chain source — shared read-only across the poll seed and
+        /// the supervised stream task.
+        provider: Arc<dyn Provider>,
+        /// The UI-facing binding the screens gate on (capabilities, never the id).
+        source: SourceBinding,
+        /// The assembled startup config (refresh cadence, channel capacity, …).
+        config: Config,
+    },
+    /// A replay session: the bundle directory (read-only) and the config. Needs no
+    /// live provider.
+    Replay {
+        /// The IronCondor result-bundle directory to open, read-only.
+        dir: PathBuf,
+        /// The assembled startup config.
+        config: Config,
+    },
+}
+
+/// A live provider subscription registered under the [`Supervisor`] — the caller
+/// keeps this so a per-provider `Unsubscribe`/`Rediscover` can cancel **only**
+/// this provider's subtree without tripping the root ([ADR-0009]).
+///
+/// It retains the provider's [`child_token`](Supervisor::child_token) (a
+/// [`cancel`](Self::cancel) cancels exactly this provider) and the watched task's
+/// [`AbortHandle`] (a last-resort [`abort`](Self::abort) after cancellation), so
+/// the "no per-provider cancel handle" gap is closed.
+///
+/// [ADR-0009]: https://github.com/joaquinbejar/ChainView/blob/main/docs/adr/0009-provider-sink-two-class-routing.md
+#[derive(Debug, Clone)]
+pub struct ProviderSubscription {
+    id: ProviderId,
+    cancel: CancellationToken,
+    abort: AbortHandle,
+}
+
+impl ProviderSubscription {
+    /// The provider this subscription belongs to.
+    #[must_use]
+    pub fn provider(&self) -> &ProviderId {
+        &self.id
+    }
+
+    /// Cancel **only** this provider's reconnect loop (a cooperative stop on its
+    /// child token), without touching the root or the other providers.
+    pub fn cancel(&self) {
+        self.cancel.cancel();
+    }
+
+    /// Force-abort the watched task — the last resort after [`cancel`](Self::cancel)
+    /// if the loop ignores cooperative cancellation.
+    pub fn abort(&self) {
+        self.abort.abort();
+    }
+}
+
+/// Spawn a provider's streaming subscription and register it under the
+/// [`Supervisor`] as a **watched** task (ADR-0009, the composition seam).
+///
+/// This is the single public seam a binary (built-in or external, ADR-0006) uses
+/// to plug a resolved provider into the live loop with **no built-in
+/// special-casing**:
+///
+/// 1. mint the provider's [`child_token`](Supervisor::child_token) (the issue-11
+///    supervision seam) — the root cancel cascades to it, and the returned
+///    [`ProviderSubscription`] retains a clone for a per-provider cancel;
+/// 2. build the two-class [`MarketUpdateSink`](crate::MarketUpdateSink) from
+///    `senders` and call [`Provider::subscribe`];
+/// 3. take the loop's [`JoinHandle`](tokio::task::JoinHandle) out of the returned
+///    handle and [`watch`](Supervisor::watch) it, so a panic/return **mid-run**
+///    wakes the supervisor (rather than the loop dying unnoticed) and the task is
+///    reaped at the ordered teardown.
+///
+/// Returns `Ok(Some(_))` for a streaming provider (the retained per-provider
+/// cancel handle), and `Ok(None)` for a **poll-only** provider whose `subscribe`
+/// returns [`ProviderError::Unsupported`] (there is no stream task to supervise).
+/// Must be called from within a tokio runtime.
+///
+/// # Errors
+///
+/// Any non-`Unsupported` [`ProviderError`] from `subscribe` (a transport/auth
+/// failure opening the stream).
+pub async fn spawn_supervised_subscription(
+    provider: &Arc<dyn Provider>,
+    underlying: &str,
+    expiration_utc: DateTime<Utc>,
+    instruments: Vec<Instrument>,
+    senders: &BridgeSenders,
+    supervisor: &mut Supervisor,
+) -> Result<Option<ProviderSubscription>, ProviderError> {
+    // (1) The per-provider child token (issue-11 seam): the root cancel cascades
+    // to it; the caller keeps the returned clone for a mid-run per-provider cancel.
+    let cancel = supervisor.child_token();
+    // (2) The two-class sink over the bridge's control + coalesced senders.
+    let sink = senders.market_update_sink();
+    let request = SubscriptionRequest::new(underlying, expiration_utc, instruments, cancel.clone());
+    match provider.subscribe(request, sink).await {
+        Ok(mut handle) => match handle.take_join_handle() {
+            // (3) Watch the spawned loop so a mid-run panic/return wakes the
+            // supervisor; the ordered teardown reaps it (bounded, then aborted).
+            Some(join) => {
+                let abort = supervisor.watch(join);
+                Ok(Some(ProviderSubscription {
+                    id: provider.id(),
+                    cancel,
+                    abort,
+                }))
+            }
+            // A streaming provider is expected to return a spawned handle; a handle
+            // with no join carries its own RAII lifecycle, so there is nothing to
+            // supervise here (the handle's drop cancels it). Treat as no stream task.
+            None => Ok(None),
+        },
+        // A poll-only provider has no stream to supervise.
+        Err(ProviderError::Unsupported(_)) => Ok(None),
+        Err(other) => Err(other),
+    }
 }
 
 #[cfg(test)]
@@ -460,18 +623,23 @@ mod tests {
     use std::time::Duration;
 
     use async_trait::async_trait;
+    use chrono::{DateTime, Utc};
     use optionstratlib::ExpirationDate;
     use proptest::prelude::*;
-    use tokio::sync::mpsc;
 
-    use super::{ChainViewApp, ProviderRegistry, resolve_source};
-    use crate::app::{LiveScreen, SourceBinding, is_screen_reachable};
-    use crate::chain::{ChainFetch, MarketUpdate, ProviderId, RESERVED_PROVIDER_IDS, StreamHealth};
+    use super::{ChainViewApp, ProviderRegistry, resolve_source, spawn_supervised_subscription};
+    use crate::app::{
+        BridgeSenders, EventBridge, FinalTeardown, LiveScreen, SourceBinding, Supervisor,
+        is_screen_reachable,
+    };
+    use crate::chain::{
+        ChainFetch, Instrument, MarketUpdate, ProviderId, RESERVED_PROVIDER_IDS, StreamHealth,
+    };
     use crate::config::{Config, ModeSelect, ThemeChoice};
     use crate::error::{ChainViewError, ConfigError, ProviderError, RegistryError};
     use crate::providers::{
-        ChainCapability, GreeksCapability, Provider, ProviderCapabilities, SubscriptionHandle,
-        SubscriptionRequest, UnderlyingRef,
+        ChainCapability, GreeksCapability, MarketUpdateSink, Provider, ProviderCapabilities,
+        SubscriptionHandle, SubscriptionRequest, UnderlyingRef,
     };
 
     // --- Test constructors (no unwrap/expect/indexing per the ruleset) -------
@@ -572,7 +740,7 @@ mod tests {
         async fn subscribe(
             &self,
             _req: SubscriptionRequest,
-            _tx: mpsc::Sender<MarketUpdate>,
+            _sink: MarketUpdateSink,
         ) -> Result<SubscriptionHandle, ProviderError> {
             Err(ProviderError::Unsupported("fake provider has no stream"))
         }
@@ -743,7 +911,8 @@ mod tests {
         let registry = registry_with("mybroker");
         let config = live_config("mybroker");
         match resolve_source(&registry, &config) {
-            Ok(binding) => {
+            Ok((provider, binding)) => {
+                assert_eq!(provider.id().as_str(), "mybroker");
                 assert_eq!(binding.provider.as_str(), "mybroker");
                 // The UI-facing seam carries the DECLARED capabilities, never the
                 // `dyn Provider`/registry.
@@ -770,7 +939,10 @@ mod tests {
             Err(ChainViewError::Config(ConfigError::InvalidValue { field, .. })) => {
                 assert_eq!(field, "provider");
             }
-            other => panic!("expected InvalidValue on provider, got {other:?}"),
+            // `dyn Provider` is not `Debug`, so report the error text (or "Ok")
+            // rather than debug-printing the resolved tuple.
+            Err(other) => panic!("expected InvalidValue on provider, got {other}"),
+            Ok(_) => panic!("expected InvalidValue on provider, got a resolved source"),
         }
     }
 
@@ -816,6 +988,165 @@ mod tests {
         let mybroker = rendered.find("mybroker");
         let zeta = rendered.find("zeta");
         assert!(mybroker < zeta, "ids are rendered sorted: {rendered}");
+    }
+
+    // === spawn_supervised_subscription: watched + per-provider cancel ==========
+
+    /// A no-op final teardown (no real TTY) for the supervisor in these tests.
+    struct NoopTeardown;
+
+    impl FinalTeardown for NoopTeardown {
+        fn run(self: Box<Self>) {}
+    }
+
+    #[track_caller]
+    fn expiry() -> DateTime<Utc> {
+        match DateTime::<Utc>::from_timestamp(1_751_011_200, 0) {
+            Some(t) => t,
+            None => panic!("valid fixed expiry"),
+        }
+    }
+
+    /// A streaming faux provider whose `subscribe` sends a control-class
+    /// `Health(Live)` through the real two-class [`MarketUpdateSink`] and then
+    /// spawns a loop. `panic_mid_run` makes the loop panic immediately (with no
+    /// external trigger) so the supervisor's `watch` seam is the only thing
+    /// observing it; otherwise the loop is cooperative and stops on its child token.
+    struct StreamingFake {
+        id: ProviderId,
+        panic_mid_run: bool,
+    }
+
+    #[async_trait]
+    impl Provider for StreamingFake {
+        fn id(&self) -> ProviderId {
+            self.id.clone()
+        }
+
+        fn capabilities(&self) -> ProviderCapabilities {
+            chainful_caps()
+        }
+
+        async fn discover(&self) -> Result<Vec<UnderlyingRef>, ProviderError> {
+            Ok(vec![UnderlyingRef::new("BTC")])
+        }
+
+        async fn fetch_chain(
+            &self,
+            _underlying: &str,
+            _expiration: &ExpirationDate,
+        ) -> Result<ChainFetch, ProviderError> {
+            Err(ProviderError::Unsupported("no chain in this test"))
+        }
+
+        async fn subscribe(
+            &self,
+            req: SubscriptionRequest,
+            mut sink: MarketUpdateSink,
+        ) -> Result<SubscriptionHandle, ProviderError> {
+            let _ = sink
+                .send(MarketUpdate::Health(self.id.clone(), StreamHealth::Live))
+                .await;
+            let cancel = req.cancel;
+            let panic_mid_run = self.panic_mid_run;
+            let loop_cancel = cancel.clone();
+            let join = tokio::spawn(async move {
+                if panic_mid_run {
+                    panic!("mid-run provider panic");
+                }
+                loop_cancel.cancelled().await;
+            });
+            Ok(SubscriptionHandle::spawned(cancel, join))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_spawn_supervised_subscription_returns_cancel_handle_and_joins_clean() {
+        let provider: Arc<dyn Provider> = Arc::new(StreamingFake {
+            id: pid("faux"),
+            panic_mid_run: false,
+        });
+        let (_bridge, senders) = EventBridge::new(64);
+        let mut supervisor = Supervisor::new(Box::new(NoopTeardown));
+        let sub = spawn_supervised_subscription(
+            &provider,
+            "BTC",
+            expiry(),
+            Vec::<Instrument>::new(),
+            &senders,
+            &mut supervisor,
+        )
+        .await;
+        let handle = match sub {
+            Ok(Some(handle)) => handle,
+            other => panic!("expected a supervised subscription handle, got {other:?}"),
+        };
+        assert_eq!(handle.provider().as_str(), "faux");
+        // The per-provider cancel handle stops only this provider's subtree.
+        handle.cancel();
+        // A clean quit joins the watched loop in the ordered teardown.
+        supervisor.request_quit();
+        assert!(
+            supervisor.run().await.is_clean(),
+            "the supervised, cooperatively-cancelled loop joins clean"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_spawn_supervised_provider_death_mid_run_wakes_supervisor() {
+        // Closes Codex finding #2: a watched provider task that panics MID-RUN
+        // (with NO external trigger) must wake the supervisor as fatal, not run
+        // stale forever.
+        let provider: Arc<dyn Provider> = Arc::new(StreamingFake {
+            id: pid("faux"),
+            panic_mid_run: true,
+        });
+        let (_bridge, senders) = EventBridge::new(64);
+        let mut supervisor = Supervisor::new(Box::new(NoopTeardown));
+        let sub = spawn_supervised_subscription(
+            &provider,
+            "BTC",
+            expiry(),
+            Vec::<Instrument>::new(),
+            &senders,
+            &mut supervisor,
+        )
+        .await;
+        assert!(
+            matches!(sub, Ok(Some(_))),
+            "the streaming provider task is watched under the supervisor"
+        );
+        // No external trigger: only `watch` observes the mid-run panic.
+        let cause = supervisor.run().await;
+        assert_eq!(
+            cause.exit_code(),
+            1,
+            "a watched provider panicking mid-run wakes the supervisor as fatal"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_spawn_supervised_subscription_poll_only_is_none() {
+        // A poll-only provider whose `subscribe` returns `Unsupported` has no
+        // stream task to supervise.
+        let provider: Arc<dyn Provider> = Arc::new(FakeProvider::chainful(pid("mybroker")));
+        let (_bridge, senders): (EventBridge, BridgeSenders) = EventBridge::new(64);
+        let mut supervisor = Supervisor::new(Box::new(NoopTeardown));
+        let sub = spawn_supervised_subscription(
+            &provider,
+            "BTC",
+            expiry(),
+            Vec::<Instrument>::new(),
+            &senders,
+            &mut supervisor,
+        )
+        .await;
+        assert!(
+            matches!(sub, Ok(None)),
+            "a poll-only provider has no supervised stream task"
+        );
+        supervisor.request_quit();
+        assert!(supervisor.run().await.is_clean());
     }
 
     // === Property tests =======================================================

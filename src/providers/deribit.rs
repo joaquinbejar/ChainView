@@ -48,20 +48,19 @@
 //! chain to reconcile drift, and resubscribes off the **fresh
 //! [`AliasCatalog`]** — the backfill is current state, never a replayed tape.
 //!
-//! # One sender, two update classes
+//! # The two-class sink
 //!
-//! The port hands `subscribe` a **single** bounded [`mpsc::Sender`]. Over it the
-//! adapter emits two classes: **control-class** updates (`Health` / the reconnect
-//! backfill `Chain`) are **await-sent** — never coalesced or dropped — and
-//! **coalesced-class** updates (`Quote` / `Greeks` / `Depth`) go through a
-//! per-[`InstrumentKey`] **producer-side staging map** ([`ProducerStaging`]) that
-//! **overwrites the staged slot on a full channel** so the freshest value
-//! survives under sustained saturation (the producer mirror of the #10 consumer
-//! conflater, `docs/02-tui-architecture.md` §5). This one sender cannot
-//! physically *separate* a control channel; the true two-class priority (a
-//! separate control channel drained first) is the **consumer bridge's** concern,
-//! and the port→bridge two-sender routing is reconciled at the composition seam
-//! (#22, per ADR-0009). The rustls crypto provider is installed once via
+//! The port hands `subscribe` a two-class [`MarketUpdateSink`] (ADR-0009). The
+//! adapter routes every update through it: **control-class** updates (`Health` /
+//! the reconnect backfill `Chain`) are **await-sent** on the priority control
+//! channel — never coalesced or dropped — while **coalesced-class** updates
+//! (`Quote` / `Greeks` / `Depth`) ride the sink's per-[`InstrumentKey`]
+//! **producer-side overwrite-on-full staging map** onto the coalesced channel, so
+//! the freshest value per instrument survives sustained saturation (the producer
+//! mirror of the #10 consumer conflater, `docs/02-tui-architecture.md` §5). On a
+//! socket drop the loop [`epoch`](MarketUpdateSink::epoch)s the coalesced staging
+//! so a pre-outage quote can never flush over the fresh reconnect backfill. The
+//! rustls crypto provider is installed once via
 //! [`install_default_crypto_provider`] before the first WS TLS handshake.
 //!
 //! [ADR-0003]: https://github.com/joaquinbejar/ChainView/blob/main/docs/adr/0003-zero-config-first-run.md
@@ -84,14 +83,18 @@ use optionstratlib::chains::chain::OptionChain;
 use optionstratlib::prelude::{Decimal, Positive};
 use optionstratlib::{ExpirationDate, OptionStyle};
 use serde::Deserialize;
+// `mpsc` is used only by the mock-transport / staging tests below (production
+// streams through the two-class `MarketUpdateSink`), so the import is test-gated
+// to keep a non-test build warning-clean.
+#[cfg(test)]
 use tokio::sync::mpsc;
-use tokio::sync::mpsc::error::TrySendError;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    AuthKind, ChainCapability, ChainPollCapability, GreeksCapability, OptionStreamCapability,
-    Provider, ProviderCapabilities, SubscriptionHandle, SubscriptionRequest, UnderlyingRef,
+    AuthKind, ChainCapability, ChainPollCapability, GreeksCapability, MarketUpdateSink,
+    OptionStreamCapability, Provider, ProviderCapabilities, SendState, SubscriptionHandle,
+    SubscriptionRequest, UnderlyingRef,
 };
 use crate::chain::{
     AliasCatalog, ChainFetch, ChainSnapshot, ChainSource, ContractSpecFingerprint, DepthLadder,
@@ -361,42 +364,45 @@ impl Provider for DeribitAdapter {
     async fn subscribe(
         &self,
         req: SubscriptionRequest,
-        tx: mpsc::Sender<MarketUpdate>,
+        sink: MarketUpdateSink,
     ) -> Result<SubscriptionHandle, ProviderError> {
         // The adapter OWNS the reconnect/resubscribe loop — `deribit-websocket`
         // (0.3.1) ships no auto-reconnect (`docs/03-data-providers.md` §5). The
-        // loop runs behind the returned handle; dropping (or aborting) the handle
-        // cancels the token — a clean cooperative stop — and aborts the task as a
-        // hard backstop, so there is no fire-and-forget spawn.
+        // loop selects on the supervisor's per-provider `cancel` child token
+        // ([ADR-0009]); the returned handle carries the loop's `JoinHandle` so the
+        // supervised composition seam registers it for an ordered, bounded join
+        // (a drop/abort of the handle still cancels the token as an RAII backstop
+        // until the supervisor takes the join).
         //
         // The loop is generic over the [`DeribitTransport`] seam (issue #17): the
         // production [`LiveTransport`] wraps the upstream WebSocket client plus the
         // REST backfill, while tests inject a mock so the reconnect lifecycle runs
         // with no socket and no wall clock. Cold-path config assembly (venue URL
         // from env or the production default); no credential is read or required —
-        // public data only.
-        let cancel = CancellationToken::new();
-        let loop_cancel = cancel.clone();
+        // public data only. Every update is routed through the two-class
+        // [`MarketUpdateSink`], so control-class updates keep their priority and
+        // coalesced-class updates keep their producer overwrite-on-full staging.
+        //
+        // [ADR-0009]: https://github.com/joaquinbejar/ChainView/blob/main/docs/adr/0009-provider-sink-two-class-routing.md
         let transport = LiveTransport::new(self.clone(), WebSocketConfig::default());
         let id = self.id.clone();
         let SubscriptionRequest {
             underlying,
             expiration_utc,
             instruments,
+            cancel,
         } = req;
+        let loop_cancel = cancel.clone();
         let handle = tokio::spawn(run_reconnect_loop(
             transport,
             id,
             underlying,
             expiration_utc,
             instruments,
-            tx,
+            sink,
             loop_cancel,
         ));
-        Ok(SubscriptionHandle::new(move || {
-            cancel.cancel();
-            handle.abort();
-        }))
+        Ok(SubscriptionHandle::spawned(cancel, handle))
     }
 }
 
@@ -1056,6 +1062,55 @@ pub(crate) fn fixture_btc_chain_fetch_named(underlying: &str) -> ChainFetch {
     )
 }
 
+/// Produce the streaming overlay updates for the recorded BTC fixture through the
+/// **real** `ticker.` streaming-normalization seam ([`normalize_ticker`]) — a
+/// `MarketUpdate::Quote` + `MarketUpdate::Greeks` per assembled leg (issue #22,
+/// finding 5). This is the STREAM counterpart of
+/// [`fixture_btc_chain_fetch_named`]'s poll seed: driving the live-path e2e test's
+/// overlay through the production normalizer (not a hand-built `QuoteUpdate`)
+/// means a regression in the real streaming normalize/route path is actually
+/// caught. Because both legs' quote/Greeks come from the SAME recorded tickers the
+/// poll seed assembled from, the fold is idempotent and the rendered chain stays
+/// byte-stable against the seed-only #19 golden. `#[cfg(test)]`, so it never rides
+/// in a release build.
+#[cfg(test)]
+pub(crate) fn fixture_btc_stream_updates(received: DateTime<Utc>) -> Vec<MarketUpdate> {
+    use deribit_websocket::prelude::Value;
+
+    const TICKER_60000_CALL_JSON: &str =
+        include_str!("../../tests/fixtures/deribit/ticker/ticker_normal.json");
+    const TICKER_60000_PUT_JSON: &str =
+        include_str!("../../tests/fixtures/deribit/ticker/ticker_put.json");
+    const TICKER_61000_CALL_JSON: &str =
+        include_str!("../../tests/fixtures/deribit/ticker/ticker_61000_call.json");
+
+    fn ticker_json_for(instrument_name: &str) -> &'static str {
+        match instrument_name {
+            "BTC-27JUN25-60000-P" => TICKER_60000_PUT_JSON,
+            "BTC-27JUN25-61000-C" => TICKER_61000_CALL_JSON,
+            _ => TICKER_60000_CALL_JSON,
+        }
+    }
+
+    let fetch = fixture_btc_chain_fetch_named("BTC");
+    let mut out = Vec::new();
+    for instrument in fetch.aliases.instruments() {
+        let json = ticker_json_for(&instrument.native_symbol);
+        let value: Value = match json.parse() {
+            Ok(value) => value,
+            Err(e) => panic!("ticker fixture must parse: {e}"),
+        };
+        let payload = match TickerPayload::deserialize(&value) {
+            Ok(payload) => payload,
+            Err(e) => panic!("ticker fixture must deserialize as a TickerPayload: {e}"),
+        };
+        let (quote, greeks) = normalize_ticker(instrument, &payload, received);
+        out.push(MarketUpdate::Quote(quote));
+        out.push(MarketUpdate::Greeks(greeks));
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Bench-only streaming-normalization burst (#21) — the HP-3 seam.
 // ---------------------------------------------------------------------------
@@ -1128,65 +1183,64 @@ pub(crate) fn bench_stream_burst(
     out
 }
 
-/// Bench-only handle over the production [`ProducerStaging`] overwrite-on-full
-/// conflater (`docs/02-tui-architecture.md` §5), so the HP-3 harness and its
-/// saturation test drive the **real** NFR-15 producer path rather than a raw
-/// `try_send` that would DROP the newest under a full channel. Publishing a
-/// `ticker.`+`book.` burst onto a channel bounded BELOW the burst size overflows
-/// it, and the freshest value per instrument is STAGED (last-value-wins per kind),
-/// never dropped — the property the bench must actually exercise (issue #21).
+/// Bench-only handle over the production two-class [`MarketUpdateSink`]
+/// overwrite-on-full producer path (`docs/02-tui-architecture.md` §5, ADR-0009),
+/// so the HP-3 harness and its saturation test drive the **real** NFR-15 producer
+/// path rather than a raw `try_send` that would DROP the newest under a full
+/// channel. Publishing a `ticker.`+`book.` burst onto a channel bounded BELOW the
+/// burst size overflows it, and the freshest value per instrument is STAGED
+/// (last-value-wins per kind), never dropped — the property the bench must
+/// actually exercise (issue #21).
 ///
 /// `#[cfg(feature = "bench")]` and `pub(crate)`: it never appears on the default
-/// or the semver-governed public surface, and it wraps the private staging map so
-/// no producer internals leak.
+/// or the semver-governed public surface, and it wraps the sink so no producer
+/// internals leak.
 #[cfg(feature = "bench")]
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct BenchProducerStaging {
-    inner: ProducerStaging,
+    sink: MarketUpdateSink,
 }
 
 #[cfg(feature = "bench")]
 impl BenchProducerStaging {
-    /// An empty producer conflater.
-    pub(crate) fn new() -> Self {
-        Self {
-            inner: ProducerStaging::new(),
-        }
+    /// A producer conflater over the given sink (its coalesced channel is the
+    /// bounded target the burst overflows).
+    pub(crate) fn new(sink: MarketUpdateSink) -> Self {
+        Self { sink }
     }
 
     /// Publish one synthetic `ticker.`+`book.` burst for `legs` through the real
-    /// overwrite-on-full producer path onto the bounded `tx`. A full channel
-    /// **stages** (never drops) the freshest value per instrument. Returns `false`
-    /// only once the channel has closed.
+    /// overwrite-on-full producer path onto the sink's coalesced channel. A full
+    /// channel **stages** (never drops) the freshest value per instrument. Returns
+    /// `false` only once the channel has closed.
     pub(crate) fn publish_burst(
         &mut self,
-        tx: &mpsc::Sender<MarketUpdate>,
         legs: &[Instrument],
         round: u64,
         received: DateTime<Utc>,
     ) -> bool {
         for update in bench_stream_burst(legs, round, received) {
-            if self.inner.publish(tx, update) == SendState::Closed {
+            if self.sink.publish_coalesced(update) == SendState::Closed {
                 return false;
             }
         }
         true
     }
 
-    /// Retry the staged residue onto `tx` as the channel drains — the producer
-    /// flush tick the streaming loop performs. Returns `false` on a closed channel.
-    /// Test-only: the drain-to-quiescence loop of the saturation test uses it; the
-    /// non-saturating HP-3 harness never stages, so it never needs to retry.
+    /// Retry the staged residue onto the coalesced channel as it drains — the
+    /// producer flush tick the streaming loop performs. Returns `false` on a closed
+    /// channel. Test-only: the drain-to-quiescence loop of the saturation test uses
+    /// it; the non-saturating HP-3 harness never stages, so it never needs to retry.
     #[cfg(test)]
-    pub(crate) fn flush(&mut self, tx: &mpsc::Sender<MarketUpdate>) -> bool {
-        self.inner.flush(tx) == SendState::Open
+    pub(crate) fn flush(&mut self) -> bool {
+        self.sink.flush() == SendState::Open
     }
 
     /// True while any instrument still holds a staged value awaiting channel space.
     /// Test-only (see [`flush`](Self::flush)).
     #[cfg(test)]
     pub(crate) fn has_pending(&self) -> bool {
-        self.inner.has_pending()
+        self.sink.has_pending()
     }
 }
 
@@ -1452,203 +1506,6 @@ fn depth_level(level: &BookLevel) -> Option<DepthLevel> {
 }
 
 // ---------------------------------------------------------------------------
-// Producer-side overwrite-on-full staging (docs/02-tui-architecture.md §5).
-// ---------------------------------------------------------------------------
-
-/// Whether the bounded fan-in channel is still open. A closed channel means the
-/// consumer (the app) is gone, so the reconnect loop shuts down rather than
-/// reconnecting.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SendState {
-    /// The channel accepted the update (directly or into the staging slot).
-    Open,
-    /// The channel is closed — the consumer dropped its receiver.
-    Closed,
-}
-
-/// One producer-staged slot for one instrument: the latest of each coalesced
-/// update **kind** independently, so a Greeks refresh never clobbers a pending
-/// quote — the producer mirror of the #10 consumer `StagedInstrument`.
-#[derive(Debug, Default)]
-struct StagedInstrument {
-    quote: Option<QuoteUpdate>,
-    greeks: Option<GreeksRow>,
-    depth: Option<DepthLadder>,
-}
-
-impl StagedInstrument {
-    /// True while any kind is still staged.
-    fn has_any(&self) -> bool {
-        self.quote.is_some() || self.greeks.is_some() || self.depth.is_some()
-    }
-
-    /// Flush this slot's present kinds onto `tx`, reserving a channel slot
-    /// **before** taking the value so a full channel never drops the staged
-    /// update. Stops at the first full/closed reservation, leaving the remaining
-    /// kinds staged.
-    fn flush_into(&mut self, tx: &mpsc::Sender<MarketUpdate>) -> FlushStep {
-        if self.quote.is_some() {
-            match reserve_send(tx, &mut self.quote, MarketUpdate::Quote) {
-                FlushStep::Drained => {}
-                blocked => return blocked,
-            }
-        }
-        if self.greeks.is_some() {
-            match reserve_send(tx, &mut self.greeks, MarketUpdate::Greeks) {
-                FlushStep::Drained => {}
-                blocked => return blocked,
-            }
-        }
-        if self.depth.is_some() {
-            match reserve_send(tx, &mut self.depth, MarketUpdate::Depth) {
-                FlushStep::Drained => {}
-                blocked => return blocked,
-            }
-        }
-        FlushStep::Drained
-    }
-}
-
-/// The outcome of trying to flush one staged kind.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FlushStep {
-    /// The kind was sent (or was absent).
-    Drained,
-    /// The channel had no capacity — the value stays staged.
-    Full,
-    /// The channel is closed.
-    Closed,
-}
-
-/// Reserve a channel slot, then move the staged value out of `slot` into it — so
-/// a full channel leaves the value **in place** (it is only `take`n on a
-/// successful reservation, never lost). The caller only calls this for a
-/// non-empty `slot`.
-fn reserve_send<T>(
-    tx: &mpsc::Sender<MarketUpdate>,
-    slot: &mut Option<T>,
-    wrap: fn(T) -> MarketUpdate,
-) -> FlushStep {
-    match tx.try_reserve() {
-        Ok(permit) => {
-            if let Some(value) = slot.take() {
-                permit.send(wrap(value));
-            }
-            FlushStep::Drained
-        }
-        Err(TrySendError::Full(())) => FlushStep::Full,
-        Err(TrySendError::Closed(())) => FlushStep::Closed,
-    }
-}
-
-/// The producer-side conflater: one slot per [`InstrumentKey`], overwritten
-/// last-value-wins per kind when the bounded channel is full
-/// (`docs/02-tui-architecture.md` §5). This completes the NFR-15
-/// latest-value-wins guarantee under sustained saturation — the mirror of the
-/// #10 consumer-side staging. It is O(N subscribed) and **reuses its
-/// allocation** across bursts (`HashMap::retain` on flush retains the buckets;
-/// a repeat update for an already-staged instrument clones no key).
-#[derive(Debug, Default)]
-struct ProducerStaging {
-    slots: HashMap<InstrumentKey, StagedInstrument>,
-}
-
-impl ProducerStaging {
-    /// An empty staging map.
-    fn new() -> Self {
-        Self {
-            slots: HashMap::new(),
-        }
-    }
-
-    /// Publish `update` on the bounded `tx`, preserving the freshest value under
-    /// saturation: first opportunistically flush anything already staged (the
-    /// channel may now have space), then try to send `update`; on a **full**
-    /// channel the update is **staged** (overwriting its kind's slot) rather than
-    /// dropped. Returns [`SendState::Closed`] once the channel is closed.
-    fn publish(&mut self, tx: &mpsc::Sender<MarketUpdate>, update: MarketUpdate) -> SendState {
-        if self.flush(tx) == SendState::Closed {
-            return SendState::Closed;
-        }
-        match tx.try_send(update) {
-            Ok(()) => SendState::Open,
-            Err(TrySendError::Full(update)) => {
-                self.stage(update);
-                SendState::Open
-            }
-            Err(TrySendError::Closed(_)) => SendState::Closed,
-        }
-    }
-
-    /// True while any instrument still holds a staged value awaiting a free
-    /// channel slot. Gates the streaming loop's flush tick so an idle stream
-    /// (nothing staged) never wakes, while a burst residue is retried until it
-    /// drains.
-    fn has_pending(&self) -> bool {
-        self.slots.values().any(StagedInstrument::has_any)
-    }
-
-    /// Flush the staged current values onto `tx`, retaining the map allocation.
-    /// Stops sending once the channel is full (leaving the rest staged) and
-    /// reports a closed channel.
-    fn flush(&mut self, tx: &mpsc::Sender<MarketUpdate>) -> SendState {
-        let mut closed = false;
-        let mut full = false;
-        self.slots.retain(|_key, slot| {
-            if !closed && !full {
-                match slot.flush_into(tx) {
-                    FlushStep::Drained => {}
-                    FlushStep::Full => full = true,
-                    FlushStep::Closed => closed = true,
-                }
-            }
-            slot.has_any()
-        });
-        if closed {
-            SendState::Closed
-        } else {
-            SendState::Open
-        }
-    }
-
-    /// Overwrite the staged slot for `update`'s instrument, last-value-wins per
-    /// kind. A control-class update never reaches here (the loop sends `Health`
-    /// / `Chain` directly), but the match stays total over the closed
-    /// [`MarketUpdate`] set with no wildcard arm.
-    fn stage(&mut self, update: MarketUpdate) {
-        match update {
-            MarketUpdate::Quote(quote) => {
-                if let Some(slot) = self.slot_mut(&quote.instrument.key) {
-                    slot.quote = Some(quote);
-                }
-            }
-            MarketUpdate::Greeks(greeks) => {
-                if let Some(slot) = self.slot_mut(&greeks.instrument.key) {
-                    slot.greeks = Some(greeks);
-                }
-            }
-            MarketUpdate::Depth(depth) => {
-                if let Some(slot) = self.slot_mut(&depth.instrument.key) {
-                    slot.depth = Some(depth);
-                }
-            }
-            MarketUpdate::Chain(_) | MarketUpdate::Health(_, _) => {}
-        }
-    }
-
-    /// A mutable reference to `key`'s slot, creating it on first use. The key is
-    /// cloned **only** when the slot is vacant (the HP-3 discipline), mirroring
-    /// the consumer bridge; the `None` arm is treated as a no-op, never an
-    /// `expect` (the lint policy forbids `expect`).
-    fn slot_mut(&mut self, key: &InstrumentKey) -> Option<&mut StagedInstrument> {
-        if !self.slots.contains_key(key) {
-            let _ = self.slots.insert(key.clone(), StagedInstrument::default());
-        }
-        self.slots.get_mut(key)
-    }
-}
-
-// ---------------------------------------------------------------------------
 // The transport seam (issue #17): the venue I/O the reconnect loop drives.
 // ---------------------------------------------------------------------------
 
@@ -1774,7 +1631,7 @@ async fn run_reconnect_loop<T: DeribitTransport>(
     underlying: String,
     expiration_utc: DateTime<Utc>,
     mut instruments: Vec<Instrument>,
-    tx: mpsc::Sender<MarketUpdate>,
+    mut sink: MarketUpdateSink,
     cancel: CancellationToken,
 ) {
     let mut attempt: u32 = 0;
@@ -1782,20 +1639,26 @@ async fn run_reconnect_loop<T: DeribitTransport>(
         // Stop before opening any socket if cancelled or the consumer is gone —
         // so a closed channel is noticed at the top of the loop, never after a
         // wasted connect cycle.
-        if cancel.is_cancelled() || tx.is_closed() {
+        if cancel.is_cancelled() || sink.is_closed() {
             return;
         }
         let exit = tokio::select! {
             biased;
             () = cancel.cancelled() => return,
-            exit = connect_stream_once(&mut transport, &id, &instruments, &tx, &cancel, &mut attempt) => exit,
+            exit = connect_stream_once(&mut transport, &id, &instruments, &mut sink, &cancel, &mut attempt) => exit,
         };
         if matches!(exit, StreamExit::Shutdown) || cancel.is_cancelled() {
             return;
         }
-        // The stream dropped: surface the reconnect honestly, then back off.
-        // `attempt` is 1-based here and MUST NOT wrap back to 0 (that would reset
-        // the ramp), so it is held at the ceiling rather than saturated.
+        // The stream dropped. EPOCH the coalesced staging so any value staged
+        // before the outage is discarded and can never flush over the fresh
+        // reconnect backfill `Chain` (a stale quote overwriting current state —
+        // ADR-0009, the sink-staging fix); the fresh backfill + resubscribe is the
+        // current state.
+        sink.epoch();
+        // Surface the reconnect honestly, then back off. `attempt` is 1-based here
+        // and MUST NOT wrap back to 0 (that would reset the ramp), so it is held at
+        // the ceiling rather than saturated.
         attempt = attempt.checked_add(1).unwrap_or(attempt);
         let health = MarketUpdate::Health(id.clone(), StreamHealth::Reconnecting { attempt });
         // Cancel-wrapped await-send: on a full shared channel this must still
@@ -1803,9 +1666,9 @@ async fn run_reconnect_loop<T: DeribitTransport>(
         let health_sent = tokio::select! {
             biased;
             () = cancel.cancelled() => return,
-            result = tx.send(health) => result,
+            state = sink.send_control(health) => state,
         };
-        if health_sent.is_err() {
+        if health_sent == SendState::Closed {
             return; // consumer gone
         }
         let delay = backoff_delay(attempt, sample_jitter());
@@ -1821,7 +1684,7 @@ async fn run_reconnect_loop<T: DeribitTransport>(
             &id,
             &underlying,
             expiration_utc,
-            &tx,
+            &mut sink,
             &cancel,
         )
         .await
@@ -1842,7 +1705,7 @@ async fn connect_stream_once<T: DeribitTransport>(
     transport: &mut T,
     id: &ProviderId,
     instruments: &[Instrument],
-    tx: &mpsc::Sender<MarketUpdate>,
+    sink: &mut MarketUpdateSink,
     cancel: &CancellationToken,
     attempt: &mut u32,
 ) -> StreamExit {
@@ -1859,21 +1722,22 @@ async fn connect_stream_once<T: DeribitTransport>(
         return StreamExit::Reconnect;
     }
 
-    // A successful (re)subscribe resets the backoff ramp and surfaces `Live`.
+    // A successful (re)subscribe resets the backoff ramp and surfaces `Live`
+    // (control-class, await-sent through the sink's priority channel).
     *attempt = 0;
     let live = MarketUpdate::Health(id.clone(), StreamHealth::Live);
-    if tx.send(live).await.is_err() {
+    if sink.send_control(live).await == SendState::Closed {
         return StreamExit::Shutdown;
     }
 
     let lookup = instrument_lookup(instruments);
-    let mut staging = ProducerStaging::new();
-    // The producer flushes staged values at the start of the next `publish`, but
-    // once a burst subsides and the feed goes quiet no further `publish` arrives
-    // to drain the freshest staged value. A bounded tick flushes it instead, so
-    // the latest quote/greeks/depth is delivered promptly after capacity frees
-    // rather than stranded. The tick is gated on `has_pending`, so an idle stream
-    // never wakes; `Delay` keeps a post-idle re-arm from firing a catch-up burst.
+    // The sink's producer staging flushes staged values at the start of the next
+    // coalesced publish, but once a burst subsides and the feed goes quiet no
+    // further publish arrives to drain the freshest staged value. A bounded tick
+    // flushes it instead, so the latest quote/greeks/depth is delivered promptly
+    // after capacity frees rather than stranded. The tick is gated on
+    // `has_pending`, so an idle stream never wakes; `Delay` keeps a post-idle
+    // re-arm from firing a catch-up burst.
     let mut flush_tick = tokio::time::interval(STAGING_FLUSH_INTERVAL);
     flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -1883,8 +1747,8 @@ async fn connect_stream_once<T: DeribitTransport>(
             // The bounded staging flush (#16) fires through the same loop, gated
             // on `has_pending`, so the freshest coalesced value is delivered after
             // a burst subsides even when no further message arrives.
-            _ = flush_tick.tick(), if staging.has_pending() => {
-                if staging.flush(tx) == SendState::Closed {
+            _ = flush_tick.tick(), if sink.has_pending() => {
+                if sink.flush() == SendState::Closed {
                     return StreamExit::Shutdown; // consumer gone
                 }
                 continue;
@@ -1897,7 +1761,7 @@ async fn connect_stream_once<T: DeribitTransport>(
             Ok(text) => text,
             Err(_) => return StreamExit::Reconnect, // socket closed / errored
         };
-        if route_message(&text, &lookup, &mut staging, tx) == SendState::Closed {
+        if route_message(&text, &lookup, sink) == SendState::Closed {
             return StreamExit::Shutdown; // consumer gone
         }
     }
@@ -1914,7 +1778,7 @@ async fn refetch<T: DeribitTransport>(
     id: &ProviderId,
     underlying: &str,
     expiration_utc: DateTime<Utc>,
-    tx: &mpsc::Sender<MarketUpdate>,
+    sink: &mut MarketUpdateSink,
     cancel: &CancellationToken,
 ) -> Option<Vec<Instrument>> {
     let expiration = ExpirationDate::DateTime(expiration_utc);
@@ -1925,16 +1789,17 @@ async fn refetch<T: DeribitTransport>(
     };
     let fetch = fetched?;
 
-    // Emit the reconciled structure as a control-class `Chain` (await-send,
-    // never coalesced/dropped) so the store reconciles drift. Cancel-wrapped so a
-    // full shared channel cannot defer cancellation during the backfill send.
+    // Emit the reconciled structure as a control-class `Chain` (await-send through
+    // the sink's priority channel, never coalesced/dropped) so the store
+    // reconciles drift. Cancel-wrapped so a full shared channel cannot defer
+    // cancellation during the backfill send.
     let snapshot = MarketUpdate::Chain(chain_snapshot(&fetch, now_utc()));
     let snapshot_sent = tokio::select! {
         biased;
         () = cancel.cancelled() => return None,
-        result = tx.send(snapshot) => result,
+        state = sink.send_control(snapshot) => state,
     };
-    if snapshot_sent.is_err() {
+    if snapshot_sent == SendState::Closed {
         return None;
     }
 
@@ -2009,8 +1874,7 @@ fn instrument_lookup(instruments: &[Instrument]) -> HashMap<String, Instrument> 
 fn route_message(
     text: &str,
     lookup: &HashMap<String, Instrument>,
-    staging: &mut ProducerStaging,
-    tx: &mpsc::Sender<MarketUpdate>,
+    sink: &mut MarketUpdateSink,
 ) -> SendState {
     let handler = NotificationHandler::new();
     let Ok(notification) = handler.parse_notification(text) else {
@@ -2046,10 +1910,10 @@ fn route_message(
             return SendState::Open;
         };
         let (quote, greeks) = normalize_ticker(instrument, &payload, received);
-        if staging.publish(tx, MarketUpdate::Quote(quote)) == SendState::Closed {
+        if sink.publish_coalesced(MarketUpdate::Quote(quote)) == SendState::Closed {
             return SendState::Closed;
         }
-        return staging.publish(tx, MarketUpdate::Greeks(greeks));
+        return sink.publish_coalesced(MarketUpdate::Greeks(greeks));
     }
 
     if channel.starts_with("book.") {
@@ -2063,7 +1927,7 @@ fn route_message(
             return SendState::Open;
         };
         let ladder = normalize_book(instrument, &payload, received);
-        return staging.publish(tx, MarketUpdate::Depth(ladder));
+        return sink.publish_coalesced(MarketUpdate::Depth(ladder));
     }
 
     SendState::Open // an unsubscribed channel family (e.g. we never open `trades.`)
@@ -2100,6 +1964,15 @@ mod tests {
     }
 
     fn assert_send_sync<T: Send + Sync>() {}
+
+    /// A two-class [`MarketUpdateSink`] whose control + coalesced channels both
+    /// alias `tx`, so a test drains the whole stream from a single receiver while
+    /// still exercising the real producer overwrite-on-full staging + await-sent
+    /// control path (the sink then behaves exactly like the original single-`tx`
+    /// loop).
+    fn sink_from(tx: &mpsc::Sender<MarketUpdate>) -> MarketUpdateSink {
+        MarketUpdateSink::new(tx.clone(), tx.clone())
+    }
 
     /// A `deribit-http` instrument with the fields the adapter reads; the rest
     /// default. `expiration_timestamp` is a Deribit millisecond epoch.
@@ -2765,9 +2638,27 @@ mod tests {
         // NO socket is ever opened. Dropping the handle cancels + aborts it.
         let adapter = DeribitAdapter::new();
         let (tx, _rx) = mpsc::channel::<MarketUpdate>(4);
-        let request = SubscriptionRequest::new("BTC", utc_millis(1_751_011_200_000), Vec::new());
-        match adapter.subscribe(request, tx).await {
-            Ok(handle) => drop(handle),
+        let sink = sink_from(&tx);
+        let request = SubscriptionRequest::new(
+            "BTC",
+            utc_millis(1_751_011_200_000),
+            Vec::new(),
+            CancellationToken::new(),
+        );
+        match adapter.subscribe(request, sink).await {
+            Ok(mut handle) => {
+                // The supervised composition seam takes the join handle; the RAII
+                // cancel is then detached, so the leftover husk drop is a no-op.
+                let join = handle.take_join_handle();
+                assert!(
+                    join.is_some(),
+                    "a spawned subscription carries a join handle"
+                );
+                if let Some(join) = join {
+                    join.abort();
+                }
+                drop(handle);
+            }
             Err(e) => panic!("subscribe should spawn the reconnect loop, got {e:?}"),
         }
     }
@@ -3218,26 +3109,22 @@ mod tests {
     #[test]
     fn test_deribit_producer_staging_overwrites_on_full_channel() {
         let (tx, mut rx) = mpsc::channel::<MarketUpdate>(1);
-        let mut staging = ProducerStaging::new();
+        let mut sink = sink_from(&tx);
         // The first send fills the cap-1 channel.
         assert_eq!(
-            staging.publish(&tx, quote_update(100.0, 1.0)),
+            sink.publish_coalesced(quote_update(100.0, 1.0)),
             SendState::Open
         );
         // Channel full: these stage + overwrite in place (freshest wins per kind).
         assert_eq!(
-            staging.publish(&tx, quote_update(100.0, 2.0)),
+            sink.publish_coalesced(quote_update(100.0, 2.0)),
             SendState::Open
         );
         assert_eq!(
-            staging.publish(&tx, quote_update(100.0, 3.0)),
+            sink.publish_coalesced(quote_update(100.0, 3.0)),
             SendState::Open
         );
-        assert_eq!(
-            staging.slots.len(),
-            1,
-            "one slot per instrument, overwritten"
-        );
+        assert_eq!(sink.staged_len(), 1, "one slot per instrument, overwritten");
         // The already-sent value (1.0) drains first.
         let sent = drain_channel(&mut rx);
         assert_eq!(sent.len(), 1);
@@ -3249,7 +3136,7 @@ mod tests {
         );
         // A further publish flushes the FRESHEST staged value (3.0, not 2.0).
         assert_eq!(
-            staging.publish(&tx, quote_update(100.0, 4.0)),
+            sink.publish_coalesced(quote_update(100.0, 4.0)),
             SendState::Open
         );
         let after = drain_channel(&mut rx);
@@ -3273,28 +3160,28 @@ mod tests {
         // value once capacity frees, so the latest quote is never stranded when
         // the user is watching a now-stale "latest" (Codex review, PR #74).
         let (tx, mut rx) = mpsc::channel::<MarketUpdate>(1);
-        let mut staging = ProducerStaging::new();
+        let mut sink = sink_from(&tx);
         // Fill the cap-1 channel (1.0 sent), then stage two overwrites: freshest
         // wins per kind, so 3.0 sits in staging, 2.0 is superseded.
         assert_eq!(
-            staging.publish(&tx, quote_update(100.0, 1.0)),
+            sink.publish_coalesced(quote_update(100.0, 1.0)),
             SendState::Open
         );
         assert_eq!(
-            staging.publish(&tx, quote_update(100.0, 2.0)),
+            sink.publish_coalesced(quote_update(100.0, 2.0)),
             SendState::Open
         );
         assert_eq!(
-            staging.publish(&tx, quote_update(100.0, 3.0)),
+            sink.publish_coalesced(quote_update(100.0, 3.0)),
             SendState::Open
         );
-        assert!(staging.has_pending(), "the burst left a value staged");
+        assert!(sink.has_pending(), "the burst left a value staged");
         // The feed goes quiet: the consumer drains the already-sent 1.0, freeing
         // capacity. NO further `publish` will arrive.
         let sent = drain_channel(&mut rx);
         assert_eq!(sent.len(), 1);
         // The tick-driven flush (not a next publish) delivers the freshest value.
-        assert_eq!(staging.flush(&tx), SendState::Open);
+        assert_eq!(sink.flush(), SendState::Open);
         let after = drain_channel(&mut rx);
         assert_eq!(
             after.len(),
@@ -3310,7 +3197,7 @@ mod tests {
             "the freshest staged value (3.0) reached the channel after the feed went quiet"
         );
         assert!(
-            !staging.has_pending(),
+            !sink.has_pending(),
             "nothing remains staged once the tick flush drains the slot"
         );
     }
@@ -3318,10 +3205,10 @@ mod tests {
     #[test]
     fn test_deribit_producer_staging_keeps_quote_and_greeks_independently() {
         let (tx, mut rx) = mpsc::channel::<MarketUpdate>(2);
-        let mut staging = ProducerStaging::new();
+        let mut sink = sink_from(&tx);
         // Fill both channel slots with unrelated sends.
-        let _ = staging.publish(&tx, quote_update(200.0, 9.0));
-        let _ = staging.publish(&tx, quote_update(201.0, 9.0));
+        let _ = sink.publish_coalesced(quote_update(200.0, 9.0));
+        let _ = sink.publish_coalesced(quote_update(201.0, 9.0));
         // Same instrument, two kinds — both stage (channel full), one slot.
         let payload = ticker_payload(
             Some(0.05),
@@ -3330,13 +3217,13 @@ mod tests {
             Some(greeks_payload(Some(0.5), Some(0.01))),
         );
         let (quote, greeks) = normalize_ticker(&instrument_at(100.0), &payload, utc_millis(0));
-        let _ = staging.publish(&tx, MarketUpdate::Quote(quote));
-        let _ = staging.publish(&tx, MarketUpdate::Greeks(greeks));
-        assert_eq!(staging.slots.len(), 1, "one slot holds both kinds");
+        let _ = sink.publish_coalesced(MarketUpdate::Quote(quote));
+        let _ = sink.publish_coalesced(MarketUpdate::Greeks(greeks));
+        assert_eq!(sink.staged_len(), 1, "one slot holds both kinds");
         let _ = drain_channel(&mut rx);
         // A further publish flushes BOTH staged kinds (a Greeks refresh never
         // clobbered the pending quote).
-        let _ = staging.publish(&tx, quote_update(300.0, 1.0));
+        let _ = sink.publish_coalesced(quote_update(300.0, 1.0));
         let flushed = drain_channel(&mut rx);
         assert!(
             flushed.iter().any(|update| matches!(
@@ -3358,17 +3245,17 @@ mod tests {
         // The channel is never drained, so it stays full; a sustained burst over
         // three instruments keeps the staging map O(N=3), never O(burst).
         let (tx, _rx) = mpsc::channel::<MarketUpdate>(1);
-        let mut staging = ProducerStaging::new();
-        let _ = staging.publish(&tx, quote_update(1.0, 1.0));
+        let mut sink = sink_from(&tx);
+        let _ = sink.publish_coalesced(quote_update(1.0, 1.0));
         for round in 0..200u32 {
             for strike in [1.0, 2.0, 3.0] {
                 assert_eq!(
-                    staging.publish(&tx, quote_update(strike, f64::from(round) + 1.0)),
+                    sink.publish_coalesced(quote_update(strike, f64::from(round) + 1.0)),
                     SendState::Open
                 );
             }
             assert!(
-                staging.slots.len() <= 3,
+                sink.staged_len() <= 3,
                 "staging is O(N=3 instruments), not O(burst): round {round}"
             );
         }
@@ -3378,9 +3265,9 @@ mod tests {
     fn test_deribit_producer_staging_reports_closed_channel() {
         let (tx, rx) = mpsc::channel::<MarketUpdate>(4);
         drop(rx);
-        let mut staging = ProducerStaging::new();
+        let mut sink = sink_from(&tx);
         assert_eq!(
-            staging.publish(&tx, quote_update(100.0, 1.0)),
+            sink.publish_coalesced(quote_update(100.0, 1.0)),
             SendState::Closed,
             "a closed consumer channel stops the loop, never a silent buffer"
         );
@@ -3395,7 +3282,7 @@ mod tests {
         use deribit_websocket::prelude::json;
         let (tx, mut rx) = mpsc::channel::<MarketUpdate>(8);
         let lookup = instrument_lookup(&[sample_instrument()]);
-        let mut staging = ProducerStaging::new();
+        let mut sink = sink_from(&tx);
         let text = json!({
             "jsonrpc": "2.0",
             "method": "subscription",
@@ -3406,10 +3293,7 @@ mod tests {
             }
         })
         .to_string();
-        assert_eq!(
-            route_message(&text, &lookup, &mut staging, &tx),
-            SendState::Open
-        );
+        assert_eq!(route_message(&text, &lookup, &mut sink), SendState::Open);
         let out = drain_channel(&mut rx);
         assert!(out.iter().any(|u| matches!(u, MarketUpdate::Quote(_))));
         assert!(
@@ -3428,7 +3312,7 @@ mod tests {
         use deribit_websocket::prelude::json;
         let (tx, mut rx) = mpsc::channel::<MarketUpdate>(8);
         let lookup = instrument_lookup(&[sample_instrument()]);
-        let mut staging = ProducerStaging::new();
+        let mut sink = sink_from(&tx);
         let text = json!({
             "jsonrpc": "2.0",
             "method": "subscription",
@@ -3438,10 +3322,7 @@ mod tests {
             }
         })
         .to_string();
-        assert_eq!(
-            route_message(&text, &lookup, &mut staging, &tx),
-            SendState::Open
-        );
+        assert_eq!(route_message(&text, &lookup, &mut sink), SendState::Open);
         let out = drain_channel(&mut rx);
         // The quote routed to the right InstrumentKey (60000 call), not dropped.
         match out.iter().find_map(quote_strike_bid) {
@@ -3458,7 +3339,7 @@ mod tests {
         use deribit_websocket::prelude::json;
         let (tx, mut rx) = mpsc::channel::<MarketUpdate>(8);
         let lookup = instrument_lookup(&[sample_instrument()]);
-        let mut staging = ProducerStaging::new();
+        let mut sink = sink_from(&tx);
         let text = json!({
             "jsonrpc": "2.0",
             "method": "subscription",
@@ -3468,10 +3349,7 @@ mod tests {
             }
         })
         .to_string();
-        assert_eq!(
-            route_message(&text, &lookup, &mut staging, &tx),
-            SendState::Open
-        );
+        assert_eq!(route_message(&text, &lookup, &mut sink), SendState::Open);
         match drain_channel(&mut rx).first() {
             Some(MarketUpdate::Depth(ladder)) => assert_eq!(ladder.change_id, Some(770)),
             other => panic!("expected a Depth update with change_id, got {other:?}"),
@@ -3484,7 +3362,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<MarketUpdate>(8);
         // The lookup knows only 60000-C; a frame for 99999-C is dropped.
         let lookup = instrument_lookup(&[sample_instrument()]);
-        let mut staging = ProducerStaging::new();
+        let mut sink = sink_from(&tx);
         let text = json!({
             "jsonrpc": "2.0",
             "method": "subscription",
@@ -3494,10 +3372,7 @@ mod tests {
             }
         })
         .to_string();
-        assert_eq!(
-            route_message(&text, &lookup, &mut staging, &tx),
-            SendState::Open
-        );
+        assert_eq!(route_message(&text, &lookup, &mut sink), SendState::Open);
         assert!(
             drain_channel(&mut rx).is_empty(),
             "an update for an unsubscribed symbol is dropped, never keyed blindly"
@@ -3509,17 +3384,17 @@ mod tests {
         use deribit_websocket::prelude::json;
         let (tx, mut rx) = mpsc::channel::<MarketUpdate>(8);
         let lookup = instrument_lookup(&[sample_instrument()]);
-        let mut staging = ProducerStaging::new();
+        let mut sink = sink_from(&tx);
         // A non-subscription notification is ignored.
         let heartbeat =
             json!({ "jsonrpc": "2.0", "method": "heartbeat", "params": {} }).to_string();
         assert_eq!(
-            route_message(&heartbeat, &lookup, &mut staging, &tx),
+            route_message(&heartbeat, &lookup, &mut sink),
             SendState::Open
         );
         // Malformed JSON never panics.
         assert_eq!(
-            route_message("{ not json", &lookup, &mut staging, &tx),
+            route_message("{ not json", &lookup, &mut sink),
             SendState::Open
         );
         assert!(drain_channel(&mut rx).is_empty());
@@ -3925,10 +3800,10 @@ mod tests {
         );
         let (tx, mut rx) = mpsc::channel::<MarketUpdate>(4);
         let lookup = instrument_lookup(&[sample_instrument()]);
-        let mut staging = ProducerStaging::new();
+        let mut sink = sink_from(&tx);
         let frame = ticker_frame("BTC-27JUN25-60000-C", FIXTURE_TICKER_NON_FINITE);
         assert_eq!(
-            route_message(&frame, &lookup, &mut staging, &tx),
+            route_message(&frame, &lookup, &mut sink),
             SendState::Open,
             "a degraded frame is skipped, never a panic"
         );
@@ -4132,13 +4007,17 @@ mod tests {
         tx: mpsc::Sender<MarketUpdate>,
     ) -> (tokio::task::JoinHandle<()>, CancellationToken) {
         let cancel = CancellationToken::new();
+        // Both class channels alias the one test `tx` so the lifecycle drains the
+        // whole stream (control + coalesced) from a single receiver — the sink then
+        // behaves exactly like the original single-`tx` loop.
+        let sink = sink_from(&tx);
         let join = tokio::spawn(run_reconnect_loop(
             transport,
             deribit_provider_id(),
             "BTC".to_owned(),
             utc_millis(1_751_011_200_000),
             vec![sample_instrument()],
-            tx,
+            sink,
             cancel.clone(),
         ));
         (join, cancel)
@@ -4361,19 +4240,19 @@ mod tests {
             instrument_at(62_000.0),
         ];
         let lookup = instrument_lookup(&instruments);
-        let mut staging = ProducerStaging::new();
+        let mut sink = sink_from(&tx);
         for round in 0..500u32 {
             for strike in [60_000.0, 61_000.0, 62_000.0] {
                 let symbol = format!("BTC-27JUN25-{strike}-C");
                 let frame = ticker_frame(&symbol, &burst_ticker_json(round));
                 assert_eq!(
-                    route_message(&frame, &lookup, &mut staging, &tx),
+                    route_message(&frame, &lookup, &mut sink),
                     SendState::Open,
                     "a saturated bridge never drops the loop"
                 );
             }
             assert!(
-                staging.slots.len() <= 3,
+                sink.staged_len() <= 3,
                 "staging stays O(N = 3 instruments), not O(burst): round {round}"
             );
         }

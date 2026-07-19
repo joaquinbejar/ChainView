@@ -57,13 +57,15 @@ tokio = { version = "1", default-features = false, features = [
 # The cancellation-token tree owned by the supervisor (issue #11): the root
 # `CancellationToken` + one `child_token` per task. `default-features = false`
 # keeps only `tokio_util::sync::CancellationToken` (no codec/io); RUSTSEC-clean,
-# MSRV 1.71 (below our 1.85). Explicit-approval addition (CLAUDE.md "Coding
+# MSRV 1.71 (below our 1.88). Explicit-approval addition (CLAUDE.md "Coding
 # Rules") — audit note in CHANGELOG.
 tokio-util = { version = "0.7", default-features = false }
-# The terminal stack (ADR-0001, issue #8, first TUI pull). ratatui 0.30 requires
-# rustc 1.88, above our 1.85 MSRV, so the resolver pins 0.29 — which re-exports
-# crossterm 0.28.1. `crossterm` is pinned to that same `0.28` line so cargo
-# unifies to a single instance: the crossterm ChainView calls is exactly the one
+# The terminal stack (ADR-0001, issue #8, first TUI pull). ratatui 0.29 is
+# retained; 0.30 (which needs rustc 1.88 — now our MSRV, issue #20) is a
+# deferred breaking migration that also clears the lru RUSTSEC-2026-0002
+# advisory (see deny.toml). 0.29 re-exports crossterm 0.28.1, and `crossterm`
+# is pinned to that same `0.28` line so cargo unifies to a single instance:
+# the crossterm ChainView calls is exactly the one
 # ratatui drives (no two-version mismatch).
 ratatui = { version = "0.29", features = ["crossterm"] }
 crossterm = "0.28"

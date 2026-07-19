@@ -19,6 +19,16 @@ pub(crate) mod providers;
 pub(crate) mod terminal;
 pub(crate) mod ui;
 
+// In-crate Part B integration tests (issue #22) that require `pub(crate)`
+// internals a `tests/*.rs` (a separate crate seeing only the public API) cannot
+// reach — the live-path golden render (assembled `ChainStore` merge + the
+// `pub(crate)` chain-matrix `draw` + the recorded-fixture assembler + the
+// `#[cfg(test)]` golden helper), the id-agnostic render-parity proof, and the
+// draw-path no-I/O assertion. The public-surface faux-provider conformance and
+// the layering arch test live under `tests/` (`docs/TESTING.md` §7).
+#[cfg(test)]
+mod tests_integration;
+
 // Bench-only support surface (issue #21), compiled ONLY under the `bench` Cargo
 // feature. It exposes the constructors the `benches/*` targets need — a
 // populated render `App`, a seeded `ChainStore`, a scripted `MarketUpdate`
@@ -49,9 +59,10 @@ pub use app::{
     App, BridgeSenders, BundleLoad, COMMAND_CHANNEL_CAPACITY, CONTROL_CHANNEL_CAPACITY,
     ChainViewApp, ChainViewAppBuilder, DEFAULT_JOIN_BUDGET, EventBridge, ExitCause, ExitReporter,
     FinalTeardown, GuardTeardown, LegFocus, LiveScreen, LiveState, LoadedReplay, Mode,
-    OverlayBinding, PayoffBuilder, Playback, ReplayScreen, ReplayState, ScreenLoad, Selection,
-    SourceBinding, StatusLine, SupervisedTask, Supervisor, TaskExit, TokioTask,
-    is_replay_screen_reachable, is_screen_reachable,
+    OverlayBinding, PayoffBuilder, Playback, ProviderSubscription, ReplayScreen, ReplayState,
+    Resolved, ScreenLoad, Selection, SourceBinding, StatusLine, SupervisedTask, Supervisor,
+    TaskExit, TokioTask, is_replay_screen_reachable, is_screen_reachable,
+    spawn_supervised_subscription,
 };
 // The closed event set folded by the state machine and the render -> data
 // command channel (`docs/02-tui-architecture.md` §4).
@@ -117,9 +128,9 @@ pub use error::{
 // (`ChainFetch`/`ExpirySource`/`AliasCatalog`, `MarketUpdate`, `ProviderError`,
 // `ProviderId`) are re-exported above from their home layers.
 pub use providers::{
-    AuthKind, ChainCapability, ChainPollCapability, GreeksCapability, OptionStreamCapability,
-    Provider, ProviderCapabilities, ProviderCapabilitiesBuilder, SubscriptionHandle,
-    SubscriptionRequest, UnderlyingRef,
+    AuthKind, ChainCapability, ChainPollCapability, GreeksCapability, MarketUpdateSink,
+    OptionStreamCapability, Provider, ProviderCapabilities, ProviderCapabilitiesBuilder, SendState,
+    SubscriptionHandle, SubscriptionRequest, UnderlyingRef,
 };
 // The terminal lifecycle surface (`docs/02-tui-architecture.md` §6, ADR-0001):
 // the RAII restore guard and the panic-hook restore installer. Public so an

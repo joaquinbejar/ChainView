@@ -67,6 +67,7 @@ use tokio::sync::mpsc;
 use super::App;
 use crate::chain::{DepthLadder, GreeksRow, InstrumentKey, MarketUpdate, QuoteUpdate};
 use crate::event::{AppEvent, Command};
+use crate::providers::MarketUpdateSink;
 
 /// Capacity of the small bounded **control** channel that carries
 /// [`Chain`](MarketUpdate::Chain) / [`Health`](MarketUpdate::Health)
@@ -269,6 +270,22 @@ pub struct BridgeSenders {
     pub tx_coalesced: mpsc::Sender<MarketUpdate>,
     /// The render -> data command channel sender that [`App`] holds.
     pub tx_command: mpsc::Sender<Command>,
+}
+
+impl BridgeSenders {
+    /// Build a fresh two-class [`MarketUpdateSink`] for one provider subscription
+    /// ([ADR-0009]): it clones the control + coalesced senders so an adapter's
+    /// `subscribe` routes control-class updates onto the priority control channel
+    /// and coalesced-class updates through producer overwrite-on-full staging onto
+    /// the coalesced channel. The composition seam
+    /// ([`spawn_supervised_subscription`](crate::spawn_supervised_subscription))
+    /// hands one sink per provider task.
+    ///
+    /// [ADR-0009]: https://github.com/joaquinbejar/ChainView/blob/main/docs/adr/0009-provider-sink-two-class-routing.md
+    #[must_use]
+    pub fn market_update_sink(&self) -> MarketUpdateSink {
+        MarketUpdateSink::new(self.tx_control.clone(), self.tx_coalesced.clone())
+    }
 }
 
 // ---------------------------------------------------------------------------
