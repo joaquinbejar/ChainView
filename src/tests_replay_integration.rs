@@ -314,7 +314,8 @@ fn test_replay_scrub_updates_all_panels_to_one_coherent_head() {
             Mode::Replay(replay) => match replay.loaded() {
                 Some(loaded) => {
                     assert_eq!(
-                        loaded.cursor.position, step,
+                        loaded.cursor.position(),
+                        step,
                         "the cursor sits at head {step}"
                     );
                     let visible = loaded.cursor.visible_fills(&loaded.bundle);
@@ -539,7 +540,8 @@ fn test_replay_playback_ticks_advance_head_and_auto_pause_at_end() {
     match &app.mode {
         Mode::Replay(replay) => match replay.loaded() {
             Some(loaded) => assert_eq!(
-                loaded.cursor.position, VALID_END_STEP,
+                loaded.cursor.position(),
+                VALID_END_STEP,
                 "the play-head lands on the last step and never wraps",
             ),
             None => panic!("the bundle must be Ready during playback"),
@@ -654,4 +656,88 @@ fn test_replay_empty_golden() {
         loaded_bundle(0),
     ))));
     assert_golden("replay", "empty.txt", &render_replay_frame(&app));
+}
+
+// ---------------------------------------------------------------------------
+// Section: the REAL supervised startup seam (#37 review) — the load arrives
+// through `spawn_bundle_load` -> the event channel -> the fold, never a
+// hand-injected `BundleLoaded`, so a regression in the real worker/channel
+// path is caught here.
+// ---------------------------------------------------------------------------
+
+/// Drive the real off-thread load for `dir` and fold its posted event into a
+/// fresh replay `App`, returning the app (and asserting an event ARRIVED through
+/// the channel rather than being injected).
+#[track_caller]
+fn replay_app_via_real_load(dir: PathBuf) -> App {
+    use crate::app::spawn_bundle_load;
+    use crate::replay::ResourceCeilings;
+    use tokio_util::sync::CancellationToken;
+
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => panic!("tokio runtime for the load worker failed: {e}"),
+    };
+    let (tx_events, mut rx_events) = mpsc::channel::<AppEvent>(16);
+    let cancel = CancellationToken::new();
+    let event = runtime.block_on(async {
+        let handle = spawn_bundle_load(
+            dir.clone(),
+            ResourceCeilings::default(),
+            tx_events,
+            cancel.child_token(),
+        );
+        let event = rx_events.recv().await;
+        let _ = handle.await;
+        event
+    });
+    let Some(event) = event else {
+        panic!("the real load worker posted no BundleLoaded event");
+    };
+    let (tx, _rx) = mpsc::channel::<Command>(16);
+    let mut app = App::new(Mode::Replay(ReplayState::new(dir)), ThemeChoice::Auto, tx);
+    app.on_event(event);
+    app
+}
+
+#[test]
+fn test_real_spawned_load_reaches_ready_through_the_event_channel() {
+    let app = replay_app_via_real_load(fixture_dir("valid"));
+    match &app.mode {
+        Mode::Replay(replay) => match &replay.bundle {
+            BundleLoad::Ready(loaded) => {
+                assert_eq!(loaded.cursor.end_step(), VALID_END_STEP);
+            }
+            other => panic!("the real load must reach Ready, got {other:?}"),
+        },
+        Mode::Live(_) => panic!("a replay app"),
+    }
+    // The frame renders the real-loaded bundle, not a blank.
+    let frame = render_replay_frame(&app);
+    assert!(
+        frame.contains("Replay"),
+        "the Ready frame renders the replay screen"
+    );
+}
+
+#[test]
+fn test_real_spawned_load_surfaces_a_typed_error_through_the_event_channel() {
+    let app = replay_app_via_real_load(fixture_dir("bad_schema"));
+    match &app.mode {
+        Mode::Replay(replay) => match &replay.bundle {
+            BundleLoad::Error { .. } => {}
+            other => panic!("a bad-schema bundle must surface Error, got {other:?}"),
+        },
+        Mode::Live(_) => panic!("a replay app"),
+    }
+    // The error frame offers the replay retry key, never a blank or a panic.
+    let frame = render_replay_frame(&app);
+    assert!(
+        frame.contains('R'),
+        "the Error frame offers the R retry affordance"
+    );
 }
