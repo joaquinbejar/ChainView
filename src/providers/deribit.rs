@@ -974,12 +974,15 @@ fn assemble_chain(
 /// **hostile** `underlying` also proves the seam keeps venue bytes verbatim — the
 /// domain never mangles a venue string — so it is the render edge, not the domain,
 /// that neutralizes the escape sequence (`docs/SECURITY.md` §6.4).
-/// `#[cfg(any(test, feature = "bench"))]`, so it never rides in the release
-/// binary; it is reachable from the bench harness (issue #21) to confirm the
-/// recorded-fixture normalize/assemble path is exercisable off the default
-/// surface. The fixture bytes are baked in with `include_str!`, so the golden is
-/// byte-stable across machines (no I/O, no socket).
-#[cfg(any(test, feature = "bench"))]
+/// `#[cfg(test)]`, so it never rides in the release binary and is **test-only**:
+/// the published `bench` feature deliberately does NOT reach into
+/// `tests/fixtures/` (that tree is excluded from the packaged crate by the
+/// `Cargo.toml` `include` list), so a downstream `cargo build --features bench`
+/// stays self-contained — the scalable bench bodies use the synthetic producers
+/// in [`crate::bench_support`], not this recorded fixture (issue #21). The fixture
+/// bytes are baked in with `include_str!`, so the golden is byte-stable across
+/// machines (no I/O, no socket).
+#[cfg(test)]
 pub(crate) fn fixture_btc_chain_fetch_named(underlying: &str) -> ChainFetch {
     use deribit_http::model::ticker::TickerData;
     use deribit_websocket::prelude::Value;
@@ -1123,6 +1126,68 @@ pub(crate) fn bench_stream_burst(
         out.push(MarketUpdate::Depth(normalize_book(leg, &book, received)));
     }
     out
+}
+
+/// Bench-only handle over the production [`ProducerStaging`] overwrite-on-full
+/// conflater (`docs/02-tui-architecture.md` §5), so the HP-3 harness and its
+/// saturation test drive the **real** NFR-15 producer path rather than a raw
+/// `try_send` that would DROP the newest under a full channel. Publishing a
+/// `ticker.`+`book.` burst onto a channel bounded BELOW the burst size overflows
+/// it, and the freshest value per instrument is STAGED (last-value-wins per kind),
+/// never dropped — the property the bench must actually exercise (issue #21).
+///
+/// `#[cfg(feature = "bench")]` and `pub(crate)`: it never appears on the default
+/// or the semver-governed public surface, and it wraps the private staging map so
+/// no producer internals leak.
+#[cfg(feature = "bench")]
+#[derive(Debug, Default)]
+pub(crate) struct BenchProducerStaging {
+    inner: ProducerStaging,
+}
+
+#[cfg(feature = "bench")]
+impl BenchProducerStaging {
+    /// An empty producer conflater.
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: ProducerStaging::new(),
+        }
+    }
+
+    /// Publish one synthetic `ticker.`+`book.` burst for `legs` through the real
+    /// overwrite-on-full producer path onto the bounded `tx`. A full channel
+    /// **stages** (never drops) the freshest value per instrument. Returns `false`
+    /// only once the channel has closed.
+    pub(crate) fn publish_burst(
+        &mut self,
+        tx: &mpsc::Sender<MarketUpdate>,
+        legs: &[Instrument],
+        round: u64,
+        received: DateTime<Utc>,
+    ) -> bool {
+        for update in bench_stream_burst(legs, round, received) {
+            if self.inner.publish(tx, update) == SendState::Closed {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Retry the staged residue onto `tx` as the channel drains — the producer
+    /// flush tick the streaming loop performs. Returns `false` on a closed channel.
+    /// Test-only: the drain-to-quiescence loop of the saturation test uses it; the
+    /// non-saturating HP-3 harness never stages, so it never needs to retry.
+    #[cfg(test)]
+    pub(crate) fn flush(&mut self, tx: &mpsc::Sender<MarketUpdate>) -> bool {
+        self.inner.flush(tx) == SendState::Open
+    }
+
+    /// True while any instrument still holds a staged value awaiting channel space.
+    /// Test-only (see [`flush`](Self::flush)).
+    #[cfg(test)]
+    pub(crate) fn has_pending(&self) -> bool {
+        self.inner.has_pending()
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -14,13 +14,19 @@
 //! [`MarketUpdate`] burst, and the Deribit payload → coalescing-merge path — over
 //! the crate's own public types.
 //!
-//! # It is NOT the public API
+//! # It is an INTERNAL, UNSTABLE harness — not a SemVer surface
 //!
-//! The whole module is `#[cfg(feature = "bench")]`, OFF by default. A normal
-//! build never compiles it, so nothing here appears on the semver-governed
-//! surface (`docs/06-performance.md` §4). Every value it produces is a
-//! fixture/synthetic — no live venue, no socket, no wall clock — so the benches
-//! are deterministic and re-runnable (`docs/TESTING.md` §11).
+//! **This module carries NO SemVer guarantee.** It is an internal benchmarking
+//! harness owned by ChainView's `bench` feature; its types, signatures, and very
+//! existence may change or be removed in **any** release — including a patch —
+//! **without notice**. Do NOT depend on it from a downstream crate. The whole
+//! module is `#[cfg(feature = "bench")]`, OFF by default: a normal build never
+//! compiles it, and enabling `--features bench` is explicitly documented as
+//! opting into an unstable, internal-benchmarking-only surface that is EXCLUDED
+//! from the semver-governed public API (`docs/SEMVER.md`, `docs/06-performance.md`
+//! §4). Every value it produces is a fixture/synthetic — no live venue, no
+//! socket, no wall clock — so the benches are deterministic and re-runnable
+//! (`docs/TESTING.md` §11).
 
 use std::time::Duration;
 
@@ -40,9 +46,7 @@ use crate::chain::{
 };
 use crate::config::ThemeChoice;
 use crate::event::Command;
-use crate::providers::deribit::{
-    bench_stream_burst, deribit_capabilities, fixture_btc_chain_fetch_named,
-};
+use crate::providers::deribit::{BenchProducerStaging, bench_stream_burst, deribit_capabilities};
 
 /// The absolute-UTC expiry every synthetic instrument and chain shares —
 /// `2025-06-27T08:00:00Z`, the Deribit fixture expiry.
@@ -224,17 +228,6 @@ pub fn market_burst(strikes: usize, round: u64) -> Vec<MarketUpdate> {
     bench_stream_burst(&legs, round, base_time())
 }
 
-/// The Deribit **recorded-fixture** chain, assembled through the real
-/// normalize/assemble seam (`fixture_btc_chain_fetch_named`, a `pub(crate)`
-/// adapter helper) — confirms the recorded-fixture normalize path is reachable
-/// off the default surface under the `bench` feature (issue #21). A small
-/// (fixture-sized) chain; the scalable bench bodies use
-/// [`seeded_store`]/[`market_burst`]/[`ChainMergeHarness`].
-#[must_use]
-pub fn deribit_fixture_chain() -> ChainFetch {
-    fixture_btc_chain_fetch_named(UNDERLYING)
-}
-
 // ---------------------------------------------------------------------------
 // HP-3: the Deribit payload → coalescing-merge harness (with the NFR-15 probe).
 // ---------------------------------------------------------------------------
@@ -268,6 +261,7 @@ pub struct ChainMergeHarness {
     store: ChainStore,
     bridge: EventBridge,
     senders: BridgeSenders,
+    producer: BenchProducerStaging,
     legs: Vec<Instrument>,
     received: DateTime<Utc>,
 }
@@ -286,6 +280,7 @@ impl ChainMergeHarness {
             store,
             bridge,
             senders,
+            producer: BenchProducerStaging::new(),
             legs,
             received: base_time(),
         }
@@ -342,12 +337,114 @@ impl ChainMergeHarness {
         self.store.pending_len()
     }
 
-    /// Normalize and publish one burst onto the bounded coalesced channel. An
-    /// update refused by a full channel is dropped (the bounded-channel policy);
-    /// the delivered ones coalesce last-value-wins per instrument.
+    /// Normalize and publish one burst onto the bounded coalesced channel through
+    /// the **producer-side overwrite-on-full conflater** (the NFR-15
+    /// [`crate::providers::deribit`] `ProducerStaging`,
+    /// `docs/02-tui-architecture.md` §5): a full channel STAGES the freshest value
+    /// per instrument (last-value-wins per kind) rather than dropping it. At the
+    /// documented default capacity — above the burst size — nothing ever stages,
+    /// so this delivers the identical stream the HP-3 baseline measured; below the
+    /// burst size (exercised by the saturation test) the producer genuinely
+    /// overflows and the newest survives.
     fn publish(&mut self, round: u64) {
-        for update in bench_stream_burst(&self.legs, round, self.received) {
-            let _ = self.senders.tx_coalesced.try_send(update);
+        let _ = self.producer.publish_burst(
+            &self.senders.tx_coalesced,
+            &self.legs,
+            round,
+            self.received,
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{HashMap, HashSet};
+
+    use optionstratlib::prelude::Positive;
+    use tokio::sync::mpsc;
+
+    use super::{base_time, pos, synthetic_legs};
+    use crate::chain::{InstrumentKey, MarketUpdate};
+    use crate::providers::deribit::BenchProducerStaging;
+
+    /// The `base` quote/depth value `bench_stream_burst` assigns to `round` — a
+    /// mirror of the adapter's formula so the test can name the exact freshest
+    /// value the newest burst carries.
+    fn round_base(round: u64) -> f64 {
+        let step = u32::try_from(round % 16).unwrap_or(0);
+        1.0 + f64::from(step) * 0.05
+    }
+
+    /// NFR-15 producer overwrite-on-full under genuine saturation
+    /// (`docs/02-tui-architecture.md` §5): with the bounded channel capped FAR
+    /// below one burst, publishing an `old` then a `new` burst without draining
+    /// between must (a) never permanently drop an instrument, and (b) let the
+    /// freshest (`new`) quote and depth WIN the overwrite (last-value-wins). This
+    /// is the property the HP-3 harness's default (non-saturating) capacity never
+    /// exercises, proved here rather than assumed from the design.
+    #[test]
+    fn producer_overwrite_on_full_keeps_newest_under_saturation() {
+        const STRIKES: usize = 8; // 16 legs -> a 48-update burst
+        const CAPACITY: usize = 4; // FAR below the burst: the channel truly saturates
+        let (legs, _aliases) = synthetic_legs(STRIKES);
+        let (tx, mut rx) = mpsc::channel::<MarketUpdate>(CAPACITY);
+        let mut producer = BenchProducerStaging::new();
+        let received = base_time();
+        let old = 3_u64; // round_base(3) = 1.15
+        let new = 9_u64; // round_base(9) = 1.45 — distinct from `old`
+
+        // Two bursts with the consumer NOT draining between: the channel saturates
+        // and the producer stages the residue, the `new` burst overwriting `old`.
+        assert!(producer.publish_burst(&tx, &legs, old, received));
+        assert!(producer.publish_burst(&tx, &legs, new, received));
+
+        // Drain to quiescence, recording the LAST value seen per instrument/kind:
+        // the residue is retried onto the channel as it drains (the streaming
+        // loop's flush tick), so every staged value eventually reaches the consumer.
+        let mut quote_bid: HashMap<InstrumentKey, Positive> = HashMap::new();
+        let mut depth_bid: HashMap<InstrumentKey, Positive> = HashMap::new();
+        let mut greeks_seen: HashSet<InstrumentKey> = HashSet::new();
+        loop {
+            assert!(producer.flush(&tx), "the consumer receiver stays alive");
+            let mut drained = false;
+            while let Ok(update) = rx.try_recv() {
+                drained = true;
+                match update {
+                    MarketUpdate::Quote(quote) => {
+                        if let Some(bid) = quote.bid {
+                            let _ = quote_bid.insert(quote.instrument.key, bid);
+                        }
+                    }
+                    MarketUpdate::Depth(depth) => {
+                        if let Some(best) = depth.bids.first().map(|level| level.price) {
+                            let _ = depth_bid.insert(depth.instrument.key, best);
+                        }
+                    }
+                    MarketUpdate::Greeks(greeks) => {
+                        let _ = greeks_seen.insert(greeks.instrument.key);
+                    }
+                    MarketUpdate::Chain(_) | MarketUpdate::Health(_, _) => {}
+                }
+            }
+            if !producer.has_pending() && !drained {
+                break;
+            }
+        }
+
+        // (a) Nothing was permanently dropped: every subscribed leg survived.
+        assert_eq!(quote_bid.len(), legs.len(), "every leg's quote survived");
+        assert_eq!(depth_bid.len(), legs.len(), "every leg's depth survived");
+        assert_eq!(greeks_seen.len(), legs.len(), "every leg's Greeks survived");
+
+        // (b) The newest value won the overwrite (last-value-wins), never the stale.
+        let newest = pos(round_base(new));
+        let stale = pos(round_base(old));
+        assert_ne!(newest, stale, "the two rounds carry distinct values");
+        for bid in quote_bid.values() {
+            assert_eq!(*bid, newest, "the freshest quote won under saturation");
+        }
+        for bid in depth_bid.values() {
+            assert_eq!(*bid, newest, "the freshest depth won under saturation");
         }
     }
 }

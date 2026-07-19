@@ -25,9 +25,12 @@ pub(crate) mod ui;
 // burst, and the Deribit `ticker.`/`book.` → coalescing-merge harness — through
 // the crate's own public types, so a `benches/*.rs` (a separate crate that sees
 // only the public API) can reach the three hot paths WITHOUT the pure-render
-// `chain::draw`, the `ChainStore`, or the Deribit fixture being promoted to the
-// default public surface. Because it is `#[cfg(feature = "bench")]`, a normal
-// build never compiles it and the semver-governed API is unchanged
+// `chain::draw` or the `ChainStore` being promoted to the default public
+// surface. It is an INTERNAL, UNSTABLE harness with NO SemVer guarantee: even
+// under `--features bench` it is EXCLUDED from the semver-governed public API and
+// may change or be removed in any release without notice (see the module docs and
+// `docs/SEMVER.md`). Because it is `#[cfg(feature = "bench")]`, a normal build
+// never compiles it and the default public surface is unchanged
 // (`docs/06-performance.md` §4, `docs/TESTING.md` §11).
 #[cfg(feature = "bench")]
 pub mod bench_support;
