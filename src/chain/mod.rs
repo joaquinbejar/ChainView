@@ -24,10 +24,21 @@
 //! `docs/03-data-providers.md` §2, §11.1). It also completed [`ChainSnapshot`]'s
 //! `aliases`/`source` fields now that [`AliasCatalog`] and [`ChainSource`] exist
 //! (the store LOGIC that drives them lands in #7).
+//!
+//! Issue #7 landed the live [`ChainStore`] in the [`store`] submodule — the
+//! deterministic poll -> stream merge over the `optionstratlib` chain: the
+//! strike-keyed clone/patch/re-insert row update, the field-fold rules
+//! (crossed/zero), the bounded-generation merge with tombstones and the
+//! [`MAX_PENDING`]/[`pending_ttl`] pending-unknown-strike buffer, the two-clock
+//! freshness/watermark model ([`Freshness`]), the retained/decayed price
+//! direction ([`TickDir`]), the [`MergeOutcome`] of each fold, and the wired
+//! cross-provider overlay gate (`docs/01-domain-model.md` §5.1, §6,
+//! `docs/03-data-providers.md` §3, §4).
 
 mod events;
 mod fetch;
 mod identity;
+mod store;
 
 pub use events::{
     CHAIN_STALE_SLACK, ChainSnapshot, ChainSource, DIRECTION_DECAY, DepthLadder, DepthLevel,
@@ -39,3 +50,4 @@ pub use identity::{
     ContractSpecFingerprint, ExerciseStyle, Instrument, InstrumentKey, ProviderId,
     RESERVED_PROVIDER_IDS, SettlementStyle,
 };
+pub use store::{ChainStore, Freshness, MAX_PENDING, MergeOutcome, TickDir, pending_ttl};

@@ -14,6 +14,63 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- The live `ChainStore` (`src/chain/store.rs`, issue #7): the deterministic
+  poll -> stream merge over the `optionstratlib` chain
+  (`docs/01-domain-model.md` §5.1, §6, `docs/03-data-providers.md` §3, §4).
+  Assembled from a `ChainFetch` via `ChainStore::seed`, carrying the same
+  `AliasCatalog` forward with no re-derivation; `apply_poll` / `apply_quote` /
+  `apply_greeks` / `apply_health` mutate it **only on the market/tick event**,
+  never in draw, and `snapshot()` emits a `ChainSnapshot`. Key behaviours:
+  - **Strike-keyed clone/patch/re-insert row update.** A `QuoteUpdate` /
+    `GreeksRow` takes the row at its strike out of the upstream
+    `BTreeSet<OptionData>` (via a strike-only probe, since `OptionData`'s `Ord`
+    is its `strike_price`), clone-patches only the update's `OptionStyle` side,
+    recomputes that side's `*_middle` (upstream's `(bid+ask)/2` rounded to 4 dp),
+    and re-inserts — opposite leg and untouched fields preserved, set ordering
+    unchanged.
+  - **Field-fold rules.** A rejected (absent) field keeps its prior value; a
+    **crossed** quote (`ask < bid`, or a zero ask on a non-zero bid) rejects the
+    whole update and keeps the prior row (a zero bid is valid). `theta`/`vega`/
+    `rho` have no `OptionData` field and are intentionally not folded — the
+    per-style analytics sidecar lands in v0.2 (`docs/01` §7).
+  - **Bounded-generation merge.** A monotonic snapshot generation stamps each
+    poll; a de-listed strike is tombstoned (and never resurrected), a re-listed
+    strike clears its tombstone. A stream update for an unknown strike is held in
+    a bounded `MAX_PENDING` (256) FIFO buffer with a `pending_ttl` per-entry TTL
+    (`refresh_interval` + slack); on overflow the oldest entry is dropped
+    (counted via `dropped_overflow`); on the next poll a pending update whose
+    strike is now present is applied, a tombstoned or past-TTL one is dropped.
+    A stream update for a tombstoned strike is dropped immediately.
+  - **Two-clock freshness (§5.1).** A per-instrument watermark = `max(event_time)`
+    drops an out-of-order update (event time below the watermark) for value and
+    direction and counts it (`dropped_stale`); a `None`-`event_time` update
+    orders by receipt and never advances the watermark. Per-component staleness
+    (`quote_freshness` / `greeks_freshness` / `chain_freshness`) against
+    `QUOTE_STALE_AFTER` / `GREEKS_STALE_AFTER` / `chain_stale_after`, plus a
+    feed-delay `Delayed` classification past `FEED_DELAY_WARN` with negative skew
+    clamped to zero — surfaced as the new `Freshness` enum.
+  - **Retained/decayed price direction.** Per-instrument prev bid/ask + last
+    change time drive a `TickDir` (Up on strictly higher, Down on strictly lower,
+    an equal value keeps the prior, first-ever `Flat`), decayed to `Flat` after
+    `DIRECTION_DECAY` (3 s) and cleared to `Flat` immediately on a
+    stale/reconnecting `apply_health` — mutated on the event, read pure in draw.
+  - **Cross-provider overlay gate wired.** A leg whose overlay feed differs from
+    the source provider merges only when `AliasCatalog::overlay_compatible`
+    passes; a `ContractSpecFingerprint` mismatch refuses the leg
+    (`MergeOutcome::OverlayRefused`), keeps the source leg, and badges it
+    (`is_overlay_refused`); the within-provider merge is a no-op for the gate.
+  - The `ChainStore`, `Freshness`, `MergeOutcome`, `TickDir`, `MAX_PENDING`, and
+    `pending_ttl` are re-exported from the crate root; `ChainSnapshot` /
+    `ChainSource` / `StreamHealth` stay in `src/chain/events.rs` with unchanged
+    re-export paths (the forward declarations already matched the store's needs).
+    Tests: 32 unit (clone/patch both legs and orders, crossed/zero/missing folds,
+    staleness/delay/negative-skew, out-of-order + watermark, direction
+    up/down/equal/decay/stale-clear, tombstone no-resurrection, pending
+    new-listing/TTL/overflow, overlay gate) plus 4 property
+    (`prop_chain_merge_idempotent`, `prop_overlay_spec_gate`,
+    `prop_no_resurrection_and_bounded_memory` over scripted poll/stream
+    interleavings, `prop_freshness_out_of_order_keeps_max_event_value`). No new
+    dependency.
 - The PUBLIC, semver-governed **provider port** (`src/providers/mod.rs`, issue #6):
   the `#[async_trait] Provider: Send + Sync` trait (`id` / `capabilities` /
   `discover` / `fetch_chain` / `subscribe`) an external adapter compiles against
