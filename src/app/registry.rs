@@ -74,6 +74,8 @@ use crate::error::{ChainViewError, ConfigError, ProviderError, RegistryError};
 #[cfg(feature = "alpaca")]
 use crate::providers::alpaca::AlpacaAdapter;
 use crate::providers::deribit::DeribitAdapter;
+#[cfg(feature = "dxlink")]
+use crate::providers::dxlink::DxlinkAdapter;
 #[cfg(feature = "tastytrade")]
 use crate::providers::tastytrade::TastytradeAdapter;
 use crate::providers::{Provider, SubscriptionRequest};
@@ -262,7 +264,7 @@ impl ChainViewAppBuilder {
         // adapter's factory (never invoked here) purely so the deliberately
         // unregistered adapter stays compiled + linted in a plain
         // `--features <gated>` library build.
-        #[cfg(any(feature = "tastytrade", feature = "alpaca"))]
+        #[cfg(any(feature = "tastytrade", feature = "alpaca", feature = "dxlink"))]
         note_gated_builtins();
         self.record(RegistryError::Gated(id).into());
         self
@@ -441,11 +443,11 @@ impl ChainViewAppBuilder {
 /// environment and yields a registry-ready `Arc<dyn Provider>`. Invoked only once
 /// the adapter's security gate lifts; while the gate holds it is merely *named*
 /// (see [`note_gated_builtins`]).
-#[cfg(any(feature = "tastytrade", feature = "alpaca"))]
+#[cfg(any(feature = "tastytrade", feature = "alpaca", feature = "dxlink"))]
 type GatedBuiltinFactory =
     fn(&dyn crate::config::EnvSource) -> Result<Arc<dyn Provider>, ConfigError>;
 
-#[cfg(any(feature = "tastytrade", feature = "alpaca"))]
+#[cfg(any(feature = "tastytrade", feature = "alpaca", feature = "dxlink"))]
 fn note_gated_builtins() {
     #[cfg(feature = "tastytrade")]
     {
@@ -458,6 +460,12 @@ fn note_gated_builtins() {
         let _alpaca: GatedBuiltinFactory =
             |env| Ok(Arc::new(AlpacaAdapter::from_env(env)?) as Arc<dyn Provider>);
         let _ = _alpaca;
+    }
+    #[cfg(feature = "dxlink")]
+    {
+        let _dxlink: GatedBuiltinFactory =
+            |env| Ok(Arc::new(DxlinkAdapter::from_env(env)?) as Arc<dyn Provider>);
+        let _ = _dxlink;
     }
 }
 
@@ -964,6 +972,43 @@ mod tests {
                 assert_eq!(id, "alpaca");
             }
             other => panic!("expected UnknownProvider(alpaca), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_with_gated_builtin_dxlink_fails_while_gate_holds() {
+        // The standalone DXLink overlay (issue #42) is reachable only through the
+        // gated opt-in, which fails with a typed startup error while its gate holds —
+        // a stock binary can never enable it (docs/SECURITY.md §2.4).
+        let result = ChainViewApp::builder()
+            .with_gated_builtin(pid("dxlink"))
+            .register(FakeProvider::chainful(pid("mybroker")))
+            .with_config(live_config("mybroker"))
+            .run();
+        match result {
+            Err(ChainViewError::Registry(RegistryError::Gated(id))) => {
+                assert_eq!(id.as_str(), "dxlink");
+            }
+            other => panic!("expected Gated(dxlink), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_with_builtins_never_enables_dxlink() {
+        // The stock builder registers only the gate-clear built-ins (Deribit), so
+        // selecting the gated `dxlink` id resolves to UnknownProvider — proving the
+        // overlay-only adapter is never enabled by `with_builtins` (docs/SECURITY.md
+        // §2.4). (A chain-less source would separately be rejected by the
+        // composite-source guard; here it is simply unregistered.)
+        let result = ChainViewApp::builder()
+            .with_builtins()
+            .with_config(live_config("dxlink"))
+            .run();
+        match result {
+            Err(ChainViewError::Config(ConfigError::UnknownProvider(id))) => {
+                assert_eq!(id, "dxlink");
+            }
+            other => panic!("expected UnknownProvider(dxlink), got {other:?}"),
         }
     }
 

@@ -98,10 +98,11 @@ pub(crate) struct DxQuoteEvent {
     /// The raw dxfeed event symbol, carried **opaque** — identity resolution is
     /// the adapter's job (§4). Echoed only through [`clamp_symbol`].
     // Read only by the deferred `clamp_symbol` symbol echo (see that helper's
-    // note): the #40 adapter sets this field but drops unknown/crossed ticks
-    // silently until the tracing sink lands, so the field is written-but-unread
-    // with the `tastytrade` feature on. The allow is narrowed to it with a note
-    // (the #38 review's sanctioned alternative), removed when the echo is wired.
+    // note): BOTH the #40 tastytrade and the #42 dxlink adapters set this field
+    // but drop unknown/crossed ticks silently until the tracing sink lands
+    // (governance deviation 3), so the field is written-but-unread with either
+    // feature on. The allow is narrowed to it with a note (the #38 review's
+    // sanctioned alternative), removed when the echo is wired.
     #[allow(dead_code)]
     pub(crate) symbol: String,
     /// Best bid price (`NaN` = the venue sent none).
@@ -145,9 +146,10 @@ pub(crate) struct DxQuoteEvent {
 #[derive(Debug, Clone)]
 pub(crate) struct DxGreeksEvent {
     /// The raw dxfeed event symbol, carried opaque (see [`DxQuoteEvent::symbol`]).
-    // Written-but-unread with the `tastytrade` feature on, exactly like
-    // [`DxQuoteEvent::symbol`] — the deferred `clamp_symbol` echo is its only
-    // reader. Allow narrowed to it with a note (removed when the echo is wired).
+    // Written-but-unread with either the `tastytrade` or `dxlink` feature on,
+    // exactly like [`DxQuoteEvent::symbol`] — the deferred `clamp_symbol` echo is
+    // its only reader. Allow narrowed to it with a note (removed when the echo is
+    // wired in both adapters).
     #[allow(dead_code)]
     pub(crate) symbol: String,
     /// Delta (may be negative — no sign check).
@@ -251,12 +253,13 @@ const MAX_SYMBOL_CHARS: usize = 48;
 /// unknown-symbol warning), mirroring the replay `clamp_echo` house rule.
 // The consumer is a bounded symbol echo into a `tracing` field, but ChainView's
 // tracing sink is deferred (governance deviation 3) and `tracing` is not yet a
-// direct dependency. The first `dxfeed_decode` consumer — the #40 tastytrade
-// adapter — therefore drops unknown/crossed ticks SILENTLY for now (the deribit
-// house pattern: "once the tracing sink lands, a WARN/TRACE goes here"), so this
-// helper still has no caller even with the `tastytrade` feature on. Per the #38
-// review, the allow is NARROWED to this single item with a note (the sanctioned
-// alternative to wiring it) and is removed the moment the symbol echo is wired.
+// direct dependency. Both `dxfeed_decode` consumers — the #40 tastytrade adapter
+// and the #42 dxlink overlay — therefore drop unknown/crossed ticks SILENTLY for
+// now (the deribit house pattern: "once the tracing sink lands, a WARN/TRACE goes
+// here"), so this helper still has no caller even with the `tastytrade` or
+// `dxlink` feature on. Per the #38 review, the allow is NARROWED to this single
+// item with a note (the sanctioned alternative to wiring it) and is removed the
+// moment the symbol echo is wired in both adapters.
 #[allow(dead_code)]
 pub(crate) fn clamp_symbol(symbol: &str) -> String {
     if symbol.chars().count() <= MAX_SYMBOL_CHARS {

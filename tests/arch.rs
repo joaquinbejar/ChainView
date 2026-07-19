@@ -586,6 +586,21 @@ fn test_detector_flags_a_synthetic_back_edge() {
         "a grouped adapter→adapter import must be flagged, got {grouped_adapter:?}"
     );
 
+    // The #42 neutral-node proof: the standalone dxlink overlay reuses the shared
+    // dxfeed decode but must NEVER import the tastytrade adapter directly — both
+    // depend on the neutral `dxfeed_decode` module, neither on the other
+    // (`docs/03-data-providers.md` §12).
+    let dxlink_tastytrade = violations_in(
+        "providers/dxlink.rs",
+        "use crate::providers::tastytrade::LiveTransport;\n",
+    );
+    assert!(
+        dxlink_tastytrade
+            .iter()
+            .any(|v| v.contains("adapter → adapter")),
+        "a dxlink→tastytrade import must be flagged, got {dxlink_tastytrade:?}"
+    );
+
     // A `pub use` RE-EXPORT back-edge creates the same compile edge as a plain
     // `use` and must be flagged too (not skipped for its visibility prefix).
     let reexport_edge = violations_in(

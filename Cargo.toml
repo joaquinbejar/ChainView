@@ -43,6 +43,15 @@ tastytrade = ["dep:tastytrade"]
 # `alpaca-websocket` crates at all. `dep:` keeps the optional crates from
 # implicitly defining same-named features.
 alpaca = ["dep:alpaca-http", "dep:alpaca-websocket", "dep:futures-util"]
+# `dxlink` gates the whole standalone DXLink overlay adapter
+# (`src/providers/dxlink.rs`, issue #42). It is DISABLED by default and stays off
+# the shippable set: like tastytrade and Alpaca, the adapter is excluded from
+# `with_builtins()` and reachable only via the explicit `with_gated_builtin(id)`
+# opt-in, which fails with a typed startup error while the gate holds
+# (docs/SECURITY.md §2.4). A normal `cargo build` (no `--features dxlink`) does
+# not compile the adapter or pull the `dxlink` crate at all. `dep:` keeps the
+# optional crate from implicitly defining a same-named feature.
+dxlink = ["dep:dxlink"]
 
 [lib]
 name = "chainview"
@@ -174,6 +183,28 @@ alpaca-websocket = { version = "0.6.0", optional = true }
 # already present; `default-features = false` keeps only the async/stream adapters.
 # Explicit-approval addition (CLAUDE.md "Coding Rules") — audit note in CHANGELOG.
 futures-util = { version = "0.3", default-features = false, optional = true }
+# The standalone DXLink client (issue #42, the overlay-only quote/Greeks provider
+# — `docs/03-data-providers.md` §7.3). OPTIONAL and behind the DISABLED-by-default
+# `dxlink` feature: a normal build never pulls it, and the adapter is reachable
+# only via `with_gated_builtin` (which fails while the gate holds,
+# docs/SECURITY.md §2.4). Wraps the DXLink WebSocket protocol
+# (`DXLinkClient::new(url, token)`, no REST); ChainView never reimplements the
+# protocol (CLAUDE.md "Key Decisions"). Explicit-approval addition (CLAUDE.md
+# "Coding Rules") — ADR-0007 audit note in CHANGELOG (`cargo audit` +
+# `cargo deny check` (deny.toml pins `all-features = true`)).
+# Auth is injected programmatically: `DXLinkClient::new(url, token)` takes the URL
+# and token as plain arguments, so the adapter builds them from ChainView-
+# namespaced `CHAINVIEW_DXLINK_*` env vars. There is NO dotenv load, NO foreign
+# env namespace, and NO global tracing subscriber installed on construction; the
+# 0.2.0 client redacts the serialized `AuthMessage` token in its `debug!`
+# (`redact_sensitive`) and its `Debug` shows only `has_token` — verified against
+# the 0.2.0 checkout.
+# Supply-chain delta (feature-on only): pulls `tokio-tungstenite` (native-tls)
+# and `futures-util`, both already in the tree under the gated
+# tastytrade/deribit-websocket features. Under `--all-features` `dxlink` resolves
+# at both 0.2.0 (this direct dep) and 0.1.5 (transitive via the gated tastytrade
+# 0.3.0), a deny.toml `multiple-versions = "warn"` duplicate, never a failure.
+dxlink = { version = "0.2", optional = true }
 # The Parquet reader for the IronCondor result bundle (issue #30, ADR-0010,
 # `docs/04-replay-mode.md` §2/§3). The bundle's four tables are Parquet; the
 # reader decodes them batch-by-batch under measured resource ceilings. ChainView
