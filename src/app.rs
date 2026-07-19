@@ -70,6 +70,8 @@ mod replay_load;
 mod replay_view;
 mod supervisor;
 
+use replay_view::EquityGeometry;
+
 pub use bridge::{BridgeSenders, COMMAND_CHANNEL_CAPACITY, CONTROL_CHANNEL_CAPACITY, EventBridge};
 // `ProviderRegistry` stays crate-internal to `registry` (the UI never receives
 // it, and external code composes through the builder), so only the builder entry
@@ -1994,36 +1996,39 @@ pub struct LoadedReplay {
     /// The drilled-into fill, or `None` before any drill-down / after the selected
     /// fill scrubs out of the as-of window (`,` / `.` step it, #35).
     pub selection: Option<Fill>,
-    /// The equity line series (step → equity **cents**) up to the head, built off
-    /// the draw path from the cursor's as-of slice and projected by the ui view-cache
-    /// (#23/#35). Private — the screen reads the projection, never this `GraphData`.
-    equity_graph: GraphData,
-    /// The peak drawdown in **integer cents** (`<= 0`) over the as-of slice, computed
-    /// off the draw path so the widget reads an exact `Copy` figure, never scanning
-    /// the equity per frame.
-    peak_drawdown_cents: i64,
-    /// A monotonic counter bumped whenever [`equity_graph`](Self::equity_graph) is
-    /// rebuilt (load + every cursor move), diffed by the ui view-cache to re-project
-    /// the equity series only when it actually changed (#35, the payoff-cache pattern).
+    /// The off-draw equity geometry (the step → equity **cents** series up to the head
+    /// plus the exact peak drawdown), seeded from the run's opening capital and
+    /// maintained incrementally on a forward cursor move / rebuilt on a backward seek
+    /// (#23/#35). Private — the screen reads the projection + the `Copy` peak figure,
+    /// never this state.
+    geometry: EquityGeometry,
+    /// A monotonic counter bumped whenever [`geometry`](Self::geometry) is rebuilt
+    /// (load + every cursor move), diffed by the ui view-cache to re-project the equity
+    /// series only when it actually changed (#35, the payoff-cache pattern).
     equity_revision: u64,
 }
 
 impl LoadedReplay {
     /// Build the loaded payload from `bundle`, resolving the timeline cursor at the
     /// first step (`docs/01-domain-model.md` §10) with no drill-down selection and the
-    /// equity geometry built once for step 0 (off the draw path).
+    /// equity geometry built once for step 0 (off the draw path). The drawdown running
+    /// peak is seeded from the run's **opening capital** (`config.initial_capital`, the
+    /// #29 reconcile) so a step-0 loss shows its true drawdown; a manifest whose capital
+    /// is unreadable (an already-validated bundle always yields it) falls back to the
+    /// first equity row — the prior behaviour, never a fabricated figure.
     #[must_use]
     pub fn new(bundle: LoadedBundle) -> Self {
         let cursor = TimelineCursor::new(&bundle);
         let visible = cursor.visible_equity(&bundle);
-        let equity_graph = replay_view::build_equity_series(visible);
-        let peak_drawdown_cents = replay_view::peak_drawdown_cents(visible);
+        let seed_cents = opening_capital_cents(&bundle)
+            .or_else(|| bundle.equity.first().map(|point| point.equity_cents))
+            .unwrap_or(0);
+        let geometry = EquityGeometry::build(visible, seed_cents);
         Self {
             bundle,
             cursor,
             selection: None,
-            equity_graph,
-            peak_drawdown_cents,
+            geometry,
             equity_revision: 0,
         }
     }
@@ -2032,7 +2037,7 @@ impl LoadedReplay {
     /// project off the draw path. Not read by `draw`.
     #[must_use]
     pub fn equity_graph(&self) -> &GraphData {
-        &self.equity_graph
+        self.geometry.graph()
     }
 
     /// The equity-series revision the ui view-cache diffs to schedule a re-project
@@ -2042,11 +2047,12 @@ impl LoadedReplay {
         self.equity_revision
     }
 
-    /// The peak drawdown up to the head in **integer cents** (`<= 0`), formatted to
-    /// `$` at the render edge (#35). A `Copy` read — never a per-frame equity scan.
+    /// The peak drawdown up to the head in **integer cents** (`<= 0`), measured against
+    /// the opening-capital-seeded running peak and formatted to `$` at the render edge
+    /// (#35). A `Copy` read — never a per-frame equity scan.
     #[must_use]
     pub fn peak_drawdown_cents(&self) -> i64 {
-        self.peak_drawdown_cents
+        self.geometry.peak_drawdown_cents()
     }
 
     /// The `Copy` identity key of the drill-down selection — `(step, order_id,
@@ -2066,15 +2072,20 @@ impl LoadedReplay {
         self.reclamp_selection();
     }
 
-    /// Rebuild the equity series + peak-drawdown figure from the cursor's as-of slice
-    /// and bump the revision, off the draw path. `O(visible)` on the seek/tick path,
-    /// never per frame.
+    /// Refresh the cached equity geometry from the cursor's as-of slice and bump the
+    /// revision, off the draw path. A **forward** move (the slice grew or held) folds
+    /// only the newly-visible tail into the running peak and appends its samples —
+    /// `O(new points)` on the playback/step path, never a full rescan. A **backward**
+    /// seek (the slice shrank) cannot extend, so it rebuilds from the opening-capital
+    /// seed — `O(visible)`, but only on an arbitrary jump, not per tick. Either way the
+    /// result is a pure function of the bundle + cursor (incremental == full).
     fn rebuild_equity(&mut self) {
         let visible = self.cursor.visible_equity(&self.bundle);
-        let graph = replay_view::build_equity_series(visible);
-        let peak = replay_view::peak_drawdown_cents(visible);
-        self.equity_graph = graph;
-        self.peak_drawdown_cents = peak;
+        if visible.len() >= self.geometry.raw_len() {
+            self.geometry.extend_forward(visible);
+        } else {
+            self.geometry.rebuild(visible);
+        }
         self.equity_revision = self.equity_revision.checked_add(1).unwrap_or(0);
     }
 
@@ -2133,6 +2144,18 @@ impl LoadedReplay {
         self.selection = next;
         true
     }
+}
+
+/// The run's opening capital in **integer cents** (the drawdown baseline), projected
+/// once from the validated manifest's `config.initial_capital` via the typed
+/// [`CapitalConfig`](crate::replay::CapitalConfig) (#29). `None` only when the manifest
+/// capital is unreadable — an already-validated bundle always yields `Some`, so the
+/// `None` fallback is reserved for synthetic in-memory bundles. Money stays integer
+/// cents; no `f64`, no panic (the checked `u64 → i64` narrowing is discarded to `None`
+/// rather than propagated, since the seed has an honest first-equity-row fallback).
+#[must_use]
+fn opening_capital_cents(bundle: &LoadedBundle) -> Option<i64> {
+    bundle.manifest.capital_config().ok()?.capital_cents().ok()
 }
 
 /// The `Copy` identity key of a fill — its unique `(step, order_id, fill_seq)` sort

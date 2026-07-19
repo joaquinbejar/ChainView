@@ -214,8 +214,8 @@ fn draw_ready(
 /// is read from the first fill (a run-level property), omitted when the run has no
 /// fills; the `run` label is sanitized at this edge.
 fn replay_title(run: &str, loaded: &LoadedReplay) -> String {
-    let step = loaded.cursor.position;
-    let end = loaded.cursor.end_step;
+    let step = loaded.cursor.position();
+    let end = loaded.cursor.end_step();
     match loaded.bundle.fills.first() {
         Some(fill) => format!(
             "Replay · {} · {} · step {step}/{end}",
@@ -351,7 +351,7 @@ fn draw_drawdown(frame: &mut Frame, area: Rect, theme: Theme, loaded: &LoadedRep
 /// magnitude-proportional bar. An absent head row (empty run) renders every term as
 /// `—`, never a fabricated `0`.
 fn draw_attribution(frame: &mut Frame, area: Rect, theme: Theme, loaded: &LoadedReplay) {
-    let step = loaded.cursor.position;
+    let step = loaded.cursor.position();
     let block = Block::bordered().title(Span::styled(
         format!("P&L attribution @ step {step}"),
         theme.accent(),
@@ -453,7 +453,7 @@ fn attribution_line(
         ]),
         Some((is_negative, magnitude)) => {
             // Room left for the amount + bar after the label and the 1-cell sign.
-            let after_sign = content_w.saturating_sub(ATTRIB_LABEL_WIDTH + 1);
+            let after_sign = floor_sub(content_w, ATTRIB_LABEL_WIDTH + 1);
             let amount = fmt_cents_abs(magnitude);
             let amount_len = amount.chars().count();
             let style = theme.pnl_style(is_negative);
@@ -463,7 +463,7 @@ fn attribution_line(
                 // room), then give any remainder to the magnitude bar.
                 let pad = ATTRIB_AMOUNT_WIDTH.max(amount_len).min(after_sign);
                 spans.push(Span::styled(format!("{amount:<pad$}"), style));
-                let bar_room = after_sign.saturating_sub(pad).min(ATTRIB_MAX_BAR);
+                let bar_room = floor_sub(after_sign, pad).min(ATTRIB_MAX_BAR);
                 if bar_room > 0 {
                     spans.push(Span::styled(
                         bar_string(magnitude, max_abs, bar_room),
@@ -494,6 +494,15 @@ fn elide(s: &str, max_width: usize) -> String {
     let mut out: String = s.chars().take(max_width - 1).collect();
     out.push('…');
     out
+}
+
+/// `a - b` floored at zero, spelled so it can never underflow — the ruleset bans
+/// `saturating_sub` and `checked_sub(..).unwrap_or(0)` trips clippy's
+/// `manual_saturating_arithmetic` lint, so the floor is `a.max(b) - b` (the same
+/// idiom as `ui/chain.rs`).
+#[must_use]
+fn floor_sub(a: usize, b: usize) -> usize {
+    a.max(b) - b
 }
 
 /// A magnitude-proportional bar of `█` cells: `|value| / max_abs * width`, clamped to
@@ -833,8 +842,9 @@ mod tests {
     use ratatui::text::Line;
 
     use super::{
-        AttribRow, attribution_line, bar_string, draw, fmt_axis_cents, fmt_cents_abs,
-        fmt_drawdown_cents, fmt_drawdown_ratio, fmt_signed_cents, group_thousands, handle_key,
+        ATTRIB_LABEL_WIDTH, AttribRow, attribution_line, bar_string, draw, fmt_axis_cents,
+        fmt_cents_abs, fmt_drawdown_cents, fmt_drawdown_ratio, fmt_signed_cents, group_thousands,
+        handle_key,
     };
     use crate::app::tests_support::loaded_bundle;
     use crate::app::{BundleLoad, ReplayState};
@@ -1263,6 +1273,122 @@ mod tests {
         assert_eq!(rev1, rev2, "a no-op seek does not re-project");
     }
 
+    // --- drawdown is seeded from the opening capital (#35, Fix 1) -------------
+
+    /// The base manifest with an explicit `config.initial_capital` (the #29 writer
+    /// shape) so the loaded payload reads a real opening capital.
+    fn manifest_with_capital(initial_capital: u64) -> BundleManifest {
+        let mut m = manifest();
+        m.config = serde_json::json!({ "initial_capital": initial_capital });
+        m
+    }
+
+    /// An equity-only bundle over `0..n` with a non-monotonic curve (so playback
+    /// crosses drawdowns) and an explicit opening capital.
+    fn capital_bundle(n: u32, initial_capital: u64) -> LoadedBundle {
+        LoadedBundle {
+            manifest: manifest_with_capital(initial_capital),
+            fills: Vec::new(),
+            equity: (0..n)
+                .map(|s| {
+                    let wobble = (i64::from(s % 41) - 20) * 1_500;
+                    equity(s, 1_000_000 + wobble, 0.0)
+                })
+                .collect(),
+            positions: Vec::new(),
+            greeks: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_step0_loss_shows_drawdown_vs_opening_capital() {
+        // Opening capital $10,000.00 (1_000_000c); step 0 closes at $9,900.00 — a loss
+        // on the very first step. Seeding the running peak from the opening capital (not
+        // the first equity row) surfaces the −$100.00 step-0 loss as a −10_000c drawdown
+        // at the head; a first-row seed would (wrongly) report $0.
+        let bundle = LoadedBundle {
+            manifest: manifest_with_capital(1_000_000),
+            fills: Vec::new(),
+            equity: vec![equity(0, 990_000, -0.01), equity(1, 1_050_000, 0.0)],
+            positions: Vec::new(),
+            greeks: Vec::new(),
+        };
+        let state = state_from(bundle);
+        assert_eq!(
+            state
+                .loaded()
+                .map(crate::app::LoadedReplay::peak_drawdown_cents),
+            Some(-10_000),
+            "a step-0 loss shows its true drawdown vs the opening capital, not $0",
+        );
+    }
+
+    #[test]
+    fn test_forward_steps_match_a_direct_seek_across_a_stride_boundary() {
+        // > MAX_EQUITY_POINTS (512) rows so stepping forward crosses a downsample-stride
+        // boundary. Stepping forward one at a time (the incremental extend path) lands on
+        // exactly the same cached peak + series as one arbitrary seek to the end (the
+        // full-rebuild path): incremental == full, determinism preserved.
+        let n = 600u32;
+        let cap = 1_000_000u64;
+        let mut stepper = state_from(capital_bundle(n, cap));
+        for _ in 0..n {
+            let _ = stepper.seek(SeekTo::StepBy(1));
+        }
+        let mut seeker = state_from(capital_bundle(n, cap));
+        let _ = seeker.seek(SeekTo::Step(u32::MAX));
+
+        let step_peak = stepper
+            .loaded()
+            .map(crate::app::LoadedReplay::peak_drawdown_cents);
+        let seek_peak = seeker
+            .loaded()
+            .map(crate::app::LoadedReplay::peak_drawdown_cents);
+        assert_eq!(
+            step_peak, seek_peak,
+            "the incremental forward peak equals the arbitrary-seek rebuild peak",
+        );
+
+        // The projected series agree too (same head → same geometry).
+        let step_series = match stepper.loaded().map(crate::app::LoadedReplay::equity_graph) {
+            Some(GraphData::Series(s)) => (s.x.clone(), s.y.clone()),
+            other => panic!("expected a Series, got {other:?}"),
+        };
+        let seek_series = match seeker.loaded().map(crate::app::LoadedReplay::equity_graph) {
+            Some(GraphData::Series(s)) => (s.x.clone(), s.y.clone()),
+            other => panic!("expected a Series, got {other:?}"),
+        };
+        assert_eq!(
+            step_series, seek_series,
+            "the incremental forward series equals the arbitrary-seek rebuild series",
+        );
+    }
+
+    #[test]
+    fn test_backward_seek_rebuilds_the_drawdown_from_the_seed() {
+        // A forward run to the end, then a backward seek to an earlier head: the
+        // rebuild path recomputes the drawdown over the shorter slice from the preserved
+        // opening-capital seed — equal to loading fresh and seeking directly there.
+        let n = 40u32;
+        let cap = 1_000_000u64;
+        let mut state = state_from(capital_bundle(n, cap));
+        let _ = state.seek(SeekTo::Step(u32::MAX)); // forward to the end
+        let _ = state.seek(SeekTo::Step(9)); // backward jump → full rebuild
+
+        let mut reference = state_from(capital_bundle(n, cap));
+        let _ = reference.seek(SeekTo::Step(9)); // fresh forward-extend to the same head
+
+        assert_eq!(
+            state
+                .loaded()
+                .map(crate::app::LoadedReplay::peak_drawdown_cents),
+            reference
+                .loaded()
+                .map(crate::app::LoadedReplay::peak_drawdown_cents),
+            "the backward rebuild reproduces the drawdown at the earlier head",
+        );
+    }
+
     // --- money + display formatters ------------------------------------------
 
     #[test]
@@ -1354,6 +1480,38 @@ mod tests {
         assert!(
             !narrow.contains("$1,930.00"),
             "the complete amount does not fit at a narrow width: {narrow:?}"
+        );
+    }
+
+    #[test]
+    fn test_attribution_line_width_floor_holds_at_the_boundary() {
+        // The width floors (`floor_sub`) bottom out at zero instead of underflowing.
+        let theme = theme();
+        let row = AttribRow::signed("Θ theta", 193_000); // "$1,930.00"
+        // At width 0 and at exactly label+sign width, there is no room for the amount:
+        // the line renders the label + sign only, never a panic, never a bare prefix.
+        for w in [0usize, ATTRIB_LABEL_WIDTH + 1] {
+            let text = line_text(&attribution_line(&row, 193_000, w, theme));
+            assert!(
+                text.starts_with("Θ theta"),
+                "the label still renders at width {w}: {text:?}",
+            );
+            assert!(
+                !text.contains("$1,930.00"),
+                "no room for the amount at width {w}: {text:?}",
+            );
+        }
+        // Exactly one cell past the sign: the floor yields 1, so the amount elides to a
+        // lone `…` marker (the boundary of the bar-vs-amount budget).
+        let tight = line_text(&attribution_line(
+            &row,
+            193_000,
+            ATTRIB_LABEL_WIDTH + 2,
+            theme,
+        ));
+        assert!(
+            tight.contains('…'),
+            "one cell past the sign elides to a marker: {tight:?}",
         );
     }
 
