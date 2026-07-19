@@ -211,9 +211,8 @@ pub use app::{
     EventBridge, ExitCause, ExitReporter, FinalTeardown, GuardTeardown, LegError, LegFocus,
     LiveScreen, LiveState, LoadedReplay, Mode, OverlayBinding, PayoffBuilder, ProviderSubscription,
     ReplayPayoffHead, ReplayScreen, ReplayState, Resolved, ScreenLoad, Selection, Side,
-    SourceBinding, StatusLine,
-    SupervisedTask, Supervisor, SurfaceAxis, SurfacePanel, SurfaceView, TaskExit, TokioTask,
-    is_replay_screen_reachable, is_screen_reachable, spawn_bundle_load,
+    SourceBinding, StatusLine, SupervisedTask, Supervisor, SurfaceAxis, SurfacePanel, SurfaceView,
+    TaskExit, TokioTask, is_replay_screen_reachable, is_screen_reachable, spawn_bundle_load,
     spawn_supervised_subscription,
 };
 // The closed event set folded by the state machine and the render -> data

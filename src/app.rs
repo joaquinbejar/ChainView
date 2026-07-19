@@ -2529,15 +2529,6 @@ impl LoadedReplay {
         self.reclamp_selection();
     }
 
-<<<<<<< HEAD
-    /// Refresh the cached equity geometry from the cursor's as-of slice and bump the
-    /// revision, off the draw path. A **forward** move (the slice grew or held) folds
-    /// only the newly-visible tail into the running peak and appends its samples —
-    /// `O(new points)` on the playback/step path, never a full rescan. A **backward**
-    /// seek (the slice shrank) cannot extend, so it rebuilds from the opening-capital
-    /// seed — `O(visible)`, but only on an arbitrary jump, not per tick. Either way the
-    /// result is a pure function of the bundle + cursor (incremental == full).
-=======
     /// Rebuild the payoff-at-head geometry from the cursor's cached open set and bump
     /// its revision, off the draw path (#49). The open set is resolved **here** (a
     /// seek-time `O(k log k)` pass), never per frame in `draw`.
@@ -2548,10 +2539,13 @@ impl LoadedReplay {
         self.payoff_revision = self.payoff_revision.checked_add(1).unwrap_or(0);
     }
 
-    /// Rebuild the equity series + peak-drawdown figure from the cursor's as-of slice
-    /// and bump the revision, off the draw path. `O(visible)` on the seek/tick path,
-    /// never per frame.
->>>>>>> 5420efe (Add the replay payoff-at-head panel (#49))
+    /// Refresh the cached equity geometry from the cursor's as-of slice and bump the
+    /// revision, off the draw path. A **forward** move (the slice grew or held) folds
+    /// only the newly-visible tail into the running peak and appends its samples —
+    /// `O(new points)` on the playback/step path, never a full rescan. A **backward**
+    /// seek (the slice shrank) cannot extend, so it rebuilds from the opening-capital
+    /// seed — `O(visible)`, but only on an arbitrary jump, not per tick. Either way the
+    /// result is a pure function of the bundle + cursor (incremental == full).
     fn rebuild_equity(&mut self) {
         let visible = self.cursor.visible_equity(&self.bundle);
         if visible.len() >= self.geometry.raw_len() {
