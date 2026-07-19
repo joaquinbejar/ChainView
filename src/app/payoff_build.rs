@@ -22,11 +22,13 @@
 //! [`Position`] vector cached on the committed strategy. Both curves price against
 //! that frozen basis: the expiration payoff and the t+0 reprice read the frozen P0,
 //! never the live chain mid. So after a quote moves (P0→P1) the t+0 tick refresh
-//! (`rebuild_tplus0`) mutates **only** the sampled underlying and the current per-leg
-//! IV — the premium stays P0 — making the t+0 curve a locked-entry mark-to-market
-//! that shows the accrued unrealized P&L at spot and still converges to the frozen
-//! expiration line at the wings. Re-reading the current mark as the entry premium
-//! each tick (the prior bug) hid unrealized P&L and split the two curves' cost basis.
+//! (`rebuild_tplus0`) mutates **only** the sampled underlying, the current per-leg
+//! IV, and the time-to-expiry (so it theta-decays as the app is held open, #27 SF-3)
+//! — the entry premium stays P0 — making the t+0 curve a locked-entry
+//! mark-to-market that shows the accrued unrealized P&L at spot and still converges to
+//! the frozen expiration line at the wings. Re-reading the current mark as the entry
+//! premium each tick (the prior bug) hid unrealized P&L and split the two curves' cost
+//! basis.
 //!
 //! # Split IV requirement: expiration is IV-free, t+0 needs a plausible IV (#27 SF-2)
 //!
@@ -44,10 +46,12 @@
 //!
 //! Every input is read from the borrowed [`ChainStore`] snapshot — the marks, the
 //! per-leg IV (the #24 sidecar), the underlying, and a **stored** reference instant
-//! ([`ChainStore::last_full_poll`]) — never `Utc::now()` and never an RNG. Time to
-//! expiry is priced with [`ExpirationDate::Days`], whose year fraction is
-//! `days / 365` (clock-free). The build is a pure function of `(legs, store
-//! snapshot)`, so identical inputs yield an identical series.
+//! (the commit-time [`ChainStore::last_full_poll`] seeds the frozen entry positions;
+//! the latest `ChainStore::analytics_as_of` reprices the t+0 DTE each rebuild, #27
+//! SF-3) — never `Utc::now()` and never an RNG. Time to expiry is priced with
+//! [`ExpirationDate::Days`], whose year fraction is `days / 365` (clock-free). The
+//! build is a pure function of `(legs, store snapshot)`, so identical inputs yield an
+//! identical series.
 //!
 //! # The break-even scan is grid-derived, not the ctor scan
 //!
@@ -141,11 +145,13 @@ pub(crate) fn build_geometry(legs: &[BuilderLeg], store: &ChainStore) -> Option<
 
 /// Rebuild **only** the t+0 series by repricing the **frozen** `entry_positions`
 /// against the current `store` snapshot on the committed `grid`: the entry premium
-/// stays frozen (P0) and only the sampled underlying and the current per-leg IV
-/// move. Returns the empty series when any leg lacks a plausible IV (the "t+0
-/// unavailable" state). Constructs **no** `CustomStrategy` and touches neither the
-/// expiration series nor the break-evens — the tick-path refresh that never runs the
-/// break-even scan (#27 SF-1).
+/// stays frozen (P0) and only the sampled underlying, the current per-leg IV, and the
+/// time-to-expiry (recomputed from the latest analytics instant, so the curve
+/// theta-decays, #27 SF-3) move. Returns the empty series when any leg lacks a
+/// plausible IV or the expiry is no longer in the future (the "t+0 unavailable"
+/// state). Constructs **no** `CustomStrategy` and touches neither the expiration
+/// series nor the break-evens — the tick-path refresh that never runs the break-even
+/// scan (#27 SF-1).
 #[must_use]
 pub(crate) fn rebuild_tplus0(
     legs: &[BuilderLeg],
@@ -209,9 +215,10 @@ fn build_entry_positions(legs: &[BuilderLeg], store: &ChainStore) -> Option<Vec<
 }
 
 /// The t+0 curve for the frozen `entry_positions`: reprice them with the current
-/// plausible per-leg IV and sample across `grid`, or the empty series when any leg
-/// lacks a plausible IV (the "t+0 unavailable — no reliable IV" state). The frozen
-/// entry premium is never re-read.
+/// plausible per-leg IV and the fresh time-to-expiry (#27 SF-3), then sample across
+/// `grid`, or the empty series when any leg lacks a plausible IV or the expiry is no
+/// longer in the future (the "t+0 unavailable" state). The frozen entry premium is
+/// never re-read.
 #[must_use]
 fn tplus0_curve(
     entry_positions: &[Position],
@@ -225,11 +232,24 @@ fn tplus0_curve(
     }
 }
 
-/// Clone the frozen `entry_positions` and set each leg's **current** plausible IV
-/// for the t+0 reprice — mutating only the volatility (the underlying is swept per
-/// grid sample in [`tplus0_pnl`]) and never the frozen entry premium. `None` when any
-/// leg lacks a plausible IV, so the t+0 curve degrades to unavailable rather than
-/// mixing a real IV with a fabricated one.
+/// Clone the frozen `entry_positions` and reprice each leg for the t+0 curve —
+/// setting its **current** plausible IV and its **fresh** time-to-expiry (the
+/// underlying is swept per grid sample in [`tplus0_pnl`]) — while never touching the
+/// frozen entry premium. `None` when any leg lacks a plausible IV, or when the
+/// time-to-expiry is no longer a future span, so the t+0 curve degrades to
+/// unavailable rather than mixing a real input with a fabricated one.
+///
+/// # Theta decay (#27 SF-3)
+///
+/// The frozen `entry_positions` carry the DTE captured **at commit**; repricing them
+/// against that stale DTE would freeze the t+0 curve at the entry instant's
+/// time-to-expiry, so held open for hours it would never theta-decay. The DTE is
+/// therefore recomputed here from the **latest** analytics instant
+/// (`ChainStore::analytics_as_of` — the deterministic clock the #24 kernel already
+/// advances on each data-changing fold, never `Utc::now()`) against the chain's
+/// absolute expiry, so a later refresh prices a smaller DTE and the curve decays
+/// toward the (frozen) expiration line. Only the DTE and IV move; the entry premium
+/// (`Position::premium`) is untouched — the SF-1 frozen cost basis is preserved.
 #[must_use]
 fn repriced_for_tplus0(
     entry_positions: &[Position],
@@ -237,10 +257,16 @@ fn repriced_for_tplus0(
     store: &ChainStore,
 ) -> Option<Vec<Position>> {
     let ivs = resolve_leg_ivs(legs, store)?;
+    // Recompute the time-to-expiry from the latest analytics instant (arriving as
+    // data, never a wall-clock read) so the reprice stays deterministic and the t+0
+    // curve theta-decays as the app is held open.
+    let expiration_utc = absolute_expiry(store.chain())?;
+    let expiration = ExpirationDate::Days(days_between(store.analytics_as_of(), expiration_utc)?);
     let mut priced = Vec::with_capacity(entry_positions.len());
     for (position, iv) in entry_positions.iter().zip(ivs.iter()) {
         let mut position = position.clone();
         position.option.implied_volatility = *iv;
+        position.option.expiration_date = expiration;
         priced.push(position);
     }
     Some(priced)
@@ -517,6 +543,10 @@ fn series(name: &str, x: Vec<Decimal>, y: Vec<Decimal>) -> GraphData {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use optionstratlib::chains::OptionData;
+    use optionstratlib::chains::chain::OptionChain;
     use optionstratlib::model::Position;
     use optionstratlib::prelude::{Decimal, Positive};
     use optionstratlib::pricing::Profit;
@@ -525,8 +555,12 @@ mod tests {
     use optionstratlib::{ExpirationDate, OptionStyle, OptionType, Options, Side as OptionSide};
 
     use super::{
-        GreeksOrigin, MIN_PLAUSIBLE_LOCAL_IV, break_even_points, expiration_series,
-        plausible_leg_iv, tplus0_series,
+        BuilderLeg, GreeksOrigin, MIN_PLAUSIBLE_LOCAL_IV, Side, break_even_points, build_geometry,
+        expiration_series, plausible_leg_iv, rebuild_tplus0, tplus0_series,
+    };
+    use crate::chain::{
+        AliasCatalog, ChainFetch, ChainSource, ChainStore, ContractSpecFingerprint, ExerciseStyle,
+        ExpirySource, GreeksRow, Instrument, InstrumentKey, ProviderId, SettlementStyle,
     };
 
     // --- Constructors (no unwrap/expect/indexing per the ruleset) ------------
@@ -738,6 +772,278 @@ mod tests {
             plausible_leg_iv(plausible, GreeksOrigin::ComputedLocally),
             Some(plausible),
             "a plausible local IV passes the floor",
+        );
+    }
+
+    // --- #27 SF-3: the t+0 DTE recomputes from the latest analytics instant ------
+    //
+    // The frozen entry positions carry the commit-time DTE; the t+0 reprice must
+    // recompute it from the store's `analytics_as_of` so the curve theta-decays as
+    // the app is held open, while the entry premium stays frozen. A VENUE IV is
+    // pinned so only the DTE varies between rebuilds — a locally-inverted IV would
+    // recalibrate to the mark at each DTE and mask the decay.
+
+    /// The chain expiry string every store here shares — it parses to an absolute
+    /// instant well after both seed instants, so the DTE is a positive future span.
+    const CHAIN_EXPIRY: &str = "2025-06-27";
+    /// An early analytics instant (~591 days to expiry).
+    const AS_OF_EARLY: i64 = 1_700_000_000;
+    /// A later analytics instant (~69 days to expiry) — a smaller DTE, same chain.
+    const AS_OF_LATE: i64 = 1_745_000_000;
+
+    #[track_caller]
+    fn utc(secs: i64) -> chrono::DateTime<chrono::Utc> {
+        match chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0) {
+            Some(t) => t,
+            None => panic!("invalid test timestamp: {secs}"),
+        }
+    }
+
+    #[track_caller]
+    fn pid(id: &str) -> ProviderId {
+        match ProviderId::new(id) {
+            Ok(p) => p,
+            Err(e) => panic!("invalid provider id `{id}`: {e}"),
+        }
+    }
+
+    /// The absolute expiry `CHAIN_EXPIRY` parses to — the key the injected venue IV
+    /// row and the payoff IV resolution share.
+    #[track_caller]
+    fn resolved_expiry() -> chrono::DateTime<chrono::Utc> {
+        let chain = OptionChain::new("BTC", pos(100.0), CHAIN_EXPIRY.to_owned(), None, None);
+        match chain.get_expiration() {
+            Some(ExpirationDate::DateTime(dt)) => dt,
+            other => panic!("expected an absolute chain expiry, got {other:?}"),
+        }
+    }
+
+    /// An ATM call row with a present mark and a plausible chain IV.
+    fn atm_row(strike: f64) -> OptionData {
+        let mut od = OptionData {
+            strike_price: pos(strike),
+            call_bid: Some(pos(9.0)),
+            call_ask: Some(pos(11.0)),
+            put_bid: Some(pos(9.0)),
+            put_ask: Some(pos(11.0)),
+            implied_volatility: pos(0.5),
+            ..Default::default()
+        };
+        od.set_mid_prices();
+        od
+    }
+
+    /// A one-strike chain at `spot`.
+    fn atm_chain(spot: f64) -> OptionChain {
+        let mut chain = OptionChain::new("BTC", pos(spot), CHAIN_EXPIRY.to_owned(), None, None);
+        let _ = chain.options.insert(atm_row(spot));
+        chain
+    }
+
+    /// The identity for the ATM call leg, keyed at the resolved chain expiry so the
+    /// injected venue IV lands on the sidecar entry the payoff resolution reads.
+    fn instrument(spot: f64) -> Instrument {
+        Instrument {
+            key: InstrumentKey {
+                underlying: "BTC".to_owned(),
+                expiration_utc: resolved_expiry(),
+                strike: pos(spot),
+                style: OptionStyle::Call,
+            },
+            provider: pid("deribit"),
+            native_symbol: "BTC-CALL".to_owned(),
+            stream_symbol: None,
+            spec: ContractSpecFingerprint {
+                contract_multiplier: 1,
+                settlement: SettlementStyle::Cash,
+                exercise: ExerciseStyle::European,
+                quote_currency: "USD".to_owned(),
+                venue_product_code: "BTC".to_owned(),
+            },
+        }
+    }
+
+    /// A venue (`Provider`-origin) greeks row pinning the leg IV to a CONSTANT: it
+    /// survives every recompute (venue wins over local inversion), so only the DTE
+    /// varies between rebuilds — a locally-inverted IV would recalibrate to the mark
+    /// at each DTE and hide the decay.
+    fn venue_iv_row(spot: f64, iv: f64, received: i64) -> GreeksRow {
+        GreeksRow {
+            instrument: instrument(spot),
+            iv: Some(pos(iv)),
+            delta: None,
+            gamma: None,
+            theta: None,
+            vega: None,
+            rho: None,
+            origin: GreeksOrigin::Provider,
+            event_time: None,
+            received_time: utc(received),
+        }
+    }
+
+    /// Seed a store at `spot` and advance its deterministic `analytics_as_of` to
+    /// `as_of` by folding a venue IV row (Provider origin, IV 0.5) — the instant the
+    /// t+0 DTE recompute reads, with the IV pinned constant across both instants.
+    fn store_at(spot: f64, as_of: i64) -> ChainStore {
+        let mut store = ChainStore::seed(
+            ChainFetch::new(
+                atm_chain(spot),
+                ExpirySource::new("BTC", resolved_expiry(), pid("deribit")),
+                AliasCatalog::new(),
+            ),
+            ChainSource::Merged,
+            Duration::from_secs(2),
+            utc(as_of),
+        );
+        let _ = store.apply_greeks(&venue_iv_row(spot, 0.5, as_of));
+        store
+    }
+
+    /// A single long ATM call leg.
+    fn atm_call_leg(spot: f64) -> Vec<BuilderLeg> {
+        vec![BuilderLeg {
+            strike: pos(spot),
+            style: OptionStyle::Call,
+            side: Side::Buy,
+            qty: 1,
+        }]
+    }
+
+    #[test]
+    fn test_tplus0_theta_decays_when_the_analytics_instant_advances() {
+        // SF-3: reprice the SAME frozen positions against a LATER analytics instant
+        // (a smaller DTE). The t+0 curve must move TOWARD the (frozen) expiration line
+        // at every sample — never away — and observably so near ATM, because BS →
+        // intrinsic as time-to-expiry shrinks. The venue IV is pinned, so only the DTE
+        // moves.
+        let spot = 100.0;
+        let legs = atm_call_leg(spot);
+        let early_store = store_at(spot, AS_OF_EARLY);
+        let late_store = store_at(spot, AS_OF_LATE);
+
+        let geometry = match build_geometry(&legs, &early_store) {
+            Some(g) => g,
+            None => panic!("the ATM call geometry prices at the early instant"),
+        };
+        // The early t+0 curve (larger DTE) is the one `build_geometry` cached.
+        let (early,) = xy(&geometry.tplus0);
+        let (exp,) = xy(&geometry.expiration);
+        // Reprice the SAME frozen positions at the later instant (smaller DTE).
+        let late = rebuild_tplus0(
+            &legs,
+            &late_store,
+            &geometry.grid,
+            &geometry.entry_positions,
+        );
+        let (late,) = xy(&late);
+
+        assert_eq!(
+            early.x, late.x,
+            "the shared grid is unchanged by the reprice"
+        );
+        assert_eq!(early.x, exp.x, "expiration shares the grid too");
+        assert_eq!(
+            late.x.len(),
+            geometry.grid.len(),
+            "one sample per grid point"
+        );
+
+        let eps = Decimal::new(1, 6);
+        let mut decayed = false;
+        for ((e, l), x) in early.y.iter().zip(late.y.iter()).zip(exp.y.iter()) {
+            // Toward expiration: the later (smaller-DTE) curve sits at or below the
+            // earlier one and at or above the frozen expiration line (time value ≥ 0
+            // and monotone in DTE at r = 0).
+            assert!(
+                *l <= *e + eps,
+                "later t+0 at/below earlier (theta-decay direction): early {e}, late {l}",
+            );
+            assert!(
+                *l >= *x - eps,
+                "later t+0 stays at/above the frozen expiration: late {l}, exp {x}",
+            );
+            if *e - *l > Decimal::ONE {
+                decayed = true;
+            }
+        }
+        assert!(
+            decayed,
+            "theta decay is observable — the curve dropped toward expiration somewhere",
+        );
+        assert_ne!(
+            early.y, late.y,
+            "the t+0 curve changed with the fresh, smaller DTE"
+        );
+    }
+
+    #[test]
+    fn test_tplus0_rebuild_keeps_the_entry_premium_frozen() {
+        // The DTE recompute must NOT re-base the entry premium (SF-1 preserved): the
+        // frozen positions carry P0 = the commit-time mark, and a rebuild at a later
+        // instant reads them read-only. Prove the premium is untouched and equals the
+        // commit-time chain mid — never re-read from the later store.
+        let spot = 100.0;
+        let legs = atm_call_leg(spot);
+        let early_store = store_at(spot, AS_OF_EARLY);
+        let late_store = store_at(spot, AS_OF_LATE);
+
+        let geometry = match build_geometry(&legs, &early_store) {
+            Some(g) => g,
+            None => panic!("the ATM call geometry prices at the early instant"),
+        };
+        let commit_mark = legs
+            .first()
+            .and_then(|leg| leg.mark_in(early_store.chain()));
+        let p0: Vec<Positive> = geometry.entry_positions.iter().map(|p| p.premium).collect();
+        assert_eq!(
+            p0.first().copied(),
+            commit_mark,
+            "the frozen premium is the commit-time mark P0",
+        );
+
+        // Rebuild at the later instant (fresh DTE) — the frozen basis is borrowed
+        // read-only, so a reprice can never re-base it.
+        let _ = rebuild_tplus0(
+            &legs,
+            &late_store,
+            &geometry.grid,
+            &geometry.entry_positions,
+        );
+        let p_after: Vec<Positive> = geometry.entry_positions.iter().map(|p| p.premium).collect();
+        assert_eq!(
+            p0, p_after,
+            "a later-instant rebuild never re-bases the frozen entry premium",
+        );
+    }
+
+    #[test]
+    fn test_tplus0_rebuild_is_deterministic_across_identical_inputs() {
+        // The reprice reads the instant as data (`analytics_as_of`), never a wall
+        // clock or RNG, so two rebuilds from identical inputs are byte-for-byte
+        // identical.
+        let spot = 100.0;
+        let legs = atm_call_leg(spot);
+        let late_store = store_at(spot, AS_OF_LATE);
+        let geometry = match build_geometry(&legs, &store_at(spot, AS_OF_EARLY)) {
+            Some(g) => g,
+            None => panic!("the ATM call geometry prices at the early instant"),
+        };
+        let first = rebuild_tplus0(
+            &legs,
+            &late_store,
+            &geometry.grid,
+            &geometry.entry_positions,
+        );
+        let second = rebuild_tplus0(
+            &legs,
+            &late_store,
+            &geometry.grid,
+            &geometry.entry_positions,
+        );
+        assert_eq!(
+            first, second,
+            "identical inputs yield an identical t+0 series"
         );
     }
 }

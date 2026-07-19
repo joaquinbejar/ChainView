@@ -307,8 +307,17 @@ fn render_thread(
 ) {
     // A draw failure ends the loop; the supervisor's teardown still restores the
     // terminal. The route closure is a no-op in v0.1 (commands are surfaced, not
-    // yet acted on beyond the seam).
-    let _ = run_render_loop(&mut terminal, app, bridge, rx_events, |_command| {});
+    // yet acted on beyond the seam). The ViewState is the render-loop-owned
+    // projection cache (#27): geometry projects off-draw in its sync step.
+    let mut view = chainview::ViewState::new();
+    let _ = run_render_loop(
+        &mut terminal,
+        app,
+        bridge,
+        &mut view,
+        rx_events,
+        |_command| {},
+    );
 }
 
 /// Replay mode (v0.3): the bundle reader, timeline, and replay screens land in
