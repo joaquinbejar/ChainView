@@ -23,6 +23,14 @@ path = "src/main.rs"
 
 [dependencies]
 thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+humantime = "2"
+clap = { version = "4.5", features = ["derive"] }
+dotenvy = "0.15"
+
+[dev-dependencies]
+proptest = "1"
 
 [lints.rust]
 warnings = { level = "deny", priority = -1 }

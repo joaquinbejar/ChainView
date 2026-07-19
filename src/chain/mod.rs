@@ -16,11 +16,16 @@ use std::fmt;
 /// **Placeholder (issue #2).** This minimal form exists so the boundary error
 /// types can name a provider without depending on the full validated newtype.
 /// Issue #4 reconciles it into the open, validated `^[a-z][a-z0-9_-]{1,31}$`
-/// newtype with `serde` support, reserved-id handling, and ordering
+/// newtype with `serde` support and reserved-id handling
 /// (`docs/01-domain-model.md` §4). Until then it performs **no** grammar
 /// validation and its constructor is infallible. It carries no credential —
 /// the inner string is the public, non-secret provider id.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+///
+/// Ordering (`PartialOrd`/`Ord`) delegates to the inner string and is present
+/// so `ProviderId` can key a `BTreeMap` — `Config::providers`
+/// (`docs/07-configuration.md` §3) — ahead of issue #4; the final newtype
+/// derives the same ordering.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ProviderId(String);
 
 impl ProviderId {
