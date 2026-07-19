@@ -486,11 +486,16 @@ pub const MAX_BATCH_ROWS: usize = 65_536;
 /// [`MAX_BATCH_ROWS`] × the column widths), not the whole table — the documented
 /// residual #36's adversarial fixtures probe.
 pub const MAX_BATCH_BYTES: u64 = 256 * 1024 * 1024;
-/// Decoded-overhead multiplier in **per-mille** (1500 = 1.5×). The owned rows #31
-/// materialises (plus the validation workspace #32 needs) cost more than the raw
-/// decoded buffers, so the measured tally inflates each batch by this factor. Held
-/// as an integer per-mille so the budget arithmetic stays exact (no `f64` on the
-/// allocation path).
+/// Decoded-overhead multiplier in **per-mille** (1500 = 1.5×). Applied to each
+/// decoded `RecordBatch`'s Arrow array memory size to cover the **transient decode
+/// workspace** — the scratch buffers the Parquet→Arrow decode touches beyond the
+/// batch's own arrays, freed when the batch drops. It does **not** estimate the
+/// **retained** owned rows the typed decode (#31) materialises: those are measured
+/// EXACTLY (`rows * size_of::<RowType>()` plus every owned `String`'s heap bytes) by
+/// each decoder and accounted separately, so a dictionary-encoded UTF8 column —
+/// counted once in the Arrow batch but copied per row into the owned `Vec` — cannot
+/// slip past the working-set ceiling behind this estimate. Held as an integer
+/// per-mille so the budget arithmetic stays exact (no `f64` on the allocation path).
 pub const DECODED_OVERHEAD_PERMILLE: u64 = 1_500;
 /// Decompression-bomb reject ratio (20×) — a footer whose declared uncompressed
 /// size exceeds this multiple of the on-disk/compressed size is rejected before
@@ -1038,14 +1043,19 @@ impl BundleReader {
     /// Stat, footer-gate, and measure-decode one table under the three ceilings,
     /// folding its measured working set into `budget` and handing each
     /// budget-accounted batch to `decode` (the #31 typed per-column decode, which
-    /// appends the rows into the caller's eager `Vec`). Strictly read-only.
+    /// appends the rows into the caller's eager `Vec`). `decode` RETURNS the exact
+    /// retained-bytes delta it appended (owned row structs + every owned `String`'s
+    /// heap bytes), which is accounted against `budget` in ADDITION to the batch's
+    /// Arrow footprint — so a dictionary-encoded UTF8 column, counted once in the
+    /// Arrow batch but copied per row, cannot slip past the ceiling. Strictly
+    /// read-only.
     fn scan_table(
         &self,
         file: &str,
         key: &str,
         budget: &mut WorkingSetBudget,
         cancelled: &dyn Fn() -> bool,
-        decode: &mut dyn FnMut(&RecordBatch) -> Result<(), BundleError>,
+        decode: &mut dyn FnMut(&RecordBatch) -> Result<u64, BundleError>,
     ) -> Result<(), BundleError> {
         let path = self.root.join(file);
 
@@ -1161,7 +1171,12 @@ impl BundleReader {
         // `total_uncompressed_size` counts uncompressed PAGES, not the memory the
         // decoded arrays occupy (dictionary/RLE/repeated UTF8 can expand well
         // beyond it), so the measured per-batch tally — not the footer — is the
-        // real guard.
+        // real guard. That tally has TWO parts, each accounted against the budget:
+        // the decoded batch's Arrow footprint (transient, freed when the batch
+        // drops) and the typed decode's RETAINED owned rows (persistent). The Arrow
+        // footprint counts a dictionary-encoded UTF8 column once, while the owned
+        // rows copy the string per row, so the retained part — returned by `decode`
+        // — is what closes that gap.
         let reader = builder
             .with_batch_size(self.ceilings.max_batch_rows)
             .build()
@@ -1176,13 +1191,19 @@ impl BundleReader {
             let batch_bytes = u64::try_from(batch.get_array_memory_size())
                 .map_err(|_| too_large(format!("{file}: decoded batch size exceeds u64")))?;
             let measured = apply_overhead(batch_bytes, self.ceilings.decoded_overhead_permille)?;
-            // Account the batch FIRST — a batch that would breach the working-set
-            // ceiling is rejected before the typed decode allocates any owned rows.
+            // Account the batch's TRANSIENT decode workspace FIRST — a batch that
+            // would breach the working-set ceiling is rejected before the typed
+            // decode allocates any owned rows.
             budget.account(measured)?;
             // Then cross the wire→domain boundary, appending this batch's rows into
             // the caller's eager `Vec` (capacity grown from the ACTUAL batch size).
+            // `decode` returns the EXACT retained-bytes delta (owned row structs +
+            // every owned `String`'s heap bytes); account it against the same budget
+            // so the persistent working set — not just the transient batch estimate
+            // above — is bounded, closing the dictionary-encoding gap.
             let rows = batch.num_rows();
-            decode(&batch)?;
+            let retained = decode(&batch)?;
+            budget.account(retained)?;
             decoded_rows = decoded_rows
                 .checked_add(rows)
                 .ok_or_else(|| too_large(format!("{file}: decoded row count overflowed usize")))?;
@@ -2881,6 +2902,104 @@ mod tests {
         assert_eq!(
             loaded.greeks, expected_greeks,
             "greeks must round-trip verbatim in file order"
+        );
+    }
+
+    // --- #31 review fix: the working-set budget measures the RETAINED rows --------
+
+    /// A full-schema fills batch whose `contract_id` column is a
+    /// `Dictionary(Int32, Utf8)` holding ONE `value`, keyed by every row — the Arrow
+    /// batch stores that string once, while the typed decode copies it per row.
+    fn fills_batch_with_dict_contract_id(n: usize, value: &str) -> RecordBatch {
+        use std::sync::Arc;
+
+        use arrow_array::types::Int32Type;
+        use arrow_array::{ArrayRef, DictionaryArray, Int32Array, StringArray};
+        use arrow_schema::{DataType, Field, Schema};
+
+        let base = fills_batch(n);
+        let keys = Int32Array::from(vec![0_i32; n]);
+        let values = Arc::new(StringArray::from(vec![value])) as ArrayRef;
+        let dict: ArrayRef = match DictionaryArray::<Int32Type>::try_new(keys, values) {
+            Ok(d) => Arc::new(d),
+            Err(e) => panic!("build dictionary array: {e}"),
+        };
+        let dict_type = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
+
+        let mut fields: Vec<Field> = base
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.as_ref().clone())
+            .collect();
+        let mut cols: Vec<ArrayRef> = base.columns().to_vec();
+        let idx = match base.schema().index_of("contract_id") {
+            Ok(i) => i,
+            Err(e) => panic!("fills batch missing contract_id: {e}"),
+        };
+        if let Some(slot) = fields.get_mut(idx) {
+            *slot = Field::new("contract_id", dict_type, false);
+        }
+        if let Some(slot) = cols.get_mut(idx) {
+            *slot = dict;
+        }
+        match RecordBatch::try_new(Arc::new(Schema::new(fields)), cols) {
+            Ok(b) => b,
+            Err(e) => panic!("build dict fills batch: {e}"),
+        }
+    }
+
+    #[test]
+    fn test_working_set_budget_trips_on_retained_dictionary_bytes() {
+        // The dictionary-encoding gap: a `Dictionary(Int32, Utf8)` stores its long
+        // value ONCE (plus one Int32 key per row), so the Arrow batch footprint stays
+        // small — but the typed decode copies the value into EVERY owned row. The
+        // retained accounting must catch what the batch estimate alone misses.
+        let n = 64;
+        let long = "L".repeat(1024);
+        let batch = fills_batch_with_dict_contract_id(n, &long);
+
+        // What the measured loop accounts for the batch itself: Arrow array memory
+        // size inflated by the transient-overhead factor.
+        let arrow_bytes = u64::try_from(batch.get_array_memory_size()).unwrap_or(u64::MAX);
+        let batch_estimate = match apply_overhead(arrow_bytes, DECODED_OVERHEAD_PERMILLE) {
+            Ok(v) => v,
+            Err(e) => panic!("overhead multiply: {e}"),
+        };
+
+        // What the typed decode retains: owned rows + the value copied into all N rows.
+        let mut out = Vec::new();
+        let retained = match tables::read_fills(&batch, &mut out) {
+            Ok(r) => r,
+            Err(e) => panic!("read_fills should succeed: {e}"),
+        };
+        assert_eq!(out.len(), n);
+        assert!(
+            retained > batch_estimate,
+            "the per-row copied dictionary string must make retained {retained} exceed the \
+             Arrow batch estimate {batch_estimate}"
+        );
+
+        // A ceiling that ADMITS the batch estimate but not the estimate + retained:
+        // the transient batch accounting alone would pass, yet the retained accounting
+        // trips it — exactly the working-set breach the old batch-only tally missed.
+        let ceilings = ResourceCeilings {
+            max_working_set: batch_estimate + retained - 1,
+            max_batch_bytes: retained,
+            ..ResourceCeilings::default()
+        };
+        let mut budget = WorkingSetBudget::new(&ceilings);
+        match budget.account(batch_estimate) {
+            Ok(()) => {}
+            Err(e) => panic!("the transient batch estimate alone must fit under the ceiling: {e}"),
+        }
+        match budget.account(retained) {
+            Err(BundleError::TooLarge(_)) => {}
+            other => panic!("the retained bytes must trip the working-set ceiling, got {other:?}"),
+        }
+        assert!(
+            budget.used() < ceilings.max_working_set,
+            "a rejected retained batch is never committed; used stays under the ceiling"
         );
     }
 }

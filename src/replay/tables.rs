@@ -47,6 +47,17 @@
 //! writer that dictionary-encodes `style`/`side`/`mode` (or any UTF8 column) still
 //! decodes. The dictionary key is bounds-checked against its value array before
 //! the string is read.
+//!
+//! # Retained-bytes accounting
+//!
+//! Each decoder RETURNS the exact retained-bytes delta it appended — the owned row
+//! structs (`rows * size_of::<RowType>()`) plus every owned `String`'s heap bytes —
+//! which the reader's working-set budget (`src/replay/mod.rs`) accounts in ADDITION
+//! to the decoded batch's Arrow memory footprint. This closes the dictionary-encoding
+//! gap: a `DictionaryArray<Int32, Utf8>` stores its values ONCE while the owned rows
+//! copy the string per row, so the Arrow batch size alone under-counts the retained
+//! working set by up to an order of magnitude. The tally is all checked arithmetic;
+//! an overflow is a typed [`BundleError::TooLarge`], never a wrapping multiply.
 
 use arrow_array::types::Int32Type;
 use arrow_array::{
@@ -149,6 +160,14 @@ fn dict_key_cell(table: &str, column: &str, row: usize) -> BundleError {
     BundleError::Invariant(format!(
         "{table}.{column} row {row}: dictionary key out of range"
     ))
+}
+
+/// A decoded batch's retained-bytes tally overflowed `u64` — an absurd batch,
+/// rejected as [`BundleError::TooLarge`] rather than a wrapped multiply.
+#[cold]
+#[inline(never)]
+fn retained_overflow(table: &str) -> BundleError {
+    BundleError::TooLarge(format!("{table}: retained-bytes tally overflowed u64"))
 }
 
 // --- Column lookup + strict downcast by name --------------------------------
@@ -386,6 +405,39 @@ fn decode_mode(table: &str, column: &str, row: usize, wire: &str) -> Result<Exec
     }
 }
 
+// --- Retained-bytes tally (the exact owned-rows delta, checked) -------------
+
+/// Add an owned string's byte length to a running retained-bytes tally, checked;
+/// an overflow is [`BundleError::TooLarge`] naming the table (never a wrapping add).
+#[inline]
+fn add_len(acc: u64, s: &str, table: &str) -> Result<u64, BundleError> {
+    let len = u64::try_from(s.len()).map_err(|_| retained_overflow(table))?;
+    acc.checked_add(len).ok_or_else(|| retained_overflow(table))
+}
+
+/// The exact retained-bytes delta a decoded batch appends to its typed `Vec`:
+/// `rows * row_size` (the owned row structs) plus `string_bytes` (the heap bytes of
+/// every owned `String` copied out of the batch). All checked (`checked_mul` /
+/// `checked_add`); an overflow is [`BundleError::TooLarge`] naming the table, never
+/// an `as` cast or a wrapping multiply.
+///
+/// The reader's working-set budget accounts this in ADDITION to the batch's Arrow
+/// memory footprint, so a dictionary-encoded UTF8 column — counted once in the Arrow
+/// batch but copied per row into the owned rows — cannot slip past the ceiling.
+#[inline]
+fn retained_bytes(
+    table: &str,
+    rows: usize,
+    row_size: usize,
+    string_bytes: u64,
+) -> Result<u64, BundleError> {
+    let rows = u64::try_from(rows).map_err(|_| retained_overflow(table))?;
+    let row_size = u64::try_from(row_size).map_err(|_| retained_overflow(table))?;
+    rows.checked_mul(row_size)
+        .and_then(|structs| structs.checked_add(string_bytes))
+        .ok_or_else(|| retained_overflow(table))
+}
+
 // --- The four table decoders (per batch, append into the eager `Vec`) -------
 
 /// Decode one `fills.parquet` [`RecordBatch`] and **append** its rows to `out`.
@@ -398,13 +450,18 @@ fn decode_mode(table: &str, column: &str, row: usize, wire: &str) -> Result<Exec
 /// appended in **file order**; the writer's `(step, order_id, fill_seq)` sort key
 /// is a guarantee #32 verifies, never something the reader repairs.
 ///
+/// Returns the exact **retained-bytes delta** appended (the owned `Fill` structs
+/// plus every owned `String`'s heap bytes), which the reader's working-set budget
+/// accounts separately from the batch's Arrow footprint.
+///
 /// # Errors
 ///
 /// [`BundleError::Schema`] if a required column is missing or wrong-typed;
 /// [`BundleError::Invariant`] naming the table + column + row on a NULL in a
 /// non-nullable column, a negative value in an unsigned-domain column, or an
-/// unrecognized enum wire string.
-pub(crate) fn read_fills(batch: &RecordBatch, out: &mut Vec<Fill>) -> Result<(), BundleError> {
+/// unrecognized enum wire string; [`BundleError::TooLarge`] if the retained-bytes
+/// tally overflows `u64`.
+pub(crate) fn read_fills(batch: &RecordBatch, out: &mut Vec<Fill>) -> Result<u64, BundleError> {
     let table = "fills";
     let step = i32_col(batch, table, "step")?;
     let ts_ns = i64_col(batch, table, "ts_ns")?;
@@ -425,8 +482,10 @@ pub(crate) fn read_fills(batch: &RecordBatch, out: &mut Vec<Fill>) -> Result<(),
     let slippage_cents = i64_col(batch, table, "slippage_cents")?;
     let mode = utf8_col(batch, table, "mode")?;
 
-    out.reserve(batch.num_rows());
-    for row in 0..batch.num_rows() {
+    let rows = batch.num_rows();
+    let start = out.len();
+    out.reserve(rows);
+    for row in 0..rows {
         out.push(Fill {
             step: u32_field(step, table, "step", row)?,
             ts_ns: i64_at(ts_ns, table, "ts_ns", row)?,
@@ -450,7 +509,15 @@ pub(crate) fn read_fills(batch: &RecordBatch, out: &mut Vec<Fill>) -> Result<(),
             mode: decode_mode(table, "mode", row, mode.required(table, "mode", row)?)?,
         });
     }
-    Ok(())
+    // Measure the EXACT retained delta: the owned row structs plus every owned
+    // `String`'s heap bytes (the strings were copied above — the length is free).
+    let mut string_bytes: u64 = 0;
+    for f in out.iter().skip(start) {
+        string_bytes = add_len(string_bytes, &f.strategy_run_id, table)?;
+        string_bytes = add_len(string_bytes, &f.underlying, table)?;
+        string_bytes = add_len(string_bytes, &f.contract_id, table)?;
+    }
+    retained_bytes(table, rows, size_of::<Fill>(), string_bytes)
 }
 
 /// Decode one `equity_curve.parquet` [`RecordBatch`] and **append** its rows to
@@ -461,15 +528,18 @@ pub(crate) fn read_fills(batch: &RecordBatch, out: &mut Vec<Fill>) -> Result<(),
 /// `f64` — `drawdown` — with a non-finite guard. Rows are appended in **file
 /// order**; the writer's `step` sort key is #32-verified, not reader-repaired.
 ///
+/// Returns the exact **retained-bytes delta** appended (the owned `EquityPoint`
+/// structs — this table carries no owned `String`s).
+///
 /// # Errors
 ///
 /// [`BundleError::Schema`] on a missing/wrong-typed column;
 /// [`BundleError::Invariant`] on a NULL, a negative `step`, or a non-finite
-/// `drawdown`.
+/// `drawdown`; [`BundleError::TooLarge`] if the retained-bytes tally overflows `u64`.
 pub(crate) fn read_equity(
     batch: &RecordBatch,
     out: &mut Vec<EquityPoint>,
-) -> Result<(), BundleError> {
+) -> Result<u64, BundleError> {
     let table = "equity_curve";
     let step = i32_col(batch, table, "step")?;
     let ts_ns = i64_col(batch, table, "ts_ns")?;
@@ -478,8 +548,9 @@ pub(crate) fn read_equity(
     let equity_cents = i64_col(batch, table, "equity_cents")?;
     let drawdown = f64_col(batch, table, "drawdown")?;
 
-    out.reserve(batch.num_rows());
-    for row in 0..batch.num_rows() {
+    let rows = batch.num_rows();
+    out.reserve(rows);
+    for row in 0..rows {
         out.push(EquityPoint {
             step: u32_field(step, table, "step", row)?,
             ts_ns: i64_at(ts_ns, table, "ts_ns", row)?,
@@ -489,7 +560,8 @@ pub(crate) fn read_equity(
             drawdown: drawdown_field(drawdown, table, "drawdown", row)?,
         });
     }
-    Ok(())
+    // No owned `String`s on this table — the retained delta is the struct floor.
+    retained_bytes(table, rows, size_of::<EquityPoint>(), 0)
 }
 
 /// Decode one `positions.parquet` [`RecordBatch`] and **append** its rows to
@@ -501,15 +573,20 @@ pub(crate) fn read_equity(
 /// into `Option<String>` (NULL → `None`). Rows are appended in **file order**; the
 /// writer's `(step, position_id)` sort key is #32-verified, not reader-repaired.
 ///
+/// Returns the exact **retained-bytes delta** appended (the owned `PositionRow`
+/// structs plus every owned `String`'s heap bytes — `contract_id` and any present
+/// `exit_reason`).
+///
 /// # Errors
 ///
 /// [`BundleError::Schema`] on a missing/wrong-typed column;
 /// [`BundleError::Invariant`] on a NULL in a non-nullable column, a negative
-/// unsigned-domain value, or an unrecognized `side`.
+/// unsigned-domain value, or an unrecognized `side`; [`BundleError::TooLarge`] if
+/// the retained-bytes tally overflows `u64`.
 pub(crate) fn read_positions(
     batch: &RecordBatch,
     out: &mut Vec<PositionRow>,
-) -> Result<(), BundleError> {
+) -> Result<u64, BundleError> {
     let table = "positions";
     let step = i32_col(batch, table, "step")?;
     let ts_ns = i64_col(batch, table, "ts_ns")?;
@@ -525,8 +602,10 @@ pub(crate) fn read_positions(
     let exit_reason = utf8_col(batch, table, "exit_reason")?;
     let open_at_end = bool_col(batch, table, "open_at_end")?;
 
-    out.reserve(batch.num_rows());
-    for row in 0..batch.num_rows() {
+    let rows = batch.num_rows();
+    let start = out.len();
+    out.reserve(rows);
+    for row in 0..rows {
         out.push(PositionRow {
             step: u32_field(step, table, "step", row)?,
             ts_ns: i64_at(ts_ns, table, "ts_ns", row)?,
@@ -545,7 +624,16 @@ pub(crate) fn read_positions(
             open_at_end: bool_at(open_at_end, table, "open_at_end", row)?,
         });
     }
-    Ok(())
+    // Retained delta: the owned row structs plus every owned `String`'s heap bytes
+    // (`contract_id` on every row, plus `exit_reason` on the terminal rows).
+    let mut string_bytes: u64 = 0;
+    for p in out.iter().skip(start) {
+        string_bytes = add_len(string_bytes, &p.contract_id, table)?;
+        if let Some(reason) = &p.exit_reason {
+            string_bytes = add_len(string_bytes, reason, table)?;
+        }
+    }
+    retained_bytes(table, rows, size_of::<PositionRow>(), string_bytes)
 }
 
 /// Decode one `greeks_attribution.parquet` [`RecordBatch`] and **append** its rows
@@ -557,15 +645,19 @@ pub(crate) fn read_positions(
 /// **file order**; the writer's `step` sort key is #32-verified, not
 /// reader-repaired.
 ///
+/// Returns the exact **retained-bytes delta** appended (the owned
+/// `GreeksAttribution` structs — this table carries no owned `String`s).
+///
 /// # Errors
 ///
 /// [`BundleError::Schema`] on a missing/wrong-typed column;
 /// [`BundleError::Invariant`] on a NULL, a negative `step`, or a negative
-/// `fees_cents`.
+/// `fees_cents`; [`BundleError::TooLarge`] if the retained-bytes tally overflows
+/// `u64`.
 pub(crate) fn read_greeks(
     batch: &RecordBatch,
     out: &mut Vec<GreeksAttribution>,
-) -> Result<(), BundleError> {
+) -> Result<u64, BundleError> {
     let table = "greeks_attribution";
     let step = i32_col(batch, table, "step")?;
     let ts_ns = i64_col(batch, table, "ts_ns")?;
@@ -576,8 +668,9 @@ pub(crate) fn read_greeks(
     let fees_cents = i64_col(batch, table, "fees_cents")?;
     let residual_cents = i64_col(batch, table, "residual_cents")?;
 
-    out.reserve(batch.num_rows());
-    for row in 0..batch.num_rows() {
+    let rows = batch.num_rows();
+    out.reserve(rows);
+    for row in 0..rows {
         out.push(GreeksAttribution {
             step: u32_field(step, table, "step", row)?,
             ts_ns: i64_at(ts_ns, table, "ts_ns", row)?,
@@ -589,7 +682,8 @@ pub(crate) fn read_greeks(
             residual_cents: i64_at(residual_cents, table, "residual_cents", row)?,
         });
     }
-    Ok(())
+    // No owned `String`s on this table — the retained delta is the struct floor.
+    retained_bytes(table, rows, size_of::<GreeksAttribution>(), 0)
 }
 
 #[cfg(test)]
@@ -828,7 +922,7 @@ mod tests {
         let batch = make_batch(fields, cols);
         let mut out = Vec::new();
         match read_fills(&batch, &mut out) {
-            Ok(()) => {}
+            Ok(_) => {}
             Err(e) => panic!("read_fills should succeed: {e}"),
         }
         assert_eq!(out.len(), 2);
@@ -854,7 +948,7 @@ mod tests {
         let batch = make_batch(fields, cols);
         let mut out = Vec::new();
         match read_equity(&batch, &mut out) {
-            Ok(()) => {}
+            Ok(_) => {}
             Err(e) => panic!("read_equity should succeed: {e}"),
         }
         assert_eq!(out.len(), 2);
@@ -875,7 +969,7 @@ mod tests {
         let batch = make_batch(fields, cols);
         let mut out = Vec::new();
         match read_positions(&batch, &mut out) {
-            Ok(()) => {}
+            Ok(_) => {}
             Err(e) => panic!("read_positions should succeed: {e}"),
         }
         assert_eq!(out.len(), 2);
@@ -903,7 +997,7 @@ mod tests {
         let batch = make_batch(fields, cols);
         let mut out = Vec::new();
         match read_greeks(&batch, &mut out) {
-            Ok(()) => {}
+            Ok(_) => {}
             Err(e) => panic!("read_greeks should succeed: {e}"),
         }
         assert_eq!(out.len(), 2);
@@ -1113,7 +1207,7 @@ mod tests {
         let batch = make_batch(fields, cols);
         let mut out = Vec::new();
         match read_fills(&batch, &mut out) {
-            Ok(()) => match out.first() {
+            Ok(_) => match out.first() {
                 Some(f) => assert_eq!(f.slippage_cents, -9_999),
                 None => panic!("expected a decoded fill"),
             },
@@ -1136,7 +1230,7 @@ mod tests {
         let batch = make_batch(fields, cols);
         let mut out = Vec::new();
         match read_fills(&batch, &mut out) {
-            Ok(()) => match out.first() {
+            Ok(_) => match out.first() {
                 Some(f) => assert_eq!(f.trade_id, 9_223_372_036_854_775_807),
                 None => panic!("expected a decoded fill"),
             },
@@ -1181,7 +1275,7 @@ mod tests {
         let batch = make_batch(fields, cols);
         let mut out = Vec::new();
         match read_fills(&batch, &mut out) {
-            Ok(()) => match out.first() {
+            Ok(_) => match out.first() {
                 Some(f) => assert_eq!(f.step, 0),
                 None => panic!("expected a decoded fill"),
             },
@@ -1239,7 +1333,7 @@ mod tests {
         let batch = make_batch(fields, cols);
         let mut out = Vec::new();
         match read_fills(&batch, &mut out) {
-            Ok(()) => {
+            Ok(_) => {
                 match out.first() {
                     Some(f) => assert_eq!(f.style, OptionStyle::Call),
                     None => panic!("expected a decoded fill"),
@@ -1251,6 +1345,44 @@ mod tests {
             }
             Err(e) => panic!("a dictionary-encoded style column must decode: {e}"),
         }
+    }
+
+    // --- retained-bytes tally counts the copied owned Strings -------------------
+
+    #[test]
+    fn test_retained_bytes_counts_owned_strings_above_struct_floor() {
+        // Give every row a long owned `contract_id` string. The retained tally must
+        // count these COPIED bytes, so it exceeds the struct-size floor alone — the
+        // per-row string copy the reader's working-set budget must not miss.
+        let long = "X".repeat(500);
+        let (mut fields, mut cols) = fills_parts(4);
+        replace(
+            &mut fields,
+            &mut cols,
+            "contract_id",
+            Field::new("contract_id", DataType::Utf8, false),
+            Arc::new(StringArray::from(vec![long.as_str(); 4])),
+        );
+        let batch = make_batch(fields, cols);
+        let mut out = Vec::new();
+        let retained = match read_fills(&batch, &mut out) {
+            Ok(n) => n,
+            Err(e) => panic!("read_fills should succeed: {e}"),
+        };
+        // The struct-size floor alone (owned `Fill` structs, no heap Strings).
+        let struct_size = u64::try_from(size_of::<Fill>()).unwrap_or(u64::MAX);
+        let floor = struct_size.saturating_mul(4);
+        // The exact copied heap bytes: RUN + "BTC" + the 500-char contract_id, per row.
+        let per_row = u64::try_from(RUN.len() + "BTC".len() + long.len()).unwrap_or(u64::MAX);
+        let expected = floor.saturating_add(per_row.saturating_mul(4));
+        assert!(
+            retained > floor,
+            "retained {retained} must exceed the struct-size floor {floor}: owned Strings are counted"
+        );
+        assert_eq!(
+            retained, expected,
+            "retained must count exactly the struct floor plus every copied String's bytes"
+        );
     }
 
     // --- property: parquet round-trip preserves order and signs ------------------
