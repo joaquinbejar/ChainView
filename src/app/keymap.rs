@@ -226,9 +226,10 @@ pub enum PayoffAction {
     ToggleCurve,
 }
 
-/// A replay-screen action (`docs/05-views-and-ux.md` §3). The scrub actions have
-/// bodies now (via `AppEvent::ReplaySeek`); playback / speed / fill / end-jump land
-/// with the timeline model in v0.3.
+/// A replay-screen action (`docs/05-views-and-ux.md` §3). The scrub, end-jump,
+/// play/pause, and speed actions have bodies now (via `AppEvent::ReplaySeek` /
+/// `AppEvent::ReplayControl`, #34); the fill drill-down (`,` / `.`) lands with the
+/// drill-down render (#35+).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ReplayAction {
@@ -499,30 +500,30 @@ pub static KEYMAP: &[Binding] = &[
         help: "Expiration / t+0",
         deferred: None,
     },
-    // -- Replay (scrub wired; playback/speed/fill/end-jump defer to v0.3) ------
+    // -- Replay (scrub/end-jump/playback/speed wired #34; fill drill-down v0.3+) --
     Binding {
         context: Context::Replay(ReplayScreen::Replay),
         action: Action::Replay(ReplayAction::PlayPause),
         chords: &[KeyChord::Char(' ')],
         keys_label: "Space",
         help: "Play / pause",
-        deferred: Some("v0.3"),
+        deferred: None,
     },
     Binding {
         context: Context::Replay(ReplayScreen::Replay),
         action: Action::Replay(ReplayAction::SpeedSlower),
         chords: &[KeyChord::Char('-')],
         keys_label: "-",
-        help: "Speed slower",
-        deferred: Some("v0.3"),
+        help: "Slower (while playing)",
+        deferred: None,
     },
     Binding {
         context: Context::Replay(ReplayScreen::Replay),
         action: Action::Replay(ReplayAction::SpeedFaster),
         chords: &[KeyChord::Char('+')],
         keys_label: "+",
-        help: "Speed faster",
-        deferred: Some("v0.3"),
+        help: "Faster (while playing)",
+        deferred: None,
     },
     Binding {
         context: Context::Replay(ReplayScreen::Replay),
@@ -546,7 +547,7 @@ pub static KEYMAP: &[Binding] = &[
         chords: &[KeyChord::Char(',')],
         keys_label: ",",
         help: "Previous fill",
-        deferred: Some("v0.3"),
+        deferred: Some("soon"),
     },
     Binding {
         context: Context::Replay(ReplayScreen::Replay),
@@ -554,7 +555,7 @@ pub static KEYMAP: &[Binding] = &[
         chords: &[KeyChord::Char('.')],
         keys_label: ".",
         help: "Next fill",
-        deferred: Some("v0.3"),
+        deferred: Some("soon"),
     },
     Binding {
         context: Context::Replay(ReplayScreen::Replay),
@@ -570,7 +571,7 @@ pub static KEYMAP: &[Binding] = &[
         chords: &[KeyChord::End],
         keys_label: "End",
         help: "Jump to end",
-        deferred: Some("v0.3"),
+        deferred: None,
     },
 ];
 
@@ -713,23 +714,32 @@ fn bindings_in(context: Context) -> Vec<&'static Binding> {
 pub(crate) fn help_sections(mode: &Mode) -> Vec<(&'static str, Vec<&'static Binding>)> {
     let mut global = bindings_in(Context::Global);
     global.extend(bindings_in(Context::Any));
-    let mut sections = vec![("Global", global)];
     match mode {
         Mode::Live(_) => {
+            let mut sections = vec![("Global", global)];
             sections.push(("Chain", bindings_in(Context::Live(LiveScreen::Chain))));
             sections.push(("Depth", bindings_in(Context::Live(LiveScreen::Depth))));
             sections.push(("Surface", bindings_in(Context::Live(LiveScreen::Surface))));
             sections.push(("Payoff", bindings_in(Context::Live(LiveScreen::Payoff))));
+            sections
         }
         Mode::Replay(_) => {
+            // `r` (Reconnect) is a Live-only affordance — in replay it is a deliberate
+            // no-op (there is no live provider; `R` reloads the bundle instead), so it
+            // must NOT appear in the replay overlay or `?` would advertise a dead key
+            // (fix SF-04). The binding stays in `KEYMAP` (dispatch reads one table);
+            // this scopes only the DOCUMENTATION, keeping the overlay truthful in both
+            // modes without a second source of truth.
+            global.retain(|b| b.action != Action::Global(GlobalAction::Reconnect));
+            let mut sections = vec![("Global", global)];
             sections.push(("Replay", bindings_in(Context::Replay(ReplayScreen::Replay))));
             sections.push((
                 "Payoff (v0.5)",
                 bindings_in(Context::Replay(ReplayScreen::Payoff)),
             ));
+            sections
         }
     }
-    sections
 }
 
 /// Every binding the help overlay shows for `mode`, flattened — the cross-check
@@ -846,9 +856,11 @@ mod tests {
     }
 
     #[test]
-    fn test_keymap_marks_deferred_replay_keys_not_the_wired_scrubs() {
-        // The wired scrub keys carry no marker; the deferred playback/speed/fill/
-        // end-jump keys do (the same cross-screen honesty pattern as chain).
+    fn test_keymap_marks_deferred_replay_keys_not_the_wired_ones() {
+        // #34 wired the scrub, end-jump, play/pause, and speed keys, so none of
+        // them carries a deferred marker; only the fill drill-down (`,` / `.`)
+        // stays deferred (its render lands in #35+) — the same cross-screen
+        // honesty pattern as chain.
         let deferral = |action: ReplayAction| -> Option<&'static str> {
             KEYMAP
                 .iter()
@@ -858,10 +870,57 @@ mod tests {
         assert_eq!(deferral(ReplayAction::StepBack), None);
         assert_eq!(deferral(ReplayAction::StepForward), None);
         assert_eq!(deferral(ReplayAction::JumpStart), None);
-        assert!(deferral(ReplayAction::PlayPause).is_some());
-        assert!(deferral(ReplayAction::SpeedFaster).is_some());
+        assert_eq!(deferral(ReplayAction::JumpEnd), None);
+        assert_eq!(deferral(ReplayAction::PlayPause), None);
+        assert_eq!(deferral(ReplayAction::SpeedFaster), None);
+        assert_eq!(deferral(ReplayAction::SpeedSlower), None);
+        // Fill drill-down navigation stays deferred (its render lands in #35+).
         assert!(deferral(ReplayAction::PrevFill).is_some());
-        assert!(deferral(ReplayAction::JumpEnd).is_some());
+        assert!(deferral(ReplayAction::NextFill).is_some());
+    }
+
+    #[test]
+    fn test_help_reconnect_scoped_to_live_overlay_only() {
+        // SF-04: `r` (Reconnect) is Live-only; the replay overlay must NOT advertise
+        // it (it is a no-op there), while the live overlay still does. The binding
+        // stays in KEYMAP for dispatch — this only scopes the documentation, so the
+        // overlay is truthful in BOTH modes from the one source of truth.
+        let live = live_app_on(LiveScreen::Chain, ScreenLoad::Ready, false);
+        let replay = replay_app_on(ReplayScreen::Replay, false);
+        let is_reconnect = |b: &&Binding| b.action == Action::Global(GlobalAction::Reconnect);
+        assert!(
+            help_bindings(&live.mode).iter().any(is_reconnect),
+            "the live overlay lists Reconnect",
+        );
+        assert!(
+            !help_bindings(&replay.mode).iter().any(is_reconnect),
+            "the replay overlay omits Reconnect (no-op in replay)",
+        );
+        // Single source of truth intact: `r` still resolves globally in the map.
+        assert_eq!(
+            resolve_global(KeyChord::Char('r')),
+            Some(GlobalCommand::Reconnect),
+        );
+    }
+
+    #[test]
+    fn test_help_speed_keys_note_while_playing() {
+        // SF-03: the `+`/`-` speed help labels state the while-playing condition, so
+        // the overlay does not advertise a silent no-op while paused.
+        let help_of = |action: ReplayAction| -> &'static str {
+            KEYMAP
+                .iter()
+                .find(|b| b.action == Action::Replay(action))
+                .map_or("", |b| b.help)
+        };
+        assert!(
+            help_of(ReplayAction::SpeedFaster).contains("playing"),
+            "faster notes while-playing",
+        );
+        assert!(
+            help_of(ReplayAction::SpeedSlower).contains("playing"),
+            "slower notes while-playing",
+        );
     }
 
     #[test]

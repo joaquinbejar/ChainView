@@ -14,6 +14,74 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- **Replay state machine + the `replay` subcommand** (`src/app.rs`,
+  `src/app/replay_load.rs`, `src/event.rs`, `src/main.rs`, `src/ui/replay.rs`,
+  `src/ui/mod.rs`, `src/ui/theme.rs`, `src/app/keymap.rs`, `src/lib.rs`, issue #34;
+  `docs/02-tui-architecture.md` §3/§4, `docs/04-replay-mode.md` §3/§4,
+  `docs/07-configuration.md` §4.1). Wires replay
+  mode into the application: the bundle-load lifecycle, the CLI subcommand, and the
+  seek/playback/tick fan-in. The render loop stays pure — the load runs off-thread
+  and its outcome arrives as an event; `draw` reads state only. New crate deps: none.
+  - **`ReplayState` filled in** — `BundleLoad { Loading, Ready(Box<LoadedReplay>),
+    Error { message } }` and `LoadedReplay { bundle: LoadedBundle, cursor:
+    TimelineCursor, selection: Option<Fill> }`. `apply_load_result` folds
+    `Loading → Ready`/`Error`; `begin_reload` resets to `Loading` on `R`; `seek`
+    moves the in-memory cursor; `apply_control` folds play/pause/speed; and
+    `advance_playback` steps the play-head one tick, **auto-pausing at `end_step`**
+    so the loop parks instead of spinning.
+  - **`chainview replay <dir>` subcommand** — the one canonical spelling (no
+    `--replay` flag). A missing / non-directory bundle path is a **friendly, pre-TUI
+    CLI error** (`validate_replay_dir`) naming only the passed path; a present-but-
+    malformed bundle becomes a retryable in-TUI `BundleLoad::Error` instead. `replay`
+    ignores the live-only flags (config layer drops them).
+  - **Off-thread load worker** — `spawn_bundle_load` runs `BundleReader::open_with_
+    ceilings` + `load_cancellable` on a `spawn_blocking` worker with the supervisor's
+    `CancellationToken` adapted as the `&|| token.is_cancelled()` probe (the #30
+    seam), delivering `AppEvent::BundleLoaded(BundleLoadResult)`. A cancelled load
+    emits nothing (shutdown); a failure carries only the non-secret `BundleError`
+    text. Threads default `ResourceCeilings`.
+  - **Event fan-in** — new `AppEvent::{ReplayControl, BundleLoaded}` and
+    `ReplayControl { PlayPause, SpeedFaster, SpeedSlower }` / `BundleLoadResult
+    { Loaded(Box<LoadedBundle>), Failed(String) }`. `ReplaySeek` now folds directly
+    into the in-memory cursor (no I/O), so the dead `Command::SeekBundle` is
+    **removed**; `ReloadBundle` remains the sole replay command. Every closed-set
+    match site (`on_event`, `fold_event`, the wildcard-free fence) revisited.
+  - **Playback collapse** — the `app::Playback` stub and the domain `replay::Playback`
+    are now a **single** `Playback` (the richer #33 shape, `Playing { speed:
+    PlaybackSpeed }`); the transitional `ReplayPlayback` crate-root alias is dropped
+    and the bare `Playback` is exported from the crate root.
+  - **Keymap un-deferrals** — `Space` (play/pause), `+`/`-` (speed), and `End`
+    (jump-to-end) are no longer `deferred` now their bodies exist; the fill
+    drill-down (`,` / `.`) stays deferred to its render (#35+). `ReplayScreen::Payoff`
+    stays unreachable (v0.5).
+  - **Tests** — CLI parse (`replay <dir>` → Replay, no subcommand → Live, missing
+    dir → friendly error, missing/extra positional → clap error, live-only flags
+    ignored); load transitions (`Loading→Ready`/`Error`, `Error→R→Loading→Ready`);
+    seek fold (moves the cursor, clamps, no command); playback fold (play/pause,
+    speed clamps, tick advances only while playing, auto-pause at end); the load
+    worker (missing dir → `Failed`, pre-cancelled → no event); and the two-level
+    replay dispatch end to end. Net +21 tests (25 added, 4 rewritten/renamed).
+  - **Review-pass fixes** (ux + architect). The replay `draw` now renders the
+    **bundle-load lifecycle** instead of always painting the `Ready` placeholder:
+    `BundleLoad::Loading` shows the centered §6 spinner + "loading bundle `<run>`…",
+    `BundleLoad::Error` shows the bounded, wrapped message + a discoverable "press
+    `R` to retry" affordance (glyph-prefixed, `NO_COLOR`-safe), and `Ready` keeps the
+    deliberate #35 hand-off placeholder — so a malformed bundle is no longer an
+    invisible failure (`draw` gained `theme`/`tick`, mirroring `chain::draw`). The
+    replay status bar gains a distinct playback badge — `▶ ×N` while playing, `⏸`
+    while paused over a loaded bundle — so "playing" no longer reuses the loading
+    spinner glyph (the spinner is now Loading-only; the Loading-or-Playing redraw
+    predicate `App::is_in_motion` is unchanged, so the parking invariant holds). The
+    help overlay is now truthful in both modes: the `+`/`-` speed labels note "(while
+    playing)", the fill drill-down defers to `soon` (not `v0.3`, which reads as a
+    future release while replay *is* v0.3), and `r` (Reconnect) is scoped out of the
+    **replay** overlay where it is a no-op (the binding stays in `KEYMAP`; only the
+    documentation is scoped). Docs: `docs/02-tui-architecture.md` §4 adds
+    `AppEvent::{ReplayControl, BundleLoaded}` and drops the dead `Command::SeekBundle`
+    (a scrub folds in-memory); `docs/04-replay-mode.md` §4 records the seek-while-
+    playing rule. +9 tests (the three draw states + small-size fuzz, the playback
+    badge + loading-spinner-only guard, the two overlay-truthfulness fixes, and a
+    wildcard-free `ReplayControl` fence).
 - **Replay domain types and the manifest schema** (`src/replay/mod.rs`, issue #29;
   `docs/01-domain-model.md` §9, `docs/04-replay-mode.md` §2, ADR-0004). Opens v0.3
   (replay mode) by fixing ChainView's typed, **read-only** views of the IronCondor

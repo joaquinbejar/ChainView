@@ -58,13 +58,15 @@ use crate::chain::{
     ProviderId, QuoteClocks, StreamHealth,
 };
 use crate::config::ThemeChoice;
-use crate::event::{AppEvent, Command, SeekTo};
+use crate::event::{AppEvent, BundleLoadResult, Command, ReplayControl, SeekTo};
 use crate::providers::{ChainCapability, GreeksCapability, ProviderCapabilities};
+use crate::replay::{Fill, LoadedBundle, Playback, PlaybackSpeed, TimelineCursor};
 
 mod bridge;
 pub(crate) mod keymap;
 mod payoff_build;
 mod registry;
+mod replay_load;
 mod supervisor;
 
 pub use bridge::{BridgeSenders, COMMAND_CHANNEL_CAPACITY, CONTROL_CHANNEL_CAPACITY, EventBridge};
@@ -76,6 +78,7 @@ pub use registry::{
     ChainViewApp, ChainViewAppBuilder, ProviderSubscription, Resolved,
     spawn_supervised_subscription,
 };
+pub use replay_load::spawn_bundle_load;
 pub use supervisor::{
     DEFAULT_JOIN_BUDGET, ExitCause, ExitReporter, FinalTeardown, GuardTeardown, SupervisedTask,
     Supervisor, TaskExit, TokioTask,
@@ -90,6 +93,13 @@ pub use supervisor::{
 /// ~2 s — a readable minimum so a hint never flashes for near-zero time; a key
 /// press still clears it sooner.
 pub const HINT_TICKS: u8 = 8;
+
+/// The one-line keybar hint flashed when a replay reload (`R`) cannot be enqueued
+/// because the command channel is full or closed — the data layer is gone
+/// (`docs/05-views-and-ux.md` §6). On such a dropped send the bundle load screen is
+/// **not** flipped to [`BundleLoad::Loading`] (which, with no load in flight, would
+/// spin forever): the prior bundle state is kept and this hint is flashed instead.
+const RELOAD_UNAVAILABLE_HINT: &str = "reload unavailable: data layer not responding";
 
 /// All state the render loop reads, as a `Live | Replay` [`Mode`] state machine
 /// (`docs/02-tui-architecture.md` §3).
@@ -204,6 +214,8 @@ impl App {
             AppEvent::Tick => self.on_tick(),
             AppEvent::Market(update) => self.on_market(update),
             AppEvent::ReplaySeek(seek) => self.on_replay_seek(seek),
+            AppEvent::ReplayControl(control) => self.on_replay_control(control),
+            AppEvent::BundleLoaded(result) => self.on_bundle_loaded(result),
         }
     }
 
@@ -333,6 +345,13 @@ impl App {
         if self.tick_hint() {
             needs_redraw = true;
         }
+        // Advance replay playback: while playing, a tick moves the scrub head by
+        // the speed quantum (the cursor clamps at `end_step`, so it stops at the
+        // tape end and auto-pauses, `docs/04-replay-mode.md` §4). A no-op in live
+        // mode and while paused/loading.
+        if self.advance_replay_playback() {
+            needs_redraw = true;
+        }
         // Advance the loading/reconnecting/playback spinner: redraw ONLY in a motion
         // state, so the spinner animates during the initial connect / reconnect /
         // playback (§7) while a truly idle, non-motion app still parks and never
@@ -390,7 +409,8 @@ impl App {
         let changed = match &mut self.mode {
             Mode::Live(live) => live.apply_market(update),
             // Live market updates are meaningless in replay mode (there is no
-            // live store); replay data arrives via `ReplaySeek`/`SeekBundle`.
+            // live store); the replay play-head moves via `ReplaySeek` and the
+            // bundle lands via `BundleLoaded`.
             Mode::Replay(_) => false,
         };
         if changed {
@@ -399,12 +419,54 @@ impl App {
     }
 
     fn on_replay_seek(&mut self, seek: SeekTo) {
-        match &self.mode {
+        match &mut self.mode {
             // A scrub is meaningless in live mode; ignored.
             Mode::Live(_) => {}
-            // Seeking re-decodes table indices — I/O — so emit a `Command`; the
-            // play-head advances when the seek worker (v0.3) responds.
-            Mode::Replay(_) => self.send_command(Command::SeekBundle(seek)),
+            // Seeking moves the in-memory timeline cursor (no I/O — the whole
+            // bundle is loaded, #33), so it folds directly here rather than
+            // emitting a command; a no-op until the bundle is `Ready`.
+            Mode::Replay(replay) => {
+                if replay.seek(seek) {
+                    self.dirty = true;
+                }
+            }
+        }
+    }
+
+    fn on_replay_control(&mut self, control: ReplayControl) {
+        match &mut self.mode {
+            // Playback control is meaningless in live mode; ignored.
+            Mode::Live(_) => {}
+            // Fold the play/pause/speed key into the playback state; the tick timer
+            // advances the cursor while playing.
+            Mode::Replay(replay) => {
+                if replay.apply_control(control) {
+                    self.dirty = true;
+                }
+            }
+        }
+    }
+
+    fn on_bundle_loaded(&mut self, result: BundleLoadResult) {
+        match &mut self.mode {
+            // A bundle-load result is meaningless in live mode; ignored.
+            Mode::Live(_) => {}
+            // The off-thread load finished: fold the `BundleLoad` state machine
+            // from `Loading` to `Ready`/`Error` and always redraw the transition.
+            Mode::Replay(replay) => {
+                replay.apply_load_result(result);
+                self.dirty = true;
+            }
+        }
+    }
+
+    /// Advance the replay play-head one tick, or a no-op in live mode / while
+    /// paused / while the bundle is not yet `Ready`. Returns whether a redraw is
+    /// needed (the cursor moved or playback auto-paused at the tape end).
+    fn advance_replay_playback(&mut self) -> bool {
+        match &mut self.mode {
+            Mode::Live(_) => false,
+            Mode::Replay(replay) => replay.advance_playback(),
         }
     }
 
@@ -422,31 +484,54 @@ impl App {
 
     fn request_reconnect(&mut self) {
         match &self.mode {
-            Mode::Live(_) => self.send_command(Command::Reconnect),
+            Mode::Live(_) => {
+                let _ = self.send_command(Command::Reconnect);
+            }
             // `r` has no replay binding — `R` reloads the bundle instead (§6).
             Mode::Replay(_) => {}
         }
     }
 
     fn request_rediscover(&mut self) {
-        match &self.mode {
-            Mode::Live(_) => self.send_command(Command::Rediscover),
+        match &mut self.mode {
+            Mode::Live(_) => {
+                let _ = self.send_command(Command::Rediscover);
+            }
             Mode::Replay(replay) => {
-                let command = Command::ReloadBundle(replay.dir.clone());
-                self.send_command(command);
+                // Enqueue the reload FIRST and flip to `Loading` only once it is
+                // actually on the command channel. A dropped send (a full/closed
+                // command channel — the data layer is gone; the drop is counted by
+                // `commands_dropped`, #9) would otherwise strand the load screen at
+                // `Loading` forever with no load in flight, so on a failed send the
+                // prior bundle state is kept and a one-line hint is flashed instead
+                // (`docs/05-views-and-ux.md` §6). The fresh bundle lands back via
+                // `AppEvent::BundleLoaded`. Cloning the dir first ends the `replay`
+                // borrow so the `&mut self` send is free of an overlapping borrow.
+                let dir = replay.dir.clone();
+                if self.send_command(Command::ReloadBundle(dir)) {
+                    if let Mode::Replay(replay) = &mut self.mode {
+                        replay.begin_reload();
+                    }
+                    self.dirty = true;
+                } else {
+                    self.set_status_hint(RELOAD_UNAVAILABLE_HINT.to_owned());
+                }
             }
         }
     }
 
-    /// Enqueue a command for the data layer, non-blocking. Never blocks or awaits
-    /// the render loop. A full or closed command channel does **not** silently
-    /// swallow a recovery keypress: the failure is counted in
-    /// [`commands_dropped`](App::commands_dropped) so the status line can surface
-    /// it. A command storm is impossible (commands are user-driven, `docs/02`
+    /// Enqueue a command for the data layer, non-blocking, returning whether it was
+    /// actually enqueued. Never blocks or awaits the render loop. A full or closed
+    /// command channel does **not** silently swallow a recovery keypress: the
+    /// failure is counted in [`commands_dropped`](App::commands_dropped) (so the
+    /// status line can surface it) **and** reported as `false`, so a caller that
+    /// must not change state on a dropped send — the replay reload, which would
+    /// otherwise strand the load screen at `Loading` with no load in flight — can
+    /// react. A command storm is impossible (commands are user-driven, `docs/02`
     /// §5), so a full channel is not expected; a closed channel means the data
     /// layer is gone, which the surfaced count now makes visible rather than
     /// hidden.
-    fn send_command(&mut self, command: Command) {
+    fn send_command(&mut self, command: Command) -> bool {
         if self.tx_command.try_send(command).is_err() {
             // Checked, not `saturating_add` (a banned method): increment only
             // when it does not overflow, so the counter stops at the ceiling
@@ -455,6 +540,9 @@ impl App {
             if let Some(next) = self.commands_dropped.checked_add(1) {
                 self.commands_dropped = next;
             }
+            false
+        } else {
+            true
         }
     }
 
@@ -1712,7 +1800,9 @@ pub struct ReplayState {
 
 impl ReplayState {
     /// A replay state for a bundle directory: [`BundleLoad::Loading`], the
-    /// default [`ReplayScreen::Replay`] screen, and paused playback.
+    /// default [`ReplayScreen::Replay`] screen, and paused playback. The load task
+    /// ([`spawn_bundle_load`]) fills the bundle and delivers
+    /// [`AppEvent::BundleLoaded`], folded by [`apply_load_result`](Self::apply_load_result).
     #[must_use]
     pub fn new(dir: PathBuf) -> Self {
         Self {
@@ -1722,25 +1812,129 @@ impl ReplayState {
             play: Playback::Paused,
         }
     }
+
+    /// The loaded replay payload when the bundle is [`BundleLoad::Ready`], else
+    /// `None` (still loading or in an error state). The replay screens (#35) read
+    /// the bundle, cursor, and selection through this.
+    #[must_use]
+    pub fn loaded(&self) -> Option<&LoadedReplay> {
+        match &self.bundle {
+            BundleLoad::Ready(loaded) => Some(loaded),
+            BundleLoad::Loading | BundleLoad::Error { .. } => None,
+        }
+    }
+
+    /// Whether playback is currently running.
+    #[must_use]
+    pub fn is_playing(&self) -> bool {
+        self.play.is_playing()
+    }
+
+    /// Fold the off-thread load result into the [`BundleLoad`] state machine: a
+    /// success builds the timeline cursor and transitions to
+    /// [`BundleLoad::Ready`]; a failure carries the actionable message into
+    /// [`BundleLoad::Error`] (`R` retries). Either way playback resets to paused —
+    /// a fresh bundle starts at the first step, a failed one has nothing to play.
+    pub fn apply_load_result(&mut self, result: BundleLoadResult) {
+        self.bundle = match result {
+            BundleLoadResult::Loaded(bundle) => {
+                BundleLoad::Ready(Box::new(LoadedReplay::new(*bundle)))
+            }
+            BundleLoadResult::Failed(message) => BundleLoad::Error { message },
+        };
+        self.play = Playback::Paused;
+    }
+
+    /// Reset to [`BundleLoad::Loading`] for a reload (`R`), so the load screen
+    /// shows its connecting state while the data layer re-opens the bundle; the
+    /// fresh cursor/selection arrive with the next [`apply_load_result`](Self::apply_load_result).
+    pub fn begin_reload(&mut self) {
+        self.bundle = BundleLoad::Loading;
+        self.play = Playback::Paused;
+    }
+
+    /// Move the timeline cursor by `seek` (an in-memory index move, #33), returning
+    /// whether the cursor position changed (so the caller sets `dirty`). A no-op
+    /// until the bundle is [`BundleLoad::Ready`].
+    pub fn seek(&mut self, seek: SeekTo) -> bool {
+        let BundleLoad::Ready(loaded) = &mut self.bundle else {
+            return false;
+        };
+        // Deref the `Box` once so the cursor (mut) and the bundle (shared) are
+        // disjoint field borrows of a plain `LoadedReplay`.
+        let loaded: &mut LoadedReplay = loaded;
+        let before = loaded.cursor;
+        loaded.cursor.seek(seek, &loaded.bundle);
+        loaded.cursor != before
+    }
+
+    /// Fold a play/pause/speed control into the [`Playback`] state, returning
+    /// whether the state changed (so the caller sets `dirty`). Play/pause toggles;
+    /// the speed keys adjust an already-**playing** speed only (a no-op while
+    /// paused, since paused playback carries no speed).
+    pub fn apply_control(&mut self, control: ReplayControl) -> bool {
+        let next = match control {
+            ReplayControl::PlayPause => self.play.toggled(PlaybackSpeed::default()),
+            ReplayControl::SpeedFaster => match self.play {
+                Playback::Playing { speed } => Playback::playing(speed.faster()),
+                Playback::Paused => return false,
+            },
+            ReplayControl::SpeedSlower => match self.play {
+                Playback::Playing { speed } => Playback::playing(speed.slower()),
+                Playback::Paused => return false,
+            },
+        };
+        if next != self.play {
+            self.play = next;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Advance the play-head one playback tick: while playing over a `Ready`
+    /// bundle, seek forward by the speed quantum; the cursor clamps at `end_step`,
+    /// so playback **stops at the tape end and never wraps** and this **auto-pauses**
+    /// there (so the render loop parks instead of spinning on a no-op advance,
+    /// `docs/04-replay-mode.md` §4). Returns whether a redraw is needed. A no-op
+    /// while paused or not yet `Ready`.
+    pub fn advance_playback(&mut self) -> bool {
+        if !self.play.is_playing() {
+            return false;
+        }
+        let play = self.play;
+        let (moved, at_end) = match &mut self.bundle {
+            BundleLoad::Ready(loaded) => {
+                // Deref the `Box` once so the cursor (mut) and the bundle (shared)
+                // are disjoint field borrows of a plain `LoadedReplay`.
+                let loaded: &mut LoadedReplay = loaded;
+                let before = loaded.cursor;
+                loaded.cursor.advance_playback(play, &loaded.bundle);
+                (loaded.cursor != before, loaded.cursor.is_at_end())
+            }
+            BundleLoad::Loading | BundleLoad::Error { .. } => return false,
+        };
+        if at_end {
+            self.play = Playback::Paused;
+        }
+        moved || at_end
+    }
 }
 
 /// The bundle load state machine (`docs/02-tui-architecture.md` §3): loading,
 /// loaded, or a retryable error, so startup / failure / retry / success are all
-/// representable. `R` re-issues a [`Command::ReloadBundle`]. The enum shape is
-/// stable for v0.3; only [`LoadedReplay`]'s internals are filled later.
+/// representable. `R` re-issues a [`Command::ReloadBundle`].
 ///
-/// Producer note: no event in the current closed `AppEvent` set carries a bundle
-/// load result, so `Ready`/`Error` are not yet reachable by the fan-in and the
-/// state cannot leave `Loading` (`ReplaySeek` is an input, not a result). The
-/// bundle-load-result carrier that drives these transitions lands with the v0.3
-/// replay subcommand + bundle reader (#34), which will extend the closed set —
-/// a compile-fenced, source-compatible addition.
+/// The transitions are driven by [`AppEvent::BundleLoaded`] (the off-thread load
+/// result, folded by [`ReplayState::apply_load_result`]): `Loading → Ready` on a
+/// valid bundle, `Loading → Error` on a [`BundleError`](crate::BundleError). A
+/// reload (`R`) resets to `Loading` via [`ReplayState::begin_reload`].
 #[derive(Debug)]
 pub enum BundleLoad {
-    /// The bundle is being opened and validated.
+    /// The bundle is being opened and validated on the load worker.
     Loading,
     /// The bundle loaded successfully. Boxed so the large loaded payload does not
-    /// bloat the small `Loading`/`Error` variants.
+    /// bloat the small `Loading`/`Error` variants and keeps the `Mode` enum small.
     Ready(Box<LoadedReplay>),
     /// The bundle failed to load — an actionable [`crate::BundleError`] message;
     /// `R` retries.
@@ -1750,25 +1944,39 @@ pub enum BundleLoad {
     },
 }
 
-/// The loaded replay payload — the bundle, its timeline cursor, and the selected
-/// fill (`docs/02-tui-architecture.md` §3). A documented stub for #9;
-/// `#[non_exhaustive]` so the v0.3 fields are a source-compatible addition.
+/// The loaded replay payload — the fully materialised bundle, its timeline cursor
+/// over the integer `step` clock, and the currently drilled-into fill
+/// (`docs/02-tui-architecture.md` §3, `docs/04-replay-mode.md` §4).
+///
+/// Built by [`LoadedReplay::new`] from a [`LoadedBundle`] the load worker decoded
+/// off the render thread. `#[non_exhaustive]` so later replay fields stay a
+/// source-compatible addition.
 #[derive(Debug)]
 #[non_exhaustive]
-pub struct LoadedReplay;
+pub struct LoadedReplay {
+    /// The decoded, validated bundle (the four tables + manifest), read-only.
+    pub bundle: LoadedBundle,
+    /// The scrub position over the bundle's integer `step` clock (#33). Moved only
+    /// through [`ReplayState::seek`] / [`ReplayState::advance_playback`], never
+    /// per frame.
+    pub cursor: TimelineCursor,
+    /// The drilled-into fill, or `None` before any drill-down (#35 wires the
+    /// fill-nav keys that set it).
+    pub selection: Option<Fill>,
+}
 
-/// The replay playback state (`docs/04-replay-mode.md` §4). A documented stub;
-/// v0.3 refines the speed model.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Playback {
-    /// Playback is paused (the default on load).
-    #[default]
-    Paused,
-    /// Playback is running at the given speed multiplier.
-    Playing {
-        /// The playback speed multiplier (steps advanced per tick).
-        speed: u8,
-    },
+impl LoadedReplay {
+    /// Build the loaded payload from `bundle`, resolving the timeline cursor at the
+    /// first step (`docs/01-domain-model.md` §10) with no drill-down selection.
+    #[must_use]
+    pub fn new(bundle: LoadedBundle) -> Self {
+        let cursor = TimelineCursor::new(&bundle);
+        Self {
+            bundle,
+            cursor,
+            selection: None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1987,6 +2195,7 @@ pub(crate) fn atm_index_of(chain: &OptionChain) -> Option<usize> {
 /// every reachable mode × screen × load state without reaching into a provider.
 #[cfg(test)]
 pub(crate) mod tests_support {
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::time::Duration;
 
@@ -2002,12 +2211,74 @@ pub(crate) mod tests_support {
         AliasCatalog, ChainFetch, ChainSource, ChainStore, ExpirySource, ProviderId, StreamHealth,
     };
     use crate::config::ThemeChoice;
-    use crate::event::Command;
+    use crate::event::{BundleLoadResult, Command};
     use crate::providers::{
         ChainCapability, ChainPollCapability, GreeksCapability, ProviderCapabilities,
     };
+    use crate::replay::{BundleManifest, EquityPoint, LoadedBundle, SUPPORTED_SCHEMA};
 
     const EXP: i64 = 1_700_000_000;
+
+    /// A minimal manifest for an in-memory test bundle — the cursor never reads it;
+    /// this only satisfies [`LoadedBundle`].
+    fn replay_manifest() -> BundleManifest {
+        let mut row_counts = BTreeMap::new();
+        let _ = row_counts.insert("fills".to_owned(), 0u64);
+        let _ = row_counts.insert("equity_curve".to_owned(), 0u64);
+        let _ = row_counts.insert("positions".to_owned(), 0u64);
+        let _ = row_counts.insert("greeks_attribution".to_owned(), 0u64);
+        BundleManifest {
+            schema: SUPPORTED_SCHEMA.to_owned(),
+            run_id: "run-test".to_owned(),
+            created_utc: "2026-07-17T00:00:00Z".to_owned(),
+            code_version: "0.3.0".to_owned(),
+            lockfile_sha256: "deadbeef".to_owned(),
+            seed: 1,
+            config: serde_json::json!({ "capital_cents": 1_000_000 }),
+            strategy: serde_json::json!({}),
+            data_source: serde_json::json!({}),
+            metrics: serde_json::json!({}),
+            row_counts,
+        }
+    }
+
+    fn equity_point(step: u32) -> EquityPoint {
+        EquityPoint {
+            step,
+            ts_ns: 1_700_000_000_000_000_000 + i64::from(step),
+            cash_cents: 1_000,
+            position_value_cents: 0,
+            equity_cents: 1_000,
+            drawdown: 0.0,
+        }
+    }
+
+    /// A tiny in-memory bundle with a dense equity curve over `0..n_steps` (so the
+    /// cursor's `end_step` is `n_steps - 1`); the other tables stay empty. Used to
+    /// exercise the seek/playback folds without a Parquet round-trip.
+    #[must_use]
+    pub(crate) fn loaded_bundle(n_steps: u32) -> LoadedBundle {
+        LoadedBundle {
+            manifest: replay_manifest(),
+            fills: Vec::new(),
+            equity: (0..n_steps).map(equity_point).collect(),
+            positions: Vec::new(),
+            greeks: Vec::new(),
+        }
+    }
+
+    /// A replay [`App`] with a `Ready` bundle of `n_steps` steps (cursor at the
+    /// start, paused), plus its command-channel receiver — for the seek/playback
+    /// folds and the driver's replay end-to-end dispatch.
+    #[must_use]
+    pub(crate) fn ready_replay_app(n_steps: u32) -> (App, mpsc::Receiver<Command>) {
+        let (tx, rx) = mpsc::channel::<Command>(8);
+        let mut replay = ReplayState::new(PathBuf::from("/bundle"));
+        replay.apply_load_result(BundleLoadResult::Loaded(Box::new(loaded_bundle(n_steps))));
+        let mut app = App::new(Mode::Replay(replay), ThemeChoice::Auto, tx);
+        app.mark_drawn();
+        (app, rx)
+    }
 
     #[track_caller]
     fn pid(id: &str) -> ProviderId {
@@ -2158,6 +2429,7 @@ mod tests {
     use optionstratlib::prelude::Positive;
     use tokio::sync::mpsc;
 
+    use super::tests_support::{loaded_bundle, ready_replay_app};
     use super::{
         App, BundleLoad, HINT_TICKS, KeyRoute, LiveScreen, LiveState, Mode, OverlayBinding,
         Playback, ReplayScreen, ReplayState, ScreenLoad, SourceBinding, is_screen_reachable,
@@ -2168,10 +2440,11 @@ mod tests {
     };
     use crate::chain::{ContractSpecFingerprint, ExerciseStyle, InstrumentKey, SettlementStyle};
     use crate::config::ThemeChoice;
-    use crate::event::{AppEvent, Command, SeekTo};
+    use crate::event::{AppEvent, BundleLoadResult, Command, ReplayControl, SeekTo};
     use crate::providers::{
         ChainCapability, ChainPollCapability, GreeksCapability, ProviderCapabilities,
     };
+    use crate::replay::PlaybackSpeed;
 
     const EXP: i64 = 1_700_000_000;
 
@@ -2739,14 +3012,56 @@ mod tests {
         assert!(rx.try_recv().is_err(), "`r` has no replay binding");
     }
 
+    #[track_caller]
+    fn replay(app: &App) -> &ReplayState {
+        match &app.mode {
+            Mode::Replay(replay) => replay,
+            Mode::Live(_) => panic!("expected a replay app"),
+        }
+    }
+
+    #[track_caller]
+    fn cursor_position(app: &App) -> u32 {
+        match replay(app).loaded() {
+            Some(loaded) => loaded.cursor.position(),
+            None => panic!("expected a Ready bundle"),
+        }
+    }
+
     #[test]
-    fn test_on_replay_seek_emits_seek_bundle_command_in_replay() {
+    fn test_on_replay_seek_folds_into_cursor_no_command() {
+        // Seeking is an in-memory cursor move (#33): it emits NO command and
+        // advances the play-head directly, marking the frame dirty.
+        let (mut app, mut rx) = ready_replay_app(6);
+        app.on_event(AppEvent::ReplaySeek(SeekTo::Step(3)));
+        assert!(app.dirty, "a seek that moves the cursor redraws");
+        assert_eq!(cursor_position(&app), 3);
+        assert!(rx.try_recv().is_err(), "a seek emits no command (#33)");
+    }
+
+    #[test]
+    fn test_on_replay_seek_step_by_walks_and_clamps() {
+        let (mut app, _rx) = ready_replay_app(4);
+        // `end_step` is 3; a forward step moves, and a step past the end clamps.
+        app.on_event(AppEvent::ReplaySeek(SeekTo::StepBy(1)));
+        assert_eq!(cursor_position(&app), 1);
+        app.on_event(AppEvent::ReplaySeek(SeekTo::Step(u32::MAX)));
+        assert_eq!(cursor_position(&app), 3, "Step clamps to end_step");
+        app.mark_drawn();
+        // A no-op seek (already at end, step forward) does not redraw.
+        app.on_event(AppEvent::ReplaySeek(SeekTo::StepBy(1)));
+        assert!(!app.dirty, "a clamped no-op seek requests no redraw");
+        assert_eq!(cursor_position(&app), 3);
+    }
+
+    #[test]
+    fn test_on_replay_seek_while_loading_is_noop() {
+        // Before the bundle is Ready there is no cursor to move: the seek folds to
+        // a no-op with no redraw and no command.
         let (mut app, mut rx) = replay_app("/bundle");
         app.on_event(AppEvent::ReplaySeek(SeekTo::Step(3)));
-        match rx.try_recv() {
-            Ok(Command::SeekBundle(SeekTo::Step(3))) => {}
-            other => panic!("expected SeekBundle(Step(3)), got {other:?}"),
-        }
+        assert!(!app.dirty, "a seek with no loaded bundle is a no-op");
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
@@ -2758,6 +3073,194 @@ mod tests {
             rx.try_recv().is_err(),
             "a scrub is meaningless in live mode"
         );
+    }
+
+    // --- Bundle-load transitions: Loading -> Ready / Error, reload ------------
+
+    #[test]
+    fn test_bundle_loaded_transitions_loading_to_ready() {
+        let (mut app, _rx) = replay_app("/bundle");
+        assert!(matches!(replay(&app).bundle, BundleLoad::Loading));
+        app.on_event(AppEvent::BundleLoaded(BundleLoadResult::Loaded(Box::new(
+            loaded_bundle(5),
+        ))));
+        assert!(app.dirty, "a completed load redraws");
+        match replay(&app).loaded() {
+            Some(loaded) => {
+                assert_eq!(loaded.cursor.position(), 0, "the cursor starts at step 0");
+                assert_eq!(loaded.cursor.end_step(), 4, "end_step is n_steps - 1");
+                assert!(loaded.selection.is_none(), "no drill-down yet");
+            }
+            None => panic!("expected Ready after a successful load"),
+        }
+    }
+
+    #[test]
+    fn test_bundle_loaded_transitions_loading_to_error() {
+        let (mut app, _rx) = replay_app("/bundle");
+        app.on_event(AppEvent::BundleLoaded(BundleLoadResult::Failed(
+            "invariant violated: equity != cash + position at step 3".to_owned(),
+        )));
+        assert!(app.dirty);
+        match &replay(&app).bundle {
+            BundleLoad::Error { message } => {
+                assert!(message.contains("equity"), "the message is actionable");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_shift_r_resets_ready_bundle_to_loading_and_reloads() {
+        // `R` on a loaded bundle resets to Loading (the load screen shows the
+        // connecting state) AND re-issues ReloadBundle for the re-open I/O.
+        let (mut app, mut rx) = ready_replay_app(5);
+        assert!(replay(&app).loaded().is_some());
+        app.on_event(key(KeyCode::Char('R')));
+        assert!(app.dirty);
+        assert!(
+            matches!(replay(&app).bundle, BundleLoad::Loading),
+            "reload resets to Loading",
+        );
+        match rx.try_recv() {
+            Ok(Command::ReloadBundle(dir)) => assert_eq!(dir, PathBuf::from("/bundle")),
+            other => panic!("expected ReloadBundle, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_shift_r_on_a_closed_command_channel_keeps_prior_state_not_loading() {
+        // Finding 2 (#34): the reload flips to `Loading` only AFTER the
+        // `ReloadBundle` command actually enqueues. A dropped send (a closed command
+        // channel — the data layer is gone) must NOT strand the load screen at
+        // `Loading` with no load in flight: the prior `Ready` bundle is kept, the
+        // drop is counted (#9), and a one-line hint is flashed.
+        let (mut app, rx) = ready_replay_app(5);
+        assert!(replay(&app).loaded().is_some(), "starts Ready");
+        // Close the command channel: the data layer is gone.
+        drop(rx);
+        app.on_event(key(KeyCode::Char('R')));
+        assert!(
+            replay(&app).loaded().is_some(),
+            "a dropped reload send keeps the prior Ready bundle, not a stuck Loading",
+        );
+        assert!(
+            !matches!(replay(&app).bundle, BundleLoad::Loading),
+            "the load screen must not spin forever with no load in flight",
+        );
+        assert_eq!(app.commands_dropped, 1, "the dropped reload is counted");
+        assert!(
+            app.status_hint.is_some(),
+            "a dropped reload flashes a hint instead of silently no-op'ing",
+        );
+    }
+
+    #[test]
+    fn test_reload_after_error_returns_to_loading() {
+        // The retry key on a bundle Error is `R`: Error -> (R) -> Loading -> Ready.
+        let (mut app, mut rx) = replay_app("/bundle");
+        app.on_event(AppEvent::BundleLoaded(BundleLoadResult::Failed(
+            "missing table: fills.parquet".to_owned(),
+        )));
+        assert!(matches!(replay(&app).bundle, BundleLoad::Error { .. }));
+        app.on_event(key(KeyCode::Char('R')));
+        assert!(matches!(replay(&app).bundle, BundleLoad::Loading));
+        assert!(matches!(rx.try_recv(), Ok(Command::ReloadBundle(_))));
+        // A subsequent successful load recovers.
+        app.on_event(AppEvent::BundleLoaded(BundleLoadResult::Loaded(Box::new(
+            loaded_bundle(3),
+        ))));
+        assert!(replay(&app).loaded().is_some());
+    }
+
+    #[test]
+    fn test_bundle_loaded_in_live_is_ignored() {
+        // A stray bundle-load result in live mode is a no-op — never a panic, never
+        // a mode switch.
+        let (mut app, _rx) = live_app(full_caps());
+        app.on_event(AppEvent::BundleLoaded(BundleLoadResult::Loaded(Box::new(
+            loaded_bundle(3),
+        ))));
+        assert!(!app.dirty);
+        assert!(matches!(app.mode, Mode::Live(_)));
+    }
+
+    // --- Playback fold: play/pause/speed + tick advance ----------------------
+
+    #[test]
+    fn test_replay_control_play_pause_toggles() {
+        let (mut app, _rx) = ready_replay_app(6);
+        assert!(!replay(&app).is_playing());
+        app.on_event(AppEvent::ReplayControl(ReplayControl::PlayPause));
+        assert!(app.dirty);
+        assert!(replay(&app).is_playing());
+        assert_eq!(replay(&app).play, Playback::playing(PlaybackSpeed::X1));
+        app.mark_drawn();
+        app.on_event(AppEvent::ReplayControl(ReplayControl::PlayPause));
+        assert!(app.dirty);
+        assert_eq!(replay(&app).play, Playback::Paused);
+    }
+
+    #[test]
+    fn test_replay_control_speed_adjusts_only_while_playing() {
+        let (mut app, _rx) = ready_replay_app(6);
+        // Paused: a speed key is a no-op.
+        app.on_event(AppEvent::ReplayControl(ReplayControl::SpeedFaster));
+        assert!(!app.dirty, "speed while paused is a no-op");
+        assert_eq!(replay(&app).play, Playback::Paused);
+        // Playing: + steps the speed up, clamped at the fastest.
+        app.on_event(AppEvent::ReplayControl(ReplayControl::PlayPause));
+        app.mark_drawn();
+        app.on_event(AppEvent::ReplayControl(ReplayControl::SpeedFaster));
+        assert_eq!(replay(&app).play, Playback::playing(PlaybackSpeed::X2));
+        app.on_event(AppEvent::ReplayControl(ReplayControl::SpeedSlower));
+        assert_eq!(replay(&app).play, Playback::playing(PlaybackSpeed::X1));
+        app.mark_drawn();
+        // Already at the slowest: another `-` is a no-op.
+        app.on_event(AppEvent::ReplayControl(ReplayControl::SpeedSlower));
+        assert!(!app.dirty, "speed clamped at the slowest is a no-op");
+    }
+
+    #[test]
+    fn test_tick_advances_play_head_only_while_playing() {
+        let (mut app, _rx) = ready_replay_app(6);
+        // Paused: a tick does not move the cursor.
+        app.on_event(AppEvent::Tick);
+        assert_eq!(cursor_position(&app), 0);
+        // Playing at ×1: each tick advances one step.
+        app.on_event(AppEvent::ReplayControl(ReplayControl::PlayPause));
+        app.on_event(AppEvent::Tick);
+        assert_eq!(cursor_position(&app), 1);
+        app.on_event(AppEvent::Tick);
+        assert_eq!(cursor_position(&app), 2);
+    }
+
+    #[test]
+    fn test_tick_advance_stops_and_auto_pauses_at_end() {
+        let (mut app, _rx) = ready_replay_app(3);
+        // Jump near the end, then play: the head reaches end_step and auto-pauses,
+        // so the loop parks instead of spinning.
+        app.on_event(AppEvent::ReplaySeek(SeekTo::Step(1)));
+        app.on_event(AppEvent::ReplayControl(ReplayControl::PlayPause));
+        app.on_event(AppEvent::Tick); // 1 -> 2 (== end_step)
+        assert_eq!(cursor_position(&app), 2);
+        assert_eq!(
+            replay(&app).play,
+            Playback::Paused,
+            "playback auto-pauses at the tape end"
+        );
+        app.mark_drawn();
+        // A further tick neither moves the head nor redraws (parked).
+        app.on_event(AppEvent::Tick);
+        assert!(!app.dirty, "a paused tick at the end does not spin");
+        assert_eq!(cursor_position(&app), 2);
+    }
+
+    #[test]
+    fn test_replay_control_in_live_is_ignored() {
+        let (mut app, _rx) = live_app(full_caps());
+        app.on_event(AppEvent::ReplayControl(ReplayControl::PlayPause));
+        assert!(!app.dirty);
     }
 
     // --- Quit / help ----------------------------------------------------------

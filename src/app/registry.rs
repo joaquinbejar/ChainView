@@ -359,7 +359,12 @@ impl ChainViewAppBuilder {
             ModeSelect::Replay(dir) => {
                 // Replay renders an IronCondor bundle read-only and needs NO live
                 // provider, so the registry emptiness / `--provider` resolution do
-                // not apply. The bundle reader + timeline wiring land in v0.3 (#34).
+                // not apply. SEAM: the binary's replay composition builds the
+                // `App` with `Mode::Replay(ReplayState::new(dir))`
+                // (BundleLoad::Loading) and starts the off-thread load with
+                // [`spawn_bundle_load`](super::spawn_bundle_load) under a
+                // supervisor child token, whose `AppEvent::BundleLoaded` folds
+                // the bundle in (#34).
                 let dir = dir.clone();
                 Ok(Resolved::Replay { dir, config })
             }

@@ -60,14 +60,14 @@ pub use app::{
     App, BridgeSenders, BuilderLeg, BundleLoad, COMMAND_CHANNEL_CAPACITY, CONTROL_CHANNEL_CAPACITY,
     ChainViewApp, ChainViewAppBuilder, CommittedStrategy, CurveMode, DEFAULT_JOIN_BUDGET,
     EventBridge, ExitCause, ExitReporter, FinalTeardown, GuardTeardown, LegError, LegFocus,
-    LiveScreen, LiveState, LoadedReplay, Mode, OverlayBinding, PayoffBuilder, Playback,
-    ProviderSubscription, ReplayScreen, ReplayState, Resolved, ScreenLoad, Selection, Side,
-    SourceBinding, StatusLine, SupervisedTask, Supervisor, TaskExit, TokioTask,
-    is_replay_screen_reachable, is_screen_reachable, spawn_supervised_subscription,
+    LiveScreen, LiveState, LoadedReplay, Mode, OverlayBinding, PayoffBuilder, ProviderSubscription,
+    ReplayScreen, ReplayState, Resolved, ScreenLoad, Selection, Side, SourceBinding, StatusLine,
+    SupervisedTask, Supervisor, TaskExit, TokioTask, is_replay_screen_reachable,
+    is_screen_reachable, spawn_bundle_load, spawn_supervised_subscription,
 };
 // The closed event set folded by the state machine and the render -> data
 // command channel (`docs/02-tui-architecture.md` §4).
-pub use event::{AppEvent, Command, SeekTo};
+pub use event::{AppEvent, BundleLoadResult, Command, ReplayControl, SeekTo};
 // The pure draw dispatch and the synchronous, event-driven render loop
 // (`docs/02-tui-architecture.md` §7, §8, §9): `render` (pure over `&App`), the root
 // layout, the loop driver, the bounded `AppEvent` channel, and the tick/input task
@@ -168,20 +168,19 @@ pub use error::{
 // (O(1) `StepBy` / O(log n) `Step` seeks over the integer `step` clock, the
 // post-fill open-position set, and the as-of slices), plus the domain `Playback` /
 // `PlaybackSpeed` playback model and `TimelineCursor::advance_playback`. The cursor
-// consumes `event::SeekTo`. The domain `Playback` shares a name with the
-// `app::Playback` stub re-exported above, so it is re-exported here under the
-// TRANSITIONAL alias `ReplayPlayback` — a bare `Playback` at the crate root would
-// collide. Issue #34 (the app-state wiring) reconciles the app stub with the domain
-// type into a single `Playback`; in-crate consumers already reach the domain type
-// as `crate::replay::Playback`.
-pub use replay::Playback as ReplayPlayback;
+// consumes `event::SeekTo`.
+//
+// Issue #34 (the app-state wiring) collapsed the earlier `app::Playback` stub into
+// this single domain `Playback` — there is now exactly one playback type, exported
+// bare from the crate root (the earlier transitional re-export alias is gone), and
+// the app-state field (`ReplayState::play`) and the tick fold reference this type.
 pub use replay::{
     BundleDivergence, BundleManifest, BundleReader, CONTRACT_ID_FORMAT,
     CONTRACT_ID_UNDERLYING_PATTERN, CONTRACT_ID_VERSION_PREFIX, CapitalConfig,
     DECODED_OVERHEAD_PERMILLE, EquityPoint, ExecMode, Fill, GreeksAttribution, LoadedBundle,
     MAX_BATCH_BYTES, MAX_BATCH_ROWS, MAX_EXPANSION_RATIO, MAX_MANIFEST_BYTES, MAX_TABLE_BYTES,
-    MAX_TABLE_ROWS, MAX_WORKING_SET, ORACLE_ABS_TOL, ORACLE_REL_TOL, PlaybackSpeed, PositionRow,
-    PositionSide, ResourceCeilings, SUPPORTED_SCHEMA, TimelineCursor, compare_bundles,
+    MAX_TABLE_ROWS, MAX_WORKING_SET, ORACLE_ABS_TOL, ORACLE_REL_TOL, Playback, PlaybackSpeed,
+    PositionRow, PositionSide, ResourceCeilings, SUPPORTED_SCHEMA, TimelineCursor, compare_bundles,
 };
 // The PUBLIC, semver-governed provider port surface (`docs/03-data-providers.md`
 // §2, §11.1): the trait, the capability self-declaration + its builder + every

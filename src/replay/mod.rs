@@ -86,11 +86,10 @@ mod tables;
 mod timeline;
 mod validate;
 
-// The domain playback enum `Playback` shares a name with the `app::Playback`
-// stub the crate root already exports, so the crate root re-exports it under the
-// transitional alias `ReplayPlayback` (see `src/lib.rs`); issue #34 (the app-state
-// wiring) reconciles the two into one `Playback`. It is re-exported here so
-// `crate::replay::Playback` names the domain type for that wiring.
+// `Playback` is the single playback enum (issue #34 collapsed the earlier
+// `app::Playback` stub into this domain type): the crate root exports it bare, the
+// app-state `ReplayState::play` field and the tick fold reference it, and
+// `crate::replay::Playback` is its canonical path.
 pub use timeline::{Playback, PlaybackSpeed, TimelineCursor};
 pub use validate::{BundleDivergence, ORACLE_ABS_TOL, ORACLE_REL_TOL, compare_bundles};
 
