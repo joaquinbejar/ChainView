@@ -14,6 +14,93 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- The Deribit `ticker`/`book` streaming overlay and the adapter-owned
+  reconnect/resubscribe loop (`src/providers/deribit.rs`, issue #16;
+  `docs/03-data-providers.md` §7.1, §5, `docs/01-domain-model.md` §5, §7,
+  `docs/02-tui-architecture.md` §5). `Provider::subscribe` now opens the live
+  overlay — it replaces the #15 `Unsupported` stub. Key behaviours:
+  - **Ticker + book normalization at the seam.** `ticker.{instrument}`
+    normalizes into a `QuoteUpdate` (bid/ask/last/sizes, checked at the `f64`
+    seam — a crossed quote drops bid/ask, keeping the prior) **and** a
+    `GreeksRow` (venue delta/gamma + percentage-form IV divided by 100);
+    `book.{instrument}.{group}` normalizes into a `DepthLadder` with the upstream
+    `change_id` captured for later gap-detect/resync, best-first levels, and
+    per-level `f64` checks that drop an invalid level without dropping the ladder.
+    Both the aggregated `[price, amount]` and raw `[action, price, amount]` book
+    encodings decode. **Streamed theta/vega/rho are deliberately discarded**
+    (`docs/01` §7) — not even deserialized; the `GreeksRow` always emits `None`
+    for them. Raw `deribit-websocket` notification DTOs never leave the adapter.
+    **`trades.` is not subscribed** (the tape is deferred), so `MarketUpdate`
+    carries no trade event.
+  - **Producer-side overwrite-on-full staging — completes the two-stage
+    coalescing.** The adapter keeps a per-`InstrumentKey` `ProducerStaging` map
+    (one slot per instrument, the latest of each kind held independently) and,
+    when the bounded `mpsc::Sender<MarketUpdate>` is **full**, **overwrites the
+    staged slot with the newest value** — reserving a channel slot *before*
+    taking the staged value, so a full channel never drops it — and flushes on
+    space. This is the producer mirror of #10's consumer `EventBridge`,
+    completing the NFR-15 latest-value-wins guarantee under sustained saturation.
+    The map is O(N subscribed) and reuses its allocation.
+  - **Adapter-owned reconnect/resubscribe loop.** `deribit-websocket` (0.3.1)
+    ships no auto-reconnect, so ChainView drives it behind the
+    `SubscriptionHandle`: connect → resubscribe the `ticker`/`book` channels →
+    drain updates; on a drop it emits `Health(id, Reconnecting{attempt})` —
+    control-class updates (`Health`/`Chain`) are **await-sent** (never
+    coalesced/dropped) on the **one** bounded `mpsc::Sender` the port provides,
+    while coalesced-class updates use overwrite-on-full staging on the same
+    sender; the single-sender port cannot physically separate a control channel,
+    so the true two-class priority drain is the consumer bridge's concern and the
+    port→bridge two-sender routing is reconciled at the composition seam (#22, per
+    ADR-0009). It backs off with jittered exponential backoff
+    (`BASE = 250 ms`, `MAX = 30 s`, `jitter ∈ [-0.2, 0.2]`, `attempt` reset to 0
+    on a successful (re)subscribe — never a hot-loop, respecting the upstream
+    token-bucket limiter), then **re-`fetch_chain`** (#15) to reconcile drift and
+    resubscribes off the **fresh** `ChainFetch.aliases` (backfill = current
+    state, no bare `OptionChain`, no symbol re-derivation; a fresh `Chain`
+    snapshot is emitted to reconcile structure). Cancellation (handle drop) is
+    observed at every `.await` via a `biased` `select!`, so the loop never opens
+    a socket after cancellation; dropping the handle cancels the token and aborts
+    the task (no fire-and-forget). `install_default_crypto_provider()` installs
+    the rustls provider once before the first WS TLS handshake.
+  - **Backoff as a pure, injectable-jitter kernel.** `backoff_delay(attempt,
+    jitter)` is pure — the jitter is **injected** (the loop samples it from the
+    process clock; tests pass a fixed value) — so the formula, the bounds (never
+    above `MAX * 1.2` = 36 s, never below `BASE * 0.8` = 200 ms), the jitter
+    range, and the `attempt = 0` → `BASE` reset are unit-tested with **no**
+    wall-clock wait and no unseeded RNG in the kernel.
+  - **`AliasCatalog::instruments()`** (new, `src/chain/fetch.rs`) enumerates
+    every feed alias so the reconnect resubscribe walks the **fresh** aliases
+    without re-deriving symbols from strikes.
+  - Tested with CONSTRUCTED payloads, NO real socket, NO wall clock: the backoff
+    kernel (bounds / jitter range / reset), ticker → `QuoteUpdate`/`GreeksRow`
+    (incl. discarding theta/vega/rho and the percentage-form IV), book →
+    `DepthLadder` with `change_id` (both level encodings), the producer staging
+    (overwrite-on-full + flush-on-space + O(N) bound + closed-channel), frame
+    routing (ticker/book publish, a ticker channel with a trailing interval
+    suffix still routing to the right key, unknown-symbol guard, non-subscription
+    / malformed frames ignored), the reconnect backfill snapshot, and property
+    tests that `backoff_delay` / `normalize_ticker` / `normalize_book` are total
+    (a malformed payload is a valid update or a dropped field, never a panic).
+    The `subscribe` test spawns the loop on a current-thread runtime and drops
+    the handle before it is polled, so no socket opens. The full mock-transport
+    lifecycle (socket close/error/resubscribe/saturation/lag/shutdown) lands in
+    #17. 27 new deribit tests plus the `AliasCatalog::instruments()` test in
+    `src/chain/fetch.rs`.
+- **`deribit-websocket` `0.3.1`** (`[dependencies]`, issue #16) — the upstream
+  Deribit WebSocket client ChainView wraps for the streaming overlay; the
+  JSON-RPC 2.0 over WebSocket protocol lives upstream and is never reimplemented
+  here.
+  - **Audit note (supply-chain).** An explicit-approval dependency addition
+    (CLAUDE.md "Coding Rules"). Delta over #15's `deribit-http`: adds
+    `tokio-tungstenite` (WS framing) and the default `rustls-aws-lc` TLS backend
+    — `rustls` + the `aws-lc-rs` crypto provider, installed **once** via
+    `install_default_crypto_provider()` before the first WS TLS handshake (this
+    differs from #15, where the REST client used `reqwest`'s default TLS and
+    needed no provider install) — plus `futures-util`. It shares `tokio`
+    (feature-unified toward `full`), `serde`/`serde_json`, `url`, and `dotenv`
+    with the existing tree; `aws-lc-rs` requires a C/ASM toolchain at build time.
+    `RUSTSEC`-clean at this revision. The public data path needs no credential
+    and logs none; the public endpoints send none.
 - The Deribit adapter chain assembly, normalization, and honest capabilities
   (`src/providers/deribit.rs`, issue #15; `docs/03-data-providers.md` §7.1, §3,
   §8, ADR-0003) — the zero-config, public-data poll leg and the first provider
@@ -384,9 +471,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
     never clobbers a pending quote and the slot count stays exactly N. This is the
     **consumer-side** stage of the two-stage coalescing design (`docs/02` §5); the
     **producer-side** overwrite-on-full staging that preserves the freshest value
-    when the bounded channel is *full* is the adapter's contract, pinned in #16 —
-    until it lands, a plain `try_send`-drop producer can transiently deliver a
-    stale value under sustained saturation (self-healing on the next quote).
+    when the bounded channel is *full* landed with the Deribit adapter in #16
+    (`ProducerStaging`), so the two-stage coalescing is now complete and the
+    NFR-15 latest-value-wins guarantee holds even under sustained channel
+    saturation.
   - **HP-3 allocation discipline.** The staging map **reuses** its allocation
     across bursts — a flush drains via `HashMap::drain` and an unsubscribe prunes
     via `HashMap::retain`, both of which retain the bucket allocation, and a

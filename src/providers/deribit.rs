@@ -28,16 +28,46 @@
 //! settlement), taken from the instrument's `expiration_timestamp` (or parsed
 //! from the `instrument_name` date code as a fallback), never a relative offset.
 //!
-//! # Scope
+//! # Streaming overlay + reconnect (issue #16)
 //!
-//! This module lands the poll leg (`discover`/`fetch_chain`) and the honest
-//! [`capabilities`](Provider::capabilities). The streaming overlay + reconnect
-//! loop is issue #16, so [`subscribe`](Provider::subscribe) returns
-//! [`ProviderError::Unsupported`] here.
+//! [`subscribe`](Provider::subscribe) opens the live overlay over
+//! [`deribit-websocket`](DeribitWebSocketClient): `ticker.{instrument}`
+//! (mark/IV/Greeks → [`QuoteUpdate`] + [`GreeksRow`]) and `book.{instrument}`
+//! depth (snapshots + deltas → [`DepthLadder`] with the upstream `change_id`
+//! captured for later gap-detect/resync). The **`trades.` tape is not
+//! subscribed** (deferred). Streamed theta/vega/rho are **deliberately
+//! discarded** — [`OptionData`](optionstratlib::chains::OptionData) cannot store
+//! them and the local sidecar owns them
+//! (`docs/01-domain-model.md` §7); the adapter forwards only the venue
+//! delta/gamma/IV.
+//!
+//! `deribit-websocket` (0.3.1) ships **no** auto-reconnect, so the
+//! reconnect/resubscribe loop is **ChainView's** (`docs/03-data-providers.md`
+//! §5): on a dropped stream the adapter emits `Health(Reconnecting{attempt})`,
+//! backs off with [jittered exponential backoff](backoff_delay), re-fetches the
+//! chain to reconcile drift, and resubscribes off the **fresh
+//! [`AliasCatalog`]** — the backfill is current state, never a replayed tape.
+//!
+//! # One sender, two update classes
+//!
+//! The port hands `subscribe` a **single** bounded [`mpsc::Sender`]. Over it the
+//! adapter emits two classes: **control-class** updates (`Health` / the reconnect
+//! backfill `Chain`) are **await-sent** — never coalesced or dropped — and
+//! **coalesced-class** updates (`Quote` / `Greeks` / `Depth`) go through a
+//! per-[`InstrumentKey`] **producer-side staging map** ([`ProducerStaging`]) that
+//! **overwrites the staged slot on a full channel** so the freshest value
+//! survives under sustained saturation (the producer mirror of the #10 consumer
+//! conflater, `docs/02-tui-architecture.md` §5). This one sender cannot
+//! physically *separate* a control channel; the true two-class priority (a
+//! separate control channel drained first) is the **consumer bridge's** concern,
+//! and the port→bridge two-sender routing is reconciled at the composition seam
+//! (#22, per ADR-0009). The rustls crypto provider is installed once via
+//! [`install_default_crypto_provider`] before the first WS TLS handshake.
 //!
 //! [ADR-0003]: https://github.com/joaquinbejar/ChainView/blob/main/docs/adr/0003-zero-config-first-run.md
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, Utc};
@@ -46,19 +76,27 @@ use deribit_http::model::instrument::{
 };
 use deribit_http::model::other::OptionInstrument;
 use deribit_http::{DeribitHttpClient, HttpConfig, HttpError};
+use deribit_websocket::install_default_crypto_provider;
+use deribit_websocket::prelude::{
+    DeribitWebSocketClient, NotificationHandler, SubscriptionChannel, WebSocketConfig,
+};
 use optionstratlib::chains::chain::OptionChain;
 use optionstratlib::prelude::{Decimal, Positive};
 use optionstratlib::{ExpirationDate, OptionStyle};
+use serde::Deserialize;
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::task::JoinSet;
+use tokio_util::sync::CancellationToken;
 
 use super::{
     AuthKind, ChainCapability, ChainPollCapability, GreeksCapability, OptionStreamCapability,
     Provider, ProviderCapabilities, SubscriptionHandle, SubscriptionRequest, UnderlyingRef,
 };
 use crate::chain::{
-    AliasCatalog, ChainFetch, ContractSpecFingerprint, ExerciseStyle, ExpirySource, Instrument,
-    InstrumentKey, MarketUpdate, ProviderId, SettlementStyle,
+    AliasCatalog, ChainFetch, ChainSnapshot, ChainSource, ContractSpecFingerprint, DepthLadder,
+    DepthLevel, ExerciseStyle, ExpirySource, GreeksOrigin, GreeksRow, Instrument, InstrumentKey,
+    MarketUpdate, ProviderId, QuoteUpdate, SettlementStyle, StreamHealth,
 };
 use crate::error::{NormalizeKind, ProviderError, TransportDetail, TransportKind};
 
@@ -87,6 +125,37 @@ const OI_MAX_F64: f64 = 9_007_199_254_740_992.0;
 /// limiter (`docs/06-performance.md`).
 const MAX_CONCURRENT_TICKERS: usize = 16;
 
+// --- Reconnect backoff (docs/03-data-providers.md §5) ------------------------
+
+/// The reconnect backoff base, in milliseconds (`BASE = 250 ms`,
+/// `docs/03-data-providers.md` §5). Used by the pure [`backoff_delay`] kernel.
+const BACKOFF_BASE_MS: f64 = 250.0;
+
+/// The reconnect backoff ceiling, in milliseconds (`MAX = 30 s`,
+/// `docs/03-data-providers.md` §5).
+const BACKOFF_MAX_MS: f64 = 30_000.0;
+
+/// The reconnect jitter magnitude — the delay is scaled by `1 + jitter` with
+/// `jitter ∈ [-0.2, 0.2]` (`docs/03-data-providers.md` §5).
+const JITTER_MAGNITUDE: f64 = 0.2;
+
+/// The largest exponent applied to `2^attempt` before the [`BACKOFF_MAX_MS`] cap
+/// takes over — `250 ms * 2^7` already exceeds `30 s`, so a ceiling of `20` both
+/// keeps `attempt` growth harmless and avoids the `powi` overflow/wrap a very
+/// large `attempt` would otherwise reach.
+const BACKOFF_MAX_SHIFT: u32 = 20;
+
+/// How often the streaming loop retries a producer-staged flush while the feed
+/// is quiet. A value coalesced onto a full channel would otherwise wait for the
+/// next `publish` to flush it — and after a burst subsides that notification may
+/// never come, stranding the freshest quote/greeks/depth exactly when the user
+/// is watching a now-stale "latest". A bounded tick delivers it instead. The
+/// cadence sits well within the render loop's 16 ms/60 fps frame budget, so a
+/// staged value reaches the consumer by the next frame; the tick only arms while
+/// a value is staged, so an idle stream never wakes
+/// (`docs/02-tui-architecture.md` §5).
+const STAGING_FLUSH_INTERVAL: Duration = Duration::from_millis(10);
+
 // ---------------------------------------------------------------------------
 // The adapter.
 // ---------------------------------------------------------------------------
@@ -97,6 +166,12 @@ const MAX_CONCURRENT_TICKERS: usize = 16;
 /// Holds the upstream REST client (built for the production venue, no
 /// credentials) and its reserved [`ProviderId`]. Raw upstream types stay inside
 /// this module — nothing on the public surface names a `deribit-http` DTO.
+///
+/// `Clone` is cheap: [`DeribitHttpClient`] is `Arc`-backed and [`ProviderId`]
+/// owns a short string. A clone is moved into the spawned reconnect loop so it
+/// can re-`fetch_chain` (over REST) to reconcile drift on reconnect without
+/// borrowing `&self` across the task boundary.
+#[derive(Clone)]
 pub(crate) struct DeribitAdapter {
     client: DeribitHttpClient,
     id: ProviderId,
@@ -285,12 +360,38 @@ impl Provider for DeribitAdapter {
 
     async fn subscribe(
         &self,
-        _req: SubscriptionRequest,
-        _tx: mpsc::Sender<MarketUpdate>,
+        req: SubscriptionRequest,
+        tx: mpsc::Sender<MarketUpdate>,
     ) -> Result<SubscriptionHandle, ProviderError> {
-        // The streaming overlay + reconnect/resubscribe loop is issue #16; the
-        // poll leg above is the supported live path until then.
-        Err(ProviderError::Unsupported("deribit streaming lands in #16"))
+        // The adapter OWNS the reconnect/resubscribe loop — `deribit-websocket`
+        // (0.3.1) ships no auto-reconnect (`docs/03-data-providers.md` §5). The
+        // loop runs behind the returned handle; dropping (or aborting) the handle
+        // cancels the token — a clean cooperative stop — and aborts the task as a
+        // hard backstop, so there is no fire-and-forget spawn.
+        let cancel = CancellationToken::new();
+        let loop_cancel = cancel.clone();
+        let adapter = self.clone();
+        // Cold-path config assembly (venue URL from env or the production
+        // default); no credential is read or required — public data only.
+        let ws_config = WebSocketConfig::default();
+        let SubscriptionRequest {
+            underlying,
+            expiration_utc,
+            instruments,
+        } = req;
+        let handle = tokio::spawn(run_reconnect_loop(
+            adapter,
+            ws_config,
+            underlying,
+            expiration_utc,
+            instruments,
+            tx,
+            loop_cancel,
+        ));
+        Ok(SubscriptionHandle::new(move || {
+            cancel.cancel();
+            handle.abort();
+        }))
     }
 }
 
@@ -879,11 +980,761 @@ fn transport(kind: TransportKind) -> ProviderError {
     ProviderError::Transport(Box::new(TransportDetail::new(kind, None)))
 }
 
+// ---------------------------------------------------------------------------
+// Reconnect backoff — the pure, injectable-jitter kernel.
+// ---------------------------------------------------------------------------
+
+/// The jittered exponential backoff delay for reconnect attempt `attempt`
+/// (`docs/03-data-providers.md` §5):
+///
+/// ```text
+/// delay = min(MAX, BASE * 2^attempt) * (1 + jitter)
+/// ```
+///
+/// with `BASE = 250 ms`, `MAX = 30 s`, and `jitter ∈ [-0.2, 0.2]` (values
+/// outside the range are clamped). This is a **pure** kernel: `jitter` is
+/// **injected**, not sampled — the loop calls it with [`sample_jitter`], while
+/// tests pass a fixed value so the mapping is deterministic (no wall clock, no
+/// unseeded RNG). `attempt = 0` maps to exactly `BASE`, so a reset-to-zero would
+/// restart the ramp at `BASE`.
+///
+/// Note the loop passes a **1-based** `attempt` (matching the 1-based
+/// `Reconnecting { attempt }` badge): it increments to `1` before the *first*
+/// backoff, so the first retry delay is `BASE * 2^1 ≈ 500 ms` (with jitter), not
+/// `BASE`. `attempt = 0` is the kernel's identity point, not a delay the loop
+/// ever waits.
+///
+/// The result never exceeds `MAX * (1 + 0.2) = 36 s` and never drops below
+/// `BASE * (1 - 0.2) = 200 ms`.
+#[must_use]
+fn backoff_delay(attempt: u32, jitter: f64) -> Duration {
+    let exponent = attempt.min(BACKOFF_MAX_SHIFT);
+    let uncapped = BACKOFF_BASE_MS * 2.0_f64.powi(exponent as i32);
+    let capped = uncapped.min(BACKOFF_MAX_MS);
+    let jitter = jitter.clamp(-JITTER_MAGNITUDE, JITTER_MAGNITUDE);
+    let millis = capped * (1.0 + jitter);
+    Duration::from_secs_f64(millis / 1000.0)
+}
+
+/// Sample a reconnect jitter in `[-0.2, 0.2)` from the process clock's
+/// sub-second nanoseconds — enough entropy to spread simultaneous reconnects,
+/// with no RNG dependency. It is deliberately **outside** the [`backoff_delay`]
+/// kernel (which takes the jitter as a parameter) so the kernel stays pure and
+/// deterministic under test.
+fn sample_jitter() -> f64 {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.subsec_nanos());
+    let unit = f64::from(nanos) / 1_000_000_000.0; // [0, 1)
+    (unit * 2.0 - 1.0) * JITTER_MAGNITUDE // [-0.2, 0.2)
+}
+
+/// The current wall-clock instant as a normalization `received_time`
+/// (`docs/01-domain-model.md` §5.1). Uses `std`'s clock (chrono's `clock`
+/// feature is off), clamps a pathological system time to the representable
+/// range, and never `unwrap`s. Called only in the impure loop; the pure
+/// normalization functions take `received` as a parameter.
+fn now_utc() -> DateTime<Utc> {
+    let since = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO);
+    let secs = i64::try_from(since.as_secs()).unwrap_or(i64::MAX);
+    DateTime::<Utc>::from_timestamp(secs, since.subsec_nanos()).unwrap_or(DateTime::<Utc>::MIN_UTC)
+}
+
+/// Resolve a Deribit millisecond epoch to an optional venue `event_time` — an
+/// out-of-range value yields `None` (the stream is not rejected; the event
+/// simply carries no venue clock, `docs/01-domain-model.md` §5.1).
+fn millis_to_event_time(millis: i64) -> Option<DateTime<Utc>> {
+    DateTime::<Utc>::from_timestamp_millis(millis)
+}
+
+// ---------------------------------------------------------------------------
+// Raw streaming payload DTOs — deserialized from the subscription JSON, and
+// never escaping this module.
+// ---------------------------------------------------------------------------
+
+/// The `ticker.{instrument}` notification payload (`docs/03-data-providers.md`
+/// §7.1). Only the fields the overlay reads are named; every one is optional so
+/// a partial or unfamiliar payload deserializes rather than rejecting the frame.
+#[derive(Debug, Clone, Deserialize)]
+struct TickerPayload {
+    #[serde(default)]
+    best_bid_price: Option<f64>,
+    #[serde(default)]
+    best_ask_price: Option<f64>,
+    #[serde(default)]
+    best_bid_amount: Option<f64>,
+    #[serde(default)]
+    best_ask_amount: Option<f64>,
+    #[serde(default)]
+    last_price: Option<f64>,
+    #[serde(default)]
+    mark_iv: Option<f64>,
+    #[serde(default)]
+    timestamp: Option<i64>,
+    #[serde(default)]
+    greeks: Option<GreeksPayload>,
+}
+
+/// The `greeks` object inside a ticker payload. Only `delta` and `gamma` are
+/// read; the venue's `theta`/`vega`/`rho` are **deliberately discarded**
+/// (`docs/01-domain-model.md` §7) — `OptionData` cannot store them and the local
+/// sidecar owns them — so they are not even deserialized here (serde ignores the
+/// unmodeled JSON fields), and [`normalize_ticker`] always emits `None` for them.
+#[derive(Debug, Clone, Deserialize)]
+struct GreeksPayload {
+    #[serde(default)]
+    delta: Option<f64>,
+    #[serde(default)]
+    gamma: Option<f64>,
+}
+
+/// The `book.{instrument}.{group}` notification payload
+/// (`docs/03-data-providers.md` §7.1): best-first `bids`/`asks`, the upstream
+/// `change_id` for gap-detect/resync, and a venue `timestamp`. A snapshot and a
+/// delta frame share this shape; delta application is the depth screen's job
+/// (v0.5) — the adapter normalizes each frame's levels into a [`DepthLadder`].
+#[derive(Debug, Clone, Deserialize)]
+struct BookPayload {
+    #[serde(default)]
+    change_id: Option<u64>,
+    #[serde(default)]
+    timestamp: Option<i64>,
+    #[serde(default)]
+    bids: Vec<BookLevel>,
+    #[serde(default)]
+    asks: Vec<BookLevel>,
+}
+
+/// One order-book level, in either Deribit encoding: an aggregated
+/// `[price, amount]` pair, or a raw-book `[action, price, amount]` triple whose
+/// leading action string (`"new"`/`"change"`/`"delete"`) is ignored here — only
+/// the price and size are normalized (`docs/03-data-providers.md` §7.1).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum BookLevel {
+    /// The aggregated-book encoding: `[price, amount]`.
+    Priced([f64; 2]),
+    /// The raw-book encoding: `[action, price, amount]`.
+    Actioned(String, f64, f64),
+}
+
+impl BookLevel {
+    /// The `(price, amount)` this level carries, dropping the raw-book action
+    /// tag when present.
+    fn price_size(&self) -> (f64, f64) {
+        match self {
+            BookLevel::Priced([price, amount]) => (*price, *amount),
+            BookLevel::Actioned(_action, price, amount) => (*price, *amount),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Streaming normalization — ticker -> QuoteUpdate + GreeksRow, book -> ladder.
+// ---------------------------------------------------------------------------
+
+/// Normalize a `ticker.{instrument}` payload into a [`QuoteUpdate`] **and** a
+/// [`GreeksRow`] for the resolved [`Instrument`]
+/// (`docs/03-data-providers.md` §3 table). The same field-specific rules as the
+/// poll leg apply at the `f64` seam: a crossed/torn quote drops the bid/ask to
+/// `None` (the store keeps the prior values), a `NaN`/`Inf`/negative field is
+/// dropped, IV is percentage-form and divided by 100, and venue delta/gamma are
+/// forwarded as `Decimal`. **Streamed theta/vega/rho are discarded**
+/// (`docs/01-domain-model.md` §7) — the returned `GreeksRow` always carries
+/// `None` for them.
+fn normalize_ticker(
+    instrument: &Instrument,
+    payload: &TickerPayload,
+    received: DateTime<Utc>,
+) -> (QuoteUpdate, GreeksRow) {
+    let quote = normalize_quote(payload.best_bid_price, payload.best_ask_price).unwrap_or_default();
+    let event_time = payload.timestamp.and_then(millis_to_event_time);
+
+    let quote_update = QuoteUpdate {
+        instrument: instrument.clone(),
+        bid: quote.bid,
+        ask: quote.ask,
+        last: payload.last_price.and_then(positive_or_drop),
+        bid_size: payload.best_bid_amount.and_then(positive_or_drop),
+        ask_size: payload.best_ask_amount.and_then(positive_or_drop),
+        event_time,
+        received_time: received,
+    };
+
+    let iv = payload.mark_iv.and_then(|value| normalize_iv(value).ok());
+    let (delta, gamma) = match &payload.greeks {
+        Some(greeks) => (greek_or_drop(greeks.delta), greek_or_drop(greeks.gamma)),
+        None => (None, None),
+    };
+    let greeks_row = GreeksRow {
+        instrument: instrument.clone(),
+        iv,
+        delta,
+        gamma,
+        // Streamed theta/vega/rho are deliberately discarded (docs/01 §7).
+        theta: None,
+        vega: None,
+        rho: None,
+        origin: GreeksOrigin::Provider,
+        event_time,
+        received_time: received,
+    };
+
+    (quote_update, greeks_row)
+}
+
+/// Normalize a `book.{instrument}.{group}` payload into a [`DepthLadder`] for the
+/// resolved [`Instrument`], capturing the upstream `change_id` for later
+/// gap-detect/resync (`docs/01-domain-model.md` §5, `docs/03-data-providers.md`
+/// §7.1). A level whose price or size is `NaN`/`Inf`/negative is dropped (the
+/// rest of the ladder survives); the venue `timestamp` becomes the optional
+/// `event_time`. Levels are forwarded best-first, as Deribit sends them.
+fn normalize_book(
+    instrument: &Instrument,
+    payload: &BookPayload,
+    received: DateTime<Utc>,
+) -> DepthLadder {
+    DepthLadder {
+        instrument: instrument.clone(),
+        bids: payload.bids.iter().filter_map(depth_level).collect(),
+        asks: payload.asks.iter().filter_map(depth_level).collect(),
+        event_time: payload.timestamp.and_then(millis_to_event_time),
+        received_time: received,
+        change_id: payload.change_id,
+    }
+}
+
+/// A checked one-level conversion: a level whose price or size is
+/// `NaN`/`Inf`/negative is dropped to `None` (never a fabricated [`Positive`]).
+fn depth_level(level: &BookLevel) -> Option<DepthLevel> {
+    let (price, size) = level.price_size();
+    Some(DepthLevel {
+        price: positive_or_drop(price)?,
+        size: positive_or_drop(size)?,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Producer-side overwrite-on-full staging (docs/02-tui-architecture.md §5).
+// ---------------------------------------------------------------------------
+
+/// Whether the bounded fan-in channel is still open. A closed channel means the
+/// consumer (the app) is gone, so the reconnect loop shuts down rather than
+/// reconnecting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SendState {
+    /// The channel accepted the update (directly or into the staging slot).
+    Open,
+    /// The channel is closed — the consumer dropped its receiver.
+    Closed,
+}
+
+/// One producer-staged slot for one instrument: the latest of each coalesced
+/// update **kind** independently, so a Greeks refresh never clobbers a pending
+/// quote — the producer mirror of the #10 consumer `StagedInstrument`.
+#[derive(Debug, Default)]
+struct StagedInstrument {
+    quote: Option<QuoteUpdate>,
+    greeks: Option<GreeksRow>,
+    depth: Option<DepthLadder>,
+}
+
+impl StagedInstrument {
+    /// True while any kind is still staged.
+    fn has_any(&self) -> bool {
+        self.quote.is_some() || self.greeks.is_some() || self.depth.is_some()
+    }
+
+    /// Flush this slot's present kinds onto `tx`, reserving a channel slot
+    /// **before** taking the value so a full channel never drops the staged
+    /// update. Stops at the first full/closed reservation, leaving the remaining
+    /// kinds staged.
+    fn flush_into(&mut self, tx: &mpsc::Sender<MarketUpdate>) -> FlushStep {
+        if self.quote.is_some() {
+            match reserve_send(tx, &mut self.quote, MarketUpdate::Quote) {
+                FlushStep::Drained => {}
+                blocked => return blocked,
+            }
+        }
+        if self.greeks.is_some() {
+            match reserve_send(tx, &mut self.greeks, MarketUpdate::Greeks) {
+                FlushStep::Drained => {}
+                blocked => return blocked,
+            }
+        }
+        if self.depth.is_some() {
+            match reserve_send(tx, &mut self.depth, MarketUpdate::Depth) {
+                FlushStep::Drained => {}
+                blocked => return blocked,
+            }
+        }
+        FlushStep::Drained
+    }
+}
+
+/// The outcome of trying to flush one staged kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FlushStep {
+    /// The kind was sent (or was absent).
+    Drained,
+    /// The channel had no capacity — the value stays staged.
+    Full,
+    /// The channel is closed.
+    Closed,
+}
+
+/// Reserve a channel slot, then move the staged value out of `slot` into it — so
+/// a full channel leaves the value **in place** (it is only `take`n on a
+/// successful reservation, never lost). The caller only calls this for a
+/// non-empty `slot`.
+fn reserve_send<T>(
+    tx: &mpsc::Sender<MarketUpdate>,
+    slot: &mut Option<T>,
+    wrap: fn(T) -> MarketUpdate,
+) -> FlushStep {
+    match tx.try_reserve() {
+        Ok(permit) => {
+            if let Some(value) = slot.take() {
+                permit.send(wrap(value));
+            }
+            FlushStep::Drained
+        }
+        Err(TrySendError::Full(())) => FlushStep::Full,
+        Err(TrySendError::Closed(())) => FlushStep::Closed,
+    }
+}
+
+/// The producer-side conflater: one slot per [`InstrumentKey`], overwritten
+/// last-value-wins per kind when the bounded channel is full
+/// (`docs/02-tui-architecture.md` §5). This completes the NFR-15
+/// latest-value-wins guarantee under sustained saturation — the mirror of the
+/// #10 consumer-side staging. It is O(N subscribed) and **reuses its
+/// allocation** across bursts (`HashMap::retain` on flush retains the buckets;
+/// a repeat update for an already-staged instrument clones no key).
+#[derive(Debug, Default)]
+struct ProducerStaging {
+    slots: HashMap<InstrumentKey, StagedInstrument>,
+}
+
+impl ProducerStaging {
+    /// An empty staging map.
+    fn new() -> Self {
+        Self {
+            slots: HashMap::new(),
+        }
+    }
+
+    /// Publish `update` on the bounded `tx`, preserving the freshest value under
+    /// saturation: first opportunistically flush anything already staged (the
+    /// channel may now have space), then try to send `update`; on a **full**
+    /// channel the update is **staged** (overwriting its kind's slot) rather than
+    /// dropped. Returns [`SendState::Closed`] once the channel is closed.
+    fn publish(&mut self, tx: &mpsc::Sender<MarketUpdate>, update: MarketUpdate) -> SendState {
+        if self.flush(tx) == SendState::Closed {
+            return SendState::Closed;
+        }
+        match tx.try_send(update) {
+            Ok(()) => SendState::Open,
+            Err(TrySendError::Full(update)) => {
+                self.stage(update);
+                SendState::Open
+            }
+            Err(TrySendError::Closed(_)) => SendState::Closed,
+        }
+    }
+
+    /// True while any instrument still holds a staged value awaiting a free
+    /// channel slot. Gates the streaming loop's flush tick so an idle stream
+    /// (nothing staged) never wakes, while a burst residue is retried until it
+    /// drains.
+    fn has_pending(&self) -> bool {
+        self.slots.values().any(StagedInstrument::has_any)
+    }
+
+    /// Flush the staged current values onto `tx`, retaining the map allocation.
+    /// Stops sending once the channel is full (leaving the rest staged) and
+    /// reports a closed channel.
+    fn flush(&mut self, tx: &mpsc::Sender<MarketUpdate>) -> SendState {
+        let mut closed = false;
+        let mut full = false;
+        self.slots.retain(|_key, slot| {
+            if !closed && !full {
+                match slot.flush_into(tx) {
+                    FlushStep::Drained => {}
+                    FlushStep::Full => full = true,
+                    FlushStep::Closed => closed = true,
+                }
+            }
+            slot.has_any()
+        });
+        if closed {
+            SendState::Closed
+        } else {
+            SendState::Open
+        }
+    }
+
+    /// Overwrite the staged slot for `update`'s instrument, last-value-wins per
+    /// kind. A control-class update never reaches here (the loop sends `Health`
+    /// / `Chain` directly), but the match stays total over the closed
+    /// [`MarketUpdate`] set with no wildcard arm.
+    fn stage(&mut self, update: MarketUpdate) {
+        match update {
+            MarketUpdate::Quote(quote) => {
+                if let Some(slot) = self.slot_mut(&quote.instrument.key) {
+                    slot.quote = Some(quote);
+                }
+            }
+            MarketUpdate::Greeks(greeks) => {
+                if let Some(slot) = self.slot_mut(&greeks.instrument.key) {
+                    slot.greeks = Some(greeks);
+                }
+            }
+            MarketUpdate::Depth(depth) => {
+                if let Some(slot) = self.slot_mut(&depth.instrument.key) {
+                    slot.depth = Some(depth);
+                }
+            }
+            MarketUpdate::Chain(_) | MarketUpdate::Health(_, _) => {}
+        }
+    }
+
+    /// A mutable reference to `key`'s slot, creating it on first use. The key is
+    /// cloned **only** when the slot is vacant (the HP-3 discipline), mirroring
+    /// the consumer bridge; the `None` arm is treated as a no-op, never an
+    /// `expect` (the lint policy forbids `expect`).
+    fn slot_mut(&mut self, key: &InstrumentKey) -> Option<&mut StagedInstrument> {
+        if !self.slots.contains_key(key) {
+            let _ = self.slots.insert(key.clone(), StagedInstrument::default());
+        }
+        self.slots.get_mut(key)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The adapter-owned reconnect / resubscribe loop.
+// ---------------------------------------------------------------------------
+
+/// Why one connection attempt ended.
+enum StreamExit {
+    /// The stream dropped or a (re)connect step failed — back off and retry.
+    Reconnect,
+    /// The subscription is cancelled or the consumer is gone — stop the loop.
+    Shutdown,
+}
+
+/// The adapter-owned reconnect/resubscribe loop (`docs/03-data-providers.md`
+/// §5). `deribit-websocket` ships no auto-reconnect, so ChainView drives it:
+/// connect, resubscribe, drain updates; on a drop emit
+/// `Health(Reconnecting{attempt})`, back off with jitter, **re-`fetch_chain`**
+/// to reconcile drift, then resubscribe off the **fresh** aliases. `attempt`
+/// resets to 0 on a successful (re)subscribe. Cancellation (handle drop) is
+/// observed at every `.await` via a `biased` `select!`, so the loop never opens
+/// a socket after cancellation and never hot-loops.
+async fn run_reconnect_loop(
+    adapter: DeribitAdapter,
+    ws_config: WebSocketConfig,
+    underlying: String,
+    expiration_utc: DateTime<Utc>,
+    mut instruments: Vec<Instrument>,
+    tx: mpsc::Sender<MarketUpdate>,
+    cancel: CancellationToken,
+) {
+    let mut attempt: u32 = 0;
+    loop {
+        // Stop before opening any socket if cancelled or the consumer is gone —
+        // so a closed channel is noticed at the top of the loop, never after a
+        // wasted connect cycle.
+        if cancel.is_cancelled() || tx.is_closed() {
+            return;
+        }
+        let exit = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return,
+            exit = connect_stream_once(&adapter, &ws_config, &instruments, &tx, &cancel, &mut attempt) => exit,
+        };
+        if matches!(exit, StreamExit::Shutdown) || cancel.is_cancelled() {
+            return;
+        }
+        // The stream dropped: surface the reconnect honestly, then back off.
+        // `attempt` is 1-based here and MUST NOT wrap back to 0 (that would reset
+        // the ramp), so it is held at the ceiling rather than saturated.
+        attempt = attempt.checked_add(1).unwrap_or(attempt);
+        let health =
+            MarketUpdate::Health(adapter.id.clone(), StreamHealth::Reconnecting { attempt });
+        // Cancel-wrapped await-send: on a full shared channel this must still
+        // observe cancellation promptly (and stop cleanly if the consumer is gone).
+        let health_sent = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return,
+            result = tx.send(health) => result,
+        };
+        if health_sent.is_err() {
+            return; // consumer gone
+        }
+        let delay = backoff_delay(attempt, sample_jitter());
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => return,
+            () = tokio::time::sleep(delay) => {}
+        }
+        // Backfill = CURRENT STATE: re-fetch the chain to reconcile any drift
+        // during the outage, then resubscribe off the fresh aliases next loop.
+        if let Some(fresh) = refetch(&adapter, &underlying, expiration_utc, &tx, &cancel).await {
+            if !fresh.is_empty() {
+                instruments = fresh;
+            }
+        }
+    }
+}
+
+/// One connection attempt: install the crypto provider, connect, resubscribe the
+/// `ticker.`/`book.` channels, and drain updates until the socket drops or the
+/// subscription is cancelled. `attempt` is reset to 0 on a successful
+/// (re)subscribe. Returns [`StreamExit::Reconnect`] on a recoverable drop and
+/// [`StreamExit::Shutdown`] on cancellation or a closed consumer channel.
+async fn connect_stream_once(
+    adapter: &DeribitAdapter,
+    ws_config: &WebSocketConfig,
+    instruments: &[Instrument],
+    tx: &mpsc::Sender<MarketUpdate>,
+    cancel: &CancellationToken,
+    attempt: &mut u32,
+) -> StreamExit {
+    // The rustls crypto provider must be installed before the TLS handshake;
+    // it is process-global and idempotent (a repeat call is `AlreadyInstalled`).
+    let _ = install_default_crypto_provider();
+
+    let client = match DeribitWebSocketClient::new(ws_config) {
+        Ok(client) => client,
+        Err(_) => return StreamExit::Reconnect,
+    };
+
+    let connected = tokio::select! {
+        biased;
+        () = cancel.cancelled() => return StreamExit::Shutdown,
+        result = client.connect() => result,
+    };
+    if connected.is_err() {
+        return StreamExit::Reconnect;
+    }
+
+    let channels = subscription_channels(instruments);
+    let subscribed = tokio::select! {
+        biased;
+        () = cancel.cancelled() => return StreamExit::Shutdown,
+        result = client.subscribe(channels) => result,
+    };
+    if subscribed.is_err() {
+        return StreamExit::Reconnect;
+    }
+
+    // A successful (re)subscribe resets the backoff ramp and surfaces `Live`.
+    *attempt = 0;
+    let live = MarketUpdate::Health(adapter.id.clone(), StreamHealth::Live);
+    if tx.send(live).await.is_err() {
+        return StreamExit::Shutdown;
+    }
+
+    let lookup = instrument_lookup(instruments);
+    let mut staging = ProducerStaging::new();
+    // The producer flushes staged values at the start of the next `publish`, but
+    // once a burst subsides and the feed goes quiet no further `publish` arrives
+    // to drain the freshest staged value. A bounded tick flushes it instead, so
+    // the latest quote/greeks/depth is delivered promptly after capacity frees
+    // rather than stranded. The tick is gated on `has_pending`, so an idle stream
+    // never wakes; `Delay` keeps a post-idle re-arm from firing a catch-up burst.
+    let mut flush_tick = tokio::time::interval(STAGING_FLUSH_INTERVAL);
+    flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        let message = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return StreamExit::Shutdown,
+            _ = flush_tick.tick(), if staging.has_pending() => {
+                if staging.flush(tx) == SendState::Closed {
+                    return StreamExit::Shutdown; // consumer gone
+                }
+                continue;
+            }
+            message = client.receive_message() => message,
+        };
+        let text = match message {
+            Ok(text) => text,
+            Err(_) => return StreamExit::Reconnect, // socket closed / errored
+        };
+        if route_message(&text, &lookup, &mut staging, tx) == SendState::Closed {
+            return StreamExit::Shutdown; // consumer gone
+        }
+    }
+}
+
+/// Re-fetch the chain to reconcile drift and emit the fresh `Chain` snapshot,
+/// returning the fresh Deribit legs for the next resubscribe (backfill = current
+/// state, `docs/03-data-providers.md` §5). Cancellation short-circuits to `None`;
+/// a failed fetch keeps the prior aliases (the caller does not overwrite).
+async fn refetch(
+    adapter: &DeribitAdapter,
+    underlying: &str,
+    expiration_utc: DateTime<Utc>,
+    tx: &mpsc::Sender<MarketUpdate>,
+    cancel: &CancellationToken,
+) -> Option<Vec<Instrument>> {
+    let expiration = ExpirationDate::DateTime(expiration_utc);
+    let fetched = tokio::select! {
+        biased;
+        () = cancel.cancelled() => return None,
+        result = adapter.fetch_chain(underlying, &expiration) => result,
+    };
+    let fetch = fetched.ok()?;
+
+    // Emit the reconciled structure as a control-class `Chain` (await-send,
+    // never coalesced/dropped) so the store reconciles drift. Cancel-wrapped so a
+    // full shared channel cannot defer cancellation during the backfill send.
+    let snapshot = MarketUpdate::Chain(chain_snapshot(&fetch, now_utc()));
+    let snapshot_sent = tokio::select! {
+        biased;
+        () = cancel.cancelled() => return None,
+        result = tx.send(snapshot) => result,
+    };
+    if snapshot_sent.is_err() {
+        return None;
+    }
+
+    let instruments: Vec<Instrument> = fetch
+        .aliases
+        .instruments()
+        .filter(|instrument| instrument.provider == adapter.id)
+        .cloned()
+        .collect();
+    Some(instruments)
+}
+
+/// Assemble a streaming-current [`ChainSnapshot`] from a re-fetched
+/// [`ChainFetch`] — the same `AliasCatalog` carried forward with no
+/// re-derivation. The source is [`ChainSource::Merged`] (a REST poll seeds
+/// structure, the stream overlays quotes) and the health [`StreamHealth::Live`]
+/// (the resubscribe follows).
+fn chain_snapshot(fetch: &ChainFetch, last_poll: DateTime<Utc>) -> ChainSnapshot {
+    ChainSnapshot {
+        chain_key: (
+            fetch.expiry_source.provider.clone(),
+            fetch.expiry_source.underlying.clone(),
+            fetch.expiry_source.expiration_utc,
+        ),
+        chain: fetch.chain.clone(),
+        aliases: fetch.aliases.clone(),
+        source: ChainSource::Merged,
+        health: StreamHealth::Live,
+        last_full_poll: Some(last_poll),
+    }
+}
+
+/// The `ticker.{instrument}` and `book.{instrument}.{group}` channels to
+/// subscribe for these legs, built through the upstream [`SubscriptionChannel`]
+/// helper (never hand-formatted). **`trades.{instrument}` is intentionally not
+/// subscribed** — the trades tape is deferred (`docs/03-data-providers.md` §8).
+fn subscription_channels(instruments: &[Instrument]) -> Vec<String> {
+    // Two channels (ticker + book) per leg; fall back to the leg count if the
+    // doubled hint would overflow (a purely defensive capacity hint).
+    let hint = instruments
+        .len()
+        .checked_mul(2)
+        .unwrap_or(instruments.len());
+    let mut channels = Vec::with_capacity(hint);
+    for instrument in instruments {
+        let native = instrument.native_symbol.clone();
+        channels.push(SubscriptionChannel::Ticker(native.clone()).channel_name());
+        channels.push(SubscriptionChannel::OrderBook(native).channel_name());
+    }
+    channels
+}
+
+/// Index the subscribed legs by their native `instrument_name`, so an incoming
+/// notification's channel resolves back to the normalized [`Instrument`]. A
+/// stream update for a symbol not in this map is dropped (an unknown-symbol
+/// guard, `docs/03-data-providers.md` §4).
+fn instrument_lookup(instruments: &[Instrument]) -> HashMap<String, Instrument> {
+    instruments
+        .iter()
+        .map(|instrument| (instrument.native_symbol.clone(), instrument.clone()))
+        .collect()
+}
+
+/// Decode one raw notification frame and publish the normalized updates.
+///
+/// A frame that is not a subscription notification, carries no channel/data,
+/// names an unfamiliar channel, resolves to an **unknown symbol**, or fails to
+/// deserialize is **skipped** (never a panic). A `ticker.` frame yields a
+/// [`QuoteUpdate`] and a [`GreeksRow`]; a `book.` frame a [`DepthLadder`]; both
+/// go through the producer staging. Returns [`SendState::Closed`] once the fan-in
+/// channel is closed.
+fn route_message(
+    text: &str,
+    lookup: &HashMap<String, Instrument>,
+    staging: &mut ProducerStaging,
+    tx: &mpsc::Sender<MarketUpdate>,
+) -> SendState {
+    let handler = NotificationHandler::new();
+    let Ok(notification) = handler.parse_notification(text) else {
+        return SendState::Open;
+    };
+    if !handler.is_subscription_notification(&notification) {
+        return SendState::Open;
+    }
+    let (Some(channel), Some(data)) = (
+        handler.extract_channel(&notification),
+        handler.extract_data(&notification),
+    ) else {
+        return SendState::Open;
+    };
+    let received = now_utc();
+
+    // The instrument is always the SECOND dotted segment for both families —
+    // `ticker.{instrument}[.{interval}]` and `book.{instrument}.{group}`. Deribit
+    // can echo a trailing interval on the ticker channel, so we must take the
+    // instrument segment and ignore any suffix (a plain `strip_prefix("ticker.")`
+    // would leave `{instrument}.{interval}` and silently drop every quote).
+    // Instrument names carry `-`, never `.`, so the segment split is safe.
+    let instrument_segment = channel.split('.').nth(1);
+
+    if channel.starts_with("ticker.") {
+        let Some(symbol) = instrument_segment else {
+            return SendState::Open;
+        };
+        let Some(instrument) = lookup.get(symbol) else {
+            return SendState::Open; // unknown-symbol guard
+        };
+        let Ok(payload) = TickerPayload::deserialize(&data) else {
+            return SendState::Open;
+        };
+        let (quote, greeks) = normalize_ticker(instrument, &payload, received);
+        if staging.publish(tx, MarketUpdate::Quote(quote)) == SendState::Closed {
+            return SendState::Closed;
+        }
+        return staging.publish(tx, MarketUpdate::Greeks(greeks));
+    }
+
+    if channel.starts_with("book.") {
+        let Some(symbol) = instrument_segment else {
+            return SendState::Open;
+        };
+        let Some(instrument) = lookup.get(symbol) else {
+            return SendState::Open; // unknown-symbol guard
+        };
+        let Ok(payload) = BookPayload::deserialize(&data) else {
+            return SendState::Open;
+        };
+        let ladder = normalize_book(instrument, &payload, received);
+        return staging.publish(tx, MarketUpdate::Depth(ladder));
+    }
+
+    SendState::Open // an unsubscribed channel family (e.g. we never open `trades.`)
+}
+
 #[cfg(test)]
 mod tests {
-    use std::future::Future;
-    use std::task::{Context, Poll, Waker};
-
     use deribit_http::model::instrument::InstrumentKind;
     use deribit_http::model::other::Greeks;
     use deribit_http::model::ticker::{TickerData, TickerStats};
@@ -906,19 +1757,6 @@ mod tests {
         match DateTime::<Utc>::from_timestamp_millis(millis) {
             Some(t) => t,
             None => panic!("invalid test millis: {millis}"),
-        }
-    }
-
-    /// Drive a future that resolves on the first poll (the adapter's `subscribe`
-    /// returns immediately) without pulling in a tokio runtime. `Waker::noop` is
-    /// stable from Rust 1.85 (the crate MSRV), so no `unsafe` is needed.
-    fn block_on<F: Future>(future: F) -> F::Output {
-        let mut future = std::pin::pin!(future);
-        let waker = Waker::noop();
-        let mut cx = Context::from_waker(waker);
-        match future.as_mut().poll(&mut cx) {
-            Poll::Ready(output) => output,
-            Poll::Pending => panic!("test future parked; deribit subscribe must resolve at once"),
         }
     }
 
@@ -1579,18 +2417,19 @@ mod tests {
         assert_eq!(rendered, "upstream transport: transport: http");
     }
 
-    // --- subscribe is honestly unsupported until #16 -------------------------
+    // --- subscribe spawns the adapter-owned reconnect loop -------------------
 
-    #[test]
-    fn test_deribit_subscribe_is_unsupported() {
+    #[tokio::test]
+    async fn test_deribit_subscribe_spawns_cancellable_loop() {
+        // `subscribe` returns a handle immediately after spawning the loop; the
+        // loop task is queued but not polled on this current-thread runtime, so
+        // NO socket is ever opened. Dropping the handle cancels + aborts it.
         let adapter = DeribitAdapter::new();
-        let (tx, _rx) = mpsc::channel::<MarketUpdate>(1);
+        let (tx, _rx) = mpsc::channel::<MarketUpdate>(4);
         let request = SubscriptionRequest::new("BTC", utc_millis(1_751_011_200_000), Vec::new());
-        match block_on(adapter.subscribe(request, tx)) {
-            Err(ProviderError::Unsupported(what)) => {
-                assert_eq!(what, "deribit streaming lands in #16");
-            }
-            other => panic!("expected Unsupported, got {other:?}"),
+        match adapter.subscribe(request, tx).await {
+            Ok(handle) => drop(handle),
+            Err(e) => panic!("subscribe should spawn the reconnect loop, got {e:?}"),
         }
     }
 
@@ -1681,6 +2520,800 @@ mod tests {
                 if let Some(value) = leg.iv {
                     prop_assert!(value >= Positive::ZERO);
                 }
+            }
+        }
+    }
+
+    // =====================================================================
+    // Streaming overlay (#16): test constructors
+    // =====================================================================
+
+    /// The subscribed BTC-27JUN25-60000-C call leg (native symbol + deribit id).
+    fn sample_instrument() -> Instrument {
+        Instrument {
+            key: InstrumentKey {
+                underlying: "BTC".to_owned(),
+                expiration_utc: utc_millis(1_751_011_200_000),
+                strike: pos(60_000.0),
+                style: OptionStyle::Call,
+            },
+            provider: deribit_provider_id(),
+            native_symbol: "BTC-27JUN25-60000-C".to_owned(),
+            stream_symbol: None,
+            spec: ContractSpecFingerprint {
+                contract_multiplier: 1,
+                settlement: SettlementStyle::Cash,
+                exercise: ExerciseStyle::European,
+                quote_currency: "USD".to_owned(),
+                venue_product_code: "BTC".to_owned(),
+            },
+        }
+    }
+
+    /// A distinct leg at `strike` (distinct `InstrumentKey` + native symbol), so
+    /// the producer staging keys separate slots.
+    fn instrument_at(strike: f64) -> Instrument {
+        Instrument {
+            key: InstrumentKey {
+                strike: pos(strike),
+                ..sample_instrument().key
+            },
+            native_symbol: format!("BTC-27JUN25-{strike}-C"),
+            ..sample_instrument()
+        }
+    }
+
+    fn greeks_payload(delta: Option<f64>, gamma: Option<f64>) -> GreeksPayload {
+        GreeksPayload { delta, gamma }
+    }
+
+    fn ticker_payload(
+        bid: Option<f64>,
+        ask: Option<f64>,
+        mark_iv: Option<f64>,
+        greeks: Option<GreeksPayload>,
+    ) -> TickerPayload {
+        TickerPayload {
+            best_bid_price: bid,
+            best_ask_price: ask,
+            best_bid_amount: Some(5.0),
+            best_ask_amount: Some(4.0),
+            last_price: Some(0.055),
+            mark_iv,
+            timestamp: Some(1_751_011_200_000),
+            greeks,
+        }
+    }
+
+    /// A `Quote` `MarketUpdate` for `(strike, bid)`, normalized through the seam.
+    fn quote_update(strike: f64, bid: f64) -> MarketUpdate {
+        let payload = ticker_payload(Some(bid), Some(bid + 0.1), Some(50.0), None);
+        let (quote, _greeks) = normalize_ticker(&instrument_at(strike), &payload, utc_millis(0));
+        MarketUpdate::Quote(quote)
+    }
+
+    /// The `(strike, bid)` of a `Quote` update, or `None` for any other variant.
+    fn quote_strike_bid(update: &MarketUpdate) -> Option<(Positive, Option<Positive>)> {
+        match update {
+            MarketUpdate::Quote(quote) => Some((quote.instrument.key.strike, quote.bid)),
+            MarketUpdate::Greeks(_)
+            | MarketUpdate::Depth(_)
+            | MarketUpdate::Chain(_)
+            | MarketUpdate::Health(_, _) => None,
+        }
+    }
+
+    /// Drain every currently-buffered update from a channel (no runtime needed —
+    /// `try_recv` is non-blocking).
+    fn drain_channel(rx: &mut mpsc::Receiver<MarketUpdate>) -> Vec<MarketUpdate> {
+        let mut out = Vec::new();
+        while let Ok(update) = rx.try_recv() {
+            out.push(update);
+        }
+        out
+    }
+
+    #[track_caller]
+    fn assert_delay_ms(delay: Duration, expected_ms: f64) {
+        let got = delay.as_secs_f64() * 1000.0;
+        assert!(
+            (got - expected_ms).abs() < 1.0,
+            "expected ~{expected_ms}ms, got {got}ms"
+        );
+    }
+
+    fn opt_f64() -> impl Strategy<Value = Option<f64>> {
+        prop_oneof![Just(None), proptest::num::f64::ANY.prop_map(Some)]
+    }
+
+    // =====================================================================
+    // Backoff delay: the pure, injectable-jitter kernel
+    // =====================================================================
+
+    #[test]
+    fn test_deribit_backoff_attempt_zero_is_base() {
+        // attempt 0 → exactly BASE (250 ms), so the loop's reset-on-success
+        // restarts the ramp at BASE.
+        assert_delay_ms(backoff_delay(0, 0.0), 250.0);
+    }
+
+    #[test]
+    fn test_deribit_backoff_doubles_per_attempt() {
+        assert_delay_ms(backoff_delay(1, 0.0), 500.0);
+        assert_delay_ms(backoff_delay(2, 0.0), 1000.0);
+        assert_delay_ms(backoff_delay(3, 0.0), 2000.0);
+    }
+
+    #[test]
+    fn test_deribit_backoff_caps_at_max() {
+        // A large attempt caps at MAX (30 s), never a runaway or a `powi` wrap.
+        assert_delay_ms(backoff_delay(100, 0.0), 30_000.0);
+        assert_delay_ms(backoff_delay(u32::MAX, 0.0), 30_000.0);
+    }
+
+    #[test]
+    fn test_deribit_backoff_jitter_widens_range() {
+        // attempt 5 → 250 * 2^5 = 8000 ms, below the 30 s cap.
+        assert_delay_ms(backoff_delay(5, -0.2), 8000.0 * 0.8);
+        assert_delay_ms(backoff_delay(5, 0.2), 8000.0 * 1.2);
+        assert!(backoff_delay(5, -0.2) < backoff_delay(5, 0.2));
+    }
+
+    #[test]
+    fn test_deribit_backoff_clamps_out_of_range_jitter() {
+        // Jitter beyond ±0.2 is clamped (a hostile jitter cannot widen the delay).
+        assert_eq!(backoff_delay(0, 1.0), backoff_delay(0, 0.2));
+        assert_eq!(backoff_delay(0, -1.0), backoff_delay(0, -0.2));
+    }
+
+    #[test]
+    fn test_deribit_backoff_never_exceeds_max_plus_jitter() {
+        for attempt in 0..40u32 {
+            let delay = backoff_delay(attempt, 0.2).as_secs_f64();
+            assert!(
+                delay <= 36.0 + 1e-6,
+                "attempt {attempt} exceeded 36 s: {delay}"
+            );
+            let low = backoff_delay(attempt, -0.2).as_secs_f64();
+            assert!(low >= 0.2 - 1e-6, "attempt {attempt} below 200 ms: {low}");
+        }
+    }
+
+    // =====================================================================
+    // Ticker normalization -> QuoteUpdate + GreeksRow
+    // =====================================================================
+
+    #[test]
+    fn test_deribit_normalize_ticker_maps_quote_and_greeks() {
+        let payload = ticker_payload(
+            Some(0.05),
+            Some(0.06),
+            Some(49.22),
+            Some(greeks_payload(Some(0.55), Some(0.0001))),
+        );
+        let (quote, greeks) = normalize_ticker(
+            &sample_instrument(),
+            &payload,
+            utc_millis(1_751_011_200_000),
+        );
+        assert_eq!(quote.bid, Some(pos(0.05)));
+        assert_eq!(quote.ask, Some(pos(0.06)));
+        assert_eq!(quote.last, Some(pos(0.055)));
+        assert_eq!(quote.bid_size, Some(pos(5.0)));
+        assert_eq!(quote.ask_size, Some(pos(4.0)));
+        assert_eq!(quote.event_time, Some(utc_millis(1_751_011_200_000)));
+        // IV is percentage-form -> decimal fraction; venue delta/gamma forwarded.
+        assert_eq!(greeks.iv, Some(pos(0.4922)));
+        assert_eq!(greeks.delta, Some(Decimal::new(55, 2)));
+        assert!(greeks.gamma.is_some());
+        assert_eq!(greeks.origin, GreeksOrigin::Provider);
+        assert_eq!(greeks.event_time, Some(utc_millis(1_751_011_200_000)));
+    }
+
+    #[test]
+    fn test_deribit_normalize_ticker_discards_theta_vega_rho() {
+        // A wire ticker carrying theta/vega/rho: they are not even deserialized,
+        // and normalize_ticker always emits None for them (docs/01 §7 — OptionData
+        // cannot store them, the sidecar owns them). Venue delta/gamma survive.
+        use deribit_websocket::prelude::json;
+        let data = json!({
+            "best_bid_price": 0.05,
+            "best_ask_price": 0.06,
+            "mark_iv": 50.0,
+            "greeks": { "delta": 0.5, "gamma": 0.001, "theta": -9.9, "vega": 8.8, "rho": 7.7 }
+        });
+        let payload = match TickerPayload::deserialize(&data) {
+            Ok(payload) => payload,
+            Err(e) => panic!("ticker payload should deserialize: {e}"),
+        };
+        let (_quote, greeks) = normalize_ticker(&sample_instrument(), &payload, utc_millis(0));
+        assert_eq!(
+            greeks.delta,
+            Some(Decimal::new(5, 1)),
+            "venue delta forwarded"
+        );
+        assert!(greeks.gamma.is_some(), "venue gamma forwarded");
+        assert!(greeks.theta.is_none(), "streamed theta must be discarded");
+        assert!(greeks.vega.is_none(), "streamed vega must be discarded");
+        assert!(greeks.rho.is_none(), "streamed rho must be discarded");
+    }
+
+    #[test]
+    fn test_deribit_normalize_ticker_crossed_quote_drops_bid_ask() {
+        // ask (0.03) < bid (0.06) is crossed -> bid/ask dropped (the store keeps
+        // the prior quote); non-quote fields survive.
+        let payload = ticker_payload(Some(0.06), Some(0.03), None, None);
+        let (quote, _greeks) = normalize_ticker(&sample_instrument(), &payload, utc_millis(0));
+        assert_eq!(quote.bid, None);
+        assert_eq!(quote.ask, None);
+        assert_eq!(quote.last, Some(pos(0.055)));
+    }
+
+    #[test]
+    fn test_deribit_normalize_ticker_missing_greeks_are_none() {
+        let payload = ticker_payload(Some(0.05), Some(0.06), None, None);
+        let (_quote, greeks) = normalize_ticker(&sample_instrument(), &payload, utc_millis(0));
+        assert!(greeks.iv.is_none());
+        assert!(greeks.delta.is_none());
+        assert!(greeks.gamma.is_none());
+    }
+
+    #[test]
+    fn test_deribit_ticker_payload_deserializes_from_json() {
+        use deribit_websocket::prelude::json;
+        let data = json!({
+            "best_bid_price": 0.05,
+            "best_ask_price": 0.06,
+            "mark_iv": 49.22,
+            "timestamp": 1_751_011_200_000i64,
+            "greeks": { "delta": 0.55, "gamma": 0.0001, "theta": -1.0, "vega": 2.0, "rho": 3.0 }
+        });
+        match TickerPayload::deserialize(&data) {
+            Ok(payload) => {
+                let (quote, greeks) =
+                    normalize_ticker(&sample_instrument(), &payload, utc_millis(0));
+                assert_eq!(quote.bid, Some(pos(0.05)));
+                assert_eq!(greeks.iv, Some(pos(0.4922)));
+                assert!(greeks.theta.is_none());
+            }
+            Err(e) => panic!("ticker payload should deserialize: {e}"),
+        }
+    }
+
+    // =====================================================================
+    // Book normalization -> DepthLadder (change_id captured)
+    // =====================================================================
+
+    #[test]
+    fn test_deribit_normalize_book_captures_change_id_and_levels() {
+        let payload = BookPayload {
+            change_id: Some(770),
+            timestamp: Some(1_751_011_200_000),
+            bids: vec![
+                BookLevel::Priced([60_000.0, 2.0]),
+                BookLevel::Priced([59_990.0, 5.0]),
+            ],
+            asks: vec![BookLevel::Priced([60_010.0, 1.5])],
+        };
+        let ladder = normalize_book(
+            &sample_instrument(),
+            &payload,
+            utc_millis(1_751_011_200_000),
+        );
+        assert_eq!(ladder.change_id, Some(770));
+        assert_eq!(ladder.event_time, Some(utc_millis(1_751_011_200_000)));
+        assert_eq!(ladder.bids.len(), 2);
+        assert_eq!(ladder.asks.len(), 1);
+        match ladder.bids.first() {
+            Some(level) => {
+                assert_eq!(level.price, pos(60_000.0));
+                assert_eq!(level.size, pos(2.0));
+            }
+            None => panic!("expected the best bid at index 0"),
+        }
+    }
+
+    #[test]
+    fn test_deribit_normalize_book_drops_invalid_levels() {
+        let payload = BookPayload {
+            change_id: Some(1),
+            timestamp: None,
+            bids: vec![
+                BookLevel::Priced([f64::NAN, 1.0]),
+                BookLevel::Priced([60_000.0, 2.0]),
+                BookLevel::Priced([59_000.0, -1.0]),
+            ],
+            asks: Vec::new(),
+        };
+        let ladder = normalize_book(&sample_instrument(), &payload, utc_millis(0));
+        assert_eq!(ladder.bids.len(), 1, "NaN price and negative size dropped");
+        assert_eq!(ladder.event_time, None, "no timestamp -> no event_time");
+    }
+
+    #[test]
+    fn test_deribit_normalize_book_decodes_raw_action_levels() {
+        // The raw-book `[action, price, amount]` encoding decodes; the action tag
+        // is ignored (delta application is v0.5).
+        let payload = BookPayload {
+            change_id: Some(2),
+            timestamp: Some(1_751_011_200_000),
+            bids: vec![BookLevel::Actioned("new".to_owned(), 60_000.0, 3.0)],
+            asks: vec![BookLevel::Actioned("delete".to_owned(), 60_010.0, 0.0)],
+        };
+        let ladder = normalize_book(&sample_instrument(), &payload, utc_millis(0));
+        match ladder.bids.first() {
+            Some(level) => assert_eq!(level.price, pos(60_000.0)),
+            None => panic!("the raw `new` bid should decode"),
+        }
+        assert_eq!(ladder.asks.len(), 1);
+    }
+
+    #[test]
+    fn test_deribit_book_payload_deserializes_both_level_encodings() {
+        use deribit_websocket::prelude::json;
+        let aggregated =
+            json!({ "change_id": 5, "bids": [[60_000.0, 2.0]], "asks": [[60_010.0, 1.0]] });
+        match BookPayload::deserialize(&aggregated) {
+            Ok(payload) => {
+                let ladder = normalize_book(&sample_instrument(), &payload, utc_millis(0));
+                assert_eq!(ladder.change_id, Some(5));
+                assert_eq!(ladder.bids.len(), 1);
+            }
+            Err(e) => panic!("aggregated `[price, amount]` book should deserialize: {e}"),
+        }
+        let raw = json!({ "change_id": 6, "bids": [["new", 60_000.0, 2.0]], "asks": [] });
+        match BookPayload::deserialize(&raw) {
+            Ok(payload) => {
+                let ladder = normalize_book(&sample_instrument(), &payload, utc_millis(0));
+                assert_eq!(ladder.change_id, Some(6));
+                assert_eq!(ladder.bids.len(), 1);
+            }
+            Err(e) => panic!("raw `[action, price, amount]` book should deserialize: {e}"),
+        }
+    }
+
+    // =====================================================================
+    // Producer-side overwrite-on-full staging (docs/02 §5)
+    // =====================================================================
+
+    #[test]
+    fn test_deribit_producer_staging_overwrites_on_full_channel() {
+        let (tx, mut rx) = mpsc::channel::<MarketUpdate>(1);
+        let mut staging = ProducerStaging::new();
+        // The first send fills the cap-1 channel.
+        assert_eq!(
+            staging.publish(&tx, quote_update(100.0, 1.0)),
+            SendState::Open
+        );
+        // Channel full: these stage + overwrite in place (freshest wins per kind).
+        assert_eq!(
+            staging.publish(&tx, quote_update(100.0, 2.0)),
+            SendState::Open
+        );
+        assert_eq!(
+            staging.publish(&tx, quote_update(100.0, 3.0)),
+            SendState::Open
+        );
+        assert_eq!(
+            staging.slots.len(),
+            1,
+            "one slot per instrument, overwritten"
+        );
+        // The already-sent value (1.0) drains first.
+        let sent = drain_channel(&mut rx);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent.first()
+                .and_then(quote_strike_bid)
+                .and_then(|(_, bid)| bid),
+            Some(pos(1.0))
+        );
+        // A further publish flushes the FRESHEST staged value (3.0, not 2.0).
+        assert_eq!(
+            staging.publish(&tx, quote_update(100.0, 4.0)),
+            SendState::Open
+        );
+        let after = drain_channel(&mut rx);
+        assert_eq!(after.len(), 1, "flush-on-space delivers the staged value");
+        assert_eq!(
+            after
+                .first()
+                .and_then(quote_strike_bid)
+                .and_then(|(_, bid)| bid),
+            Some(pos(3.0)),
+            "the freshest staged value survived, not the intermediate 2.0"
+        );
+    }
+
+    #[test]
+    fn test_deribit_producer_staging_flush_delivers_freshest_after_quiet() {
+        // A burst saturates the cap-1 channel and coalesces two overwrites into
+        // the staging slot, then the feed goes QUIET: no further `publish`
+        // arrives to flush it. The streaming loop's flush tick (here `flush`,
+        // the method the tick drives) must still deliver the FRESHEST staged
+        // value once capacity frees, so the latest quote is never stranded when
+        // the user is watching a now-stale "latest" (Codex review, PR #74).
+        let (tx, mut rx) = mpsc::channel::<MarketUpdate>(1);
+        let mut staging = ProducerStaging::new();
+        // Fill the cap-1 channel (1.0 sent), then stage two overwrites: freshest
+        // wins per kind, so 3.0 sits in staging, 2.0 is superseded.
+        assert_eq!(
+            staging.publish(&tx, quote_update(100.0, 1.0)),
+            SendState::Open
+        );
+        assert_eq!(
+            staging.publish(&tx, quote_update(100.0, 2.0)),
+            SendState::Open
+        );
+        assert_eq!(
+            staging.publish(&tx, quote_update(100.0, 3.0)),
+            SendState::Open
+        );
+        assert!(staging.has_pending(), "the burst left a value staged");
+        // The feed goes quiet: the consumer drains the already-sent 1.0, freeing
+        // capacity. NO further `publish` will arrive.
+        let sent = drain_channel(&mut rx);
+        assert_eq!(sent.len(), 1);
+        // The tick-driven flush (not a next publish) delivers the freshest value.
+        assert_eq!(staging.flush(&tx), SendState::Open);
+        let after = drain_channel(&mut rx);
+        assert_eq!(
+            after.len(),
+            1,
+            "flush-on-tick delivers the staged value with no further publish"
+        );
+        assert_eq!(
+            after
+                .first()
+                .and_then(quote_strike_bid)
+                .and_then(|(_, bid)| bid),
+            Some(pos(3.0)),
+            "the freshest staged value (3.0) reached the channel after the feed went quiet"
+        );
+        assert!(
+            !staging.has_pending(),
+            "nothing remains staged once the tick flush drains the slot"
+        );
+    }
+
+    #[test]
+    fn test_deribit_producer_staging_keeps_quote_and_greeks_independently() {
+        let (tx, mut rx) = mpsc::channel::<MarketUpdate>(2);
+        let mut staging = ProducerStaging::new();
+        // Fill both channel slots with unrelated sends.
+        let _ = staging.publish(&tx, quote_update(200.0, 9.0));
+        let _ = staging.publish(&tx, quote_update(201.0, 9.0));
+        // Same instrument, two kinds — both stage (channel full), one slot.
+        let payload = ticker_payload(
+            Some(0.05),
+            Some(0.06),
+            Some(50.0),
+            Some(greeks_payload(Some(0.5), Some(0.01))),
+        );
+        let (quote, greeks) = normalize_ticker(&instrument_at(100.0), &payload, utc_millis(0));
+        let _ = staging.publish(&tx, MarketUpdate::Quote(quote));
+        let _ = staging.publish(&tx, MarketUpdate::Greeks(greeks));
+        assert_eq!(staging.slots.len(), 1, "one slot holds both kinds");
+        let _ = drain_channel(&mut rx);
+        // A further publish flushes BOTH staged kinds (a Greeks refresh never
+        // clobbered the pending quote).
+        let _ = staging.publish(&tx, quote_update(300.0, 1.0));
+        let flushed = drain_channel(&mut rx);
+        assert!(
+            flushed.iter().any(|update| matches!(
+                update,
+                MarketUpdate::Quote(quote) if quote.instrument.key.strike == pos(100.0)
+            )),
+            "the staged quote flushed"
+        );
+        assert!(
+            flushed
+                .iter()
+                .any(|update| matches!(update, MarketUpdate::Greeks(_))),
+            "the staged greeks flushed"
+        );
+    }
+
+    #[test]
+    fn test_deribit_producer_staging_is_bounded_by_instruments() {
+        // The channel is never drained, so it stays full; a sustained burst over
+        // three instruments keeps the staging map O(N=3), never O(burst).
+        let (tx, _rx) = mpsc::channel::<MarketUpdate>(1);
+        let mut staging = ProducerStaging::new();
+        let _ = staging.publish(&tx, quote_update(1.0, 1.0));
+        for round in 0..200u32 {
+            for strike in [1.0, 2.0, 3.0] {
+                assert_eq!(
+                    staging.publish(&tx, quote_update(strike, f64::from(round) + 1.0)),
+                    SendState::Open
+                );
+            }
+            assert!(
+                staging.slots.len() <= 3,
+                "staging is O(N=3 instruments), not O(burst): round {round}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_deribit_producer_staging_reports_closed_channel() {
+        let (tx, rx) = mpsc::channel::<MarketUpdate>(4);
+        drop(rx);
+        let mut staging = ProducerStaging::new();
+        assert_eq!(
+            staging.publish(&tx, quote_update(100.0, 1.0)),
+            SendState::Closed,
+            "a closed consumer channel stops the loop, never a silent buffer"
+        );
+    }
+
+    // =====================================================================
+    // Frame routing: channel -> normalized update, unknown-symbol guard
+    // =====================================================================
+
+    #[test]
+    fn test_deribit_route_message_ticker_publishes_quote_and_greeks() {
+        use deribit_websocket::prelude::json;
+        let (tx, mut rx) = mpsc::channel::<MarketUpdate>(8);
+        let lookup = instrument_lookup(&[sample_instrument()]);
+        let mut staging = ProducerStaging::new();
+        let text = json!({
+            "jsonrpc": "2.0",
+            "method": "subscription",
+            "params": {
+                "channel": "ticker.BTC-27JUN25-60000-C",
+                "data": { "best_bid_price": 0.05, "best_ask_price": 0.06, "mark_iv": 49.22,
+                          "greeks": { "delta": 0.55, "gamma": 0.0001, "theta": -1.0 } }
+            }
+        })
+        .to_string();
+        assert_eq!(
+            route_message(&text, &lookup, &mut staging, &tx),
+            SendState::Open
+        );
+        let out = drain_channel(&mut rx);
+        assert!(out.iter().any(|u| matches!(u, MarketUpdate::Quote(_))));
+        assert!(
+            out.iter()
+                .any(|u| matches!(u, MarketUpdate::Greeks(g) if g.theta.is_none())),
+            "greeks published with theta discarded"
+        );
+    }
+
+    #[test]
+    fn test_deribit_route_message_ticker_with_interval_suffix_still_routes() {
+        // Deribit can echo a trailing interval on the ticker channel
+        // (`ticker.{instrument}.{interval}`). The instrument segment must still
+        // resolve — a naive `strip_prefix("ticker.")` would leave
+        // `BTC-...-C.100ms`, miss the lookup, and silently drop every quote.
+        use deribit_websocket::prelude::json;
+        let (tx, mut rx) = mpsc::channel::<MarketUpdate>(8);
+        let lookup = instrument_lookup(&[sample_instrument()]);
+        let mut staging = ProducerStaging::new();
+        let text = json!({
+            "jsonrpc": "2.0",
+            "method": "subscription",
+            "params": {
+                "channel": "ticker.BTC-27JUN25-60000-C.100ms",
+                "data": { "best_bid_price": 0.05, "best_ask_price": 0.06 }
+            }
+        })
+        .to_string();
+        assert_eq!(
+            route_message(&text, &lookup, &mut staging, &tx),
+            SendState::Open
+        );
+        let out = drain_channel(&mut rx);
+        // The quote routed to the right InstrumentKey (60000 call), not dropped.
+        match out.iter().find_map(quote_strike_bid) {
+            Some((strike, bid)) => {
+                assert_eq!(strike, pos(60_000.0));
+                assert_eq!(bid, Some(pos(0.05)));
+            }
+            None => panic!("a ticker frame with a trailing interval must still route"),
+        }
+    }
+
+    #[test]
+    fn test_deribit_route_message_book_publishes_depth_with_change_id() {
+        use deribit_websocket::prelude::json;
+        let (tx, mut rx) = mpsc::channel::<MarketUpdate>(8);
+        let lookup = instrument_lookup(&[sample_instrument()]);
+        let mut staging = ProducerStaging::new();
+        let text = json!({
+            "jsonrpc": "2.0",
+            "method": "subscription",
+            "params": {
+                "channel": "book.BTC-27JUN25-60000-C.raw",
+                "data": { "change_id": 770, "bids": [[60_000.0, 2.0]], "asks": [[60_010.0, 1.0]] }
+            }
+        })
+        .to_string();
+        assert_eq!(
+            route_message(&text, &lookup, &mut staging, &tx),
+            SendState::Open
+        );
+        match drain_channel(&mut rx).first() {
+            Some(MarketUpdate::Depth(ladder)) => assert_eq!(ladder.change_id, Some(770)),
+            other => panic!("expected a Depth update with change_id, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_deribit_route_message_unknown_symbol_is_dropped() {
+        use deribit_websocket::prelude::json;
+        let (tx, mut rx) = mpsc::channel::<MarketUpdate>(8);
+        // The lookup knows only 60000-C; a frame for 99999-C is dropped.
+        let lookup = instrument_lookup(&[sample_instrument()]);
+        let mut staging = ProducerStaging::new();
+        let text = json!({
+            "jsonrpc": "2.0",
+            "method": "subscription",
+            "params": {
+                "channel": "ticker.BTC-27JUN25-99999-C",
+                "data": { "best_bid_price": 0.05, "best_ask_price": 0.06 }
+            }
+        })
+        .to_string();
+        assert_eq!(
+            route_message(&text, &lookup, &mut staging, &tx),
+            SendState::Open
+        );
+        assert!(
+            drain_channel(&mut rx).is_empty(),
+            "an update for an unsubscribed symbol is dropped, never keyed blindly"
+        );
+    }
+
+    #[test]
+    fn test_deribit_route_message_ignores_non_subscription_and_malformed() {
+        use deribit_websocket::prelude::json;
+        let (tx, mut rx) = mpsc::channel::<MarketUpdate>(8);
+        let lookup = instrument_lookup(&[sample_instrument()]);
+        let mut staging = ProducerStaging::new();
+        // A non-subscription notification is ignored.
+        let heartbeat =
+            json!({ "jsonrpc": "2.0", "method": "heartbeat", "params": {} }).to_string();
+        assert_eq!(
+            route_message(&heartbeat, &lookup, &mut staging, &tx),
+            SendState::Open
+        );
+        // Malformed JSON never panics.
+        assert_eq!(
+            route_message("{ not json", &lookup, &mut staging, &tx),
+            SendState::Open
+        );
+        assert!(drain_channel(&mut rx).is_empty());
+    }
+
+    // =====================================================================
+    // Subscription channels + reconnect backfill snapshot
+    // =====================================================================
+
+    #[test]
+    fn test_deribit_subscription_channels_ticker_and_book_never_trades() {
+        let channels = subscription_channels(&[sample_instrument()]);
+        assert!(channels.contains(&"ticker.BTC-27JUN25-60000-C".to_owned()));
+        assert!(
+            channels
+                .iter()
+                .any(|channel| channel.starts_with("book.BTC-27JUN25-60000-C")),
+            "the book channel is subscribed"
+        );
+        assert!(
+            !channels
+                .iter()
+                .any(|channel| channel.starts_with("trades.")),
+            "the trades tape is deferred, never subscribed"
+        );
+        assert_eq!(channels.len(), 2, "exactly ticker + book per leg");
+    }
+
+    #[test]
+    fn test_deribit_chain_snapshot_from_fetch_is_merged_live_and_carries_aliases() {
+        let call = match normalize_leg(&sample_option()) {
+            Ok(leg) => leg,
+            Err(e) => panic!("call leg should normalize, got {e}"),
+        };
+        let fetch = assemble_chain(
+            "BTC",
+            pos(60_500.0),
+            utc_millis(1_751_011_200_000),
+            &[call],
+            &deribit_provider_id(),
+        );
+        let snapshot = chain_snapshot(&fetch, utc_millis(1_751_011_200_001));
+        assert_eq!(snapshot.source, ChainSource::Merged);
+        assert!(matches!(snapshot.health, StreamHealth::Live));
+        assert_eq!(snapshot.chain_key.1, "BTC");
+        assert_eq!(snapshot.chain_key.2, utc_millis(1_751_011_200_000));
+        assert_eq!(snapshot.last_full_poll, Some(utc_millis(1_751_011_200_001)));
+        // The fresh alias catalog rides forward with no re-derivation.
+        assert!(
+            snapshot
+                .aliases
+                .resolve_symbol("BTC-27JUN25-60000-C")
+                .is_some()
+        );
+    }
+
+    // =====================================================================
+    // Property: streaming normalization is total (never panics)
+    // =====================================================================
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 256, ..ProptestConfig::default() })]
+
+        /// The backoff kernel is total and bounded for ANY attempt/jitter — no
+        /// panic (`from_secs_f64` never sees a NaN/negative), never above
+        /// `MAX * 1.2` (36 s) nor below `BASE * 0.8` (200 ms).
+        #[test]
+        fn prop_deribit_backoff_is_bounded(attempt in 0u32..64, jitter in -5.0f64..5.0) {
+            let delay = backoff_delay(attempt, jitter).as_secs_f64();
+            prop_assert!(delay >= 0.2 - 1e-9);
+            prop_assert!(delay <= 36.0 + 1e-9);
+        }
+
+        /// `normalize_ticker` is total over arbitrary numeric fields: no panic,
+        /// any present quote is never crossed, a present IV is a valid `Positive`,
+        /// and theta/vega/rho are always discarded.
+        #[test]
+        fn prop_deribit_normalize_ticker_is_total(
+            bid in opt_f64(),
+            ask in opt_f64(),
+            last in opt_f64(),
+            bid_amt in opt_f64(),
+            ask_amt in opt_f64(),
+            iv in opt_f64(),
+            delta in opt_f64(),
+            gamma in opt_f64(),
+            ts in prop_oneof![Just(None), any::<i64>().prop_map(Some)],
+        ) {
+            let payload = TickerPayload {
+                best_bid_price: bid,
+                best_ask_price: ask,
+                best_bid_amount: bid_amt,
+                best_ask_amount: ask_amt,
+                last_price: last,
+                mark_iv: iv,
+                timestamp: ts,
+                greeks: Some(GreeksPayload { delta, gamma }),
+            };
+            let (quote, greeks) = normalize_ticker(&sample_instrument(), &payload, utc_millis(0));
+            if let (Some(b), Some(a)) = (quote.bid, quote.ask) {
+                prop_assert!(a >= b);
+            }
+            if let Some(value) = greeks.iv {
+                prop_assert!(value >= Positive::ZERO);
+            }
+            // theta/vega/rho are never sourced from the stream.
+            prop_assert!(greeks.theta.is_none());
+            prop_assert!(greeks.vega.is_none());
+            prop_assert!(greeks.rho.is_none());
+        }
+
+        /// `normalize_book` is total over arbitrary level shapes: no panic, every
+        /// surviving level's price/size is a valid `Positive`, and the `change_id`
+        /// is carried through verbatim.
+        #[test]
+        fn prop_deribit_normalize_book_is_total(
+            levels in proptest::collection::vec(
+                (proptest::num::f64::ANY, proptest::num::f64::ANY),
+                0..8,
+            ),
+            change_id in prop_oneof![Just(None), any::<u64>().prop_map(Some)],
+        ) {
+            let payload = BookPayload {
+                change_id,
+                timestamp: None,
+                bids: levels.iter().map(|(p, a)| BookLevel::Priced([*p, *a])).collect(),
+                asks: Vec::new(),
+            };
+            let ladder = normalize_book(&sample_instrument(), &payload, utc_millis(0));
+            prop_assert_eq!(ladder.change_id, change_id);
+            for level in &ladder.bids {
+                prop_assert!(level.price >= Positive::ZERO);
+                prop_assert!(level.size >= Positive::ZERO);
             }
         }
     }
