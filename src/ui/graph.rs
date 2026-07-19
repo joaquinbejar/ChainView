@@ -74,6 +74,17 @@ use crate::ui::theme::sanitize;
 // The projected dataset shape a ratatui chart consumes.
 // ===========================================================================
 
+/// The minimum half-width added to a degenerate (`min == max`) axis interval: at
+/// least this many units of the axis' own coordinate space, so a flat line near
+/// zero still spans a visible range. See [`AxisBounds::padded`].
+const DEGENERATE_PAD_MIN: f64 = 1.0;
+
+/// The relative half-width added to a degenerate axis interval: 0.5% of the
+/// (absolute) endpoint value, so a flat line at a large coordinate (e.g. a 60000
+/// strike) spans a proportionate range rather than a sliver. See
+/// [`AxisBounds::padded`].
+const DEGENERATE_PAD_FRACTION: f64 = 0.005;
+
 /// The `[min, max]` range of one axis, in the plot's `f64` coordinate space.
 ///
 /// The **units are those of the source `GraphData`**, which the adapter is generic
@@ -82,18 +93,51 @@ use crate::ui::theme::sanitize;
 /// Greek curve x is the strike and y is the selected Greek. The adapter carries the
 /// numeric range only — the semantic axis title is supplied by the screen.
 ///
-/// Both endpoints are finite by construction (every contributing point passed the
-/// `finite_xy` gate). A single-point or flat series yields `min == max` (a
-/// degenerate interval); the consuming chart widget (#27) owns any visual padding.
+/// # Invariant
+///
+/// Both endpoints are **finite and ordered** (`min <= max`) by construction: the
+/// fields are private and [`new`](Self::new) is the only constructor, rejecting any
+/// `NaN`/`Inf` or inverted range before it can reach a ratatui axis. Read them
+/// through [`min`](Self::min) / [`max`](Self::max) / [`to_array`](Self::to_array).
+///
+/// # Degenerate intervals are padded at the seam
+///
+/// A single-point or flat series would otherwise yield `min == max` — a zero-width
+/// range ratatui's chart rejects entirely, painting a BLANK chart. The projection
+/// pads such an interval (the internal `padded` step), so the axis always has real
+/// width and a flat line stays visible; the pad size is documented on that step.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AxisBounds {
-    /// The axis minimum (finite).
-    pub min: f64,
+    /// The axis minimum (finite, `<= max`).
+    min: f64,
     /// The axis maximum (finite, `>= min`).
-    pub max: f64,
+    max: f64,
 }
 
 impl AxisBounds {
+    /// Construct validated bounds, or `None` when the "finite, ordered" invariant
+    /// fails: both `min` and `max` must be finite (no `NaN`/`Inf`) and ordered
+    /// (`min <= max`). This is the ONLY way to build an `AxisBounds`, so a
+    /// downstream caller can never hand a non-finite or inverted range to a ratatui
+    /// axis. A degenerate `min == max` is accepted here (it is finite and ordered);
+    /// the projection expands it via the internal `padded` step.
+    #[must_use]
+    pub fn new(min: f64, max: f64) -> Option<Self> {
+        (min.is_finite() && max.is_finite() && min <= max).then_some(Self { min, max })
+    }
+
+    /// The axis minimum — finite and `<= max` by construction.
+    #[must_use]
+    pub fn min(self) -> f64 {
+        self.min
+    }
+
+    /// The axis maximum — finite and `>= min` by construction.
+    #[must_use]
+    pub fn max(self) -> f64 {
+        self.max
+    }
+
     /// The bounds as the `[f64; 2]` array [`Axis::bounds`](ratatui::widgets::Axis::bounds)
     /// consumes.
     #[must_use]
@@ -103,7 +147,9 @@ impl AxisBounds {
 
     /// The bounds of a non-empty iterator of finite values, or `None` when the
     /// iterator is empty. Callers pass only finite values (post-`finite_xy`), so
-    /// the `<`/`>` comparisons need no `NaN` handling.
+    /// the `<`/`>` comparisons need no `NaN` handling. A degenerate result
+    /// (`min == max`) is expanded via [`padded`](Self::padded) so the axis has real
+    /// width.
     #[must_use]
     fn from_values(values: impl Iterator<Item = f64>) -> Option<Self> {
         let mut values = values;
@@ -118,7 +164,30 @@ impl AxisBounds {
                 max = value;
             }
         }
-        Some(Self { min, max })
+        Self::new(min, max).map(Self::padded)
+    }
+
+    /// Expand a degenerate (`min == max`) interval symmetrically so the axis has
+    /// real width; a non-degenerate interval is returned unchanged.
+    ///
+    /// A flat or single-point series collapses one (or both) axes to `min == max`.
+    /// ratatui's [`Chart`](ratatui::widgets::Chart) rejects every point when an axis
+    /// range has zero width, so the projection would claim `Ready` yet paint a BLANK
+    /// chart. Padding gives the axis a visible span, so a flat line renders as a
+    /// flat line. The half-width is `max(|v| * 0.005, 1.0)` — the larger of 0.5% of
+    /// the endpoint value ([`DEGENERATE_PAD_FRACTION`]) or one axis unit
+    /// ([`DEGENERATE_PAD_MIN`]). If padding would overflow to a non-finite endpoint,
+    /// the original (degenerate) interval is kept rather than panicking.
+    #[must_use]
+    fn padded(self) -> Self {
+        // The invariant guarantees `min <= max`, so `!(min < max)` means `min == max`
+        // (a degenerate interval) without an `==` float comparison.
+        if self.min < self.max {
+            return self;
+        }
+        let value = self.min;
+        let pad = (value.abs() * DEGENERATE_PAD_FRACTION).max(DEGENERATE_PAD_MIN);
+        Self::new(value - pad, value + pad).unwrap_or(self)
     }
 
     /// The `[min, mid, max]` numeric labels for the axis, formatted for
@@ -598,8 +667,8 @@ mod tests {
     fn test_axis_bounds_from_values_computes_min_and_max() {
         match AxisBounds::from_values([3.0, -1.0, 7.5, 2.0].into_iter()) {
             Some(bounds) => {
-                assert_close(bounds.min, -1.0);
-                assert_close(bounds.max, 7.5);
+                assert_close(bounds.min(), -1.0);
+                assert_close(bounds.max(), 7.5);
                 assert_eq!(bounds.to_array(), [-1.0, 7.5]);
             }
             None => panic!("non-empty values must yield bounds"),
@@ -612,16 +681,137 @@ mod tests {
     }
 
     #[test]
-    fn test_project_single_point_yields_ready_with_degenerate_bounds() {
-        // A single point is renderable: min == max on both axes (the widget owns any
-        // visual padding). This must not panic or project Empty.
+    fn test_axis_bounds_new_rejects_non_finite_and_unordered() {
+        // The only constructor enforces "finite, ordered": NaN/Inf endpoints and an
+        // inverted (max < min) range are rejected, so no bad range reaches a ratatui
+        // axis or an axis label.
+        assert_eq!(AxisBounds::new(f64::NAN, 1.0), None, "NaN min is rejected");
+        assert_eq!(AxisBounds::new(1.0, f64::NAN), None, "NaN max is rejected");
+        assert_eq!(
+            AxisBounds::new(f64::INFINITY, 1.0),
+            None,
+            "+Inf min is rejected",
+        );
+        assert_eq!(
+            AxisBounds::new(1.0, f64::NEG_INFINITY),
+            None,
+            "-Inf max is rejected",
+        );
+        assert_eq!(AxisBounds::new(5.0, 3.0), None, "max < min is rejected");
+    }
+
+    #[test]
+    fn test_axis_bounds_new_accepts_valid_and_round_trips() {
+        // Valid finite, ordered bounds round-trip through the accessors and to_array;
+        // a degenerate min == max is accepted at the type level (padding is a
+        // projection-seam concern, not a constructor one).
+        match AxisBounds::new(-1.0, 7.5) {
+            Some(bounds) => {
+                assert_close(bounds.min(), -1.0);
+                assert_close(bounds.max(), 7.5);
+                assert_eq!(bounds.to_array(), [-1.0, 7.5]);
+            }
+            None => panic!("valid finite, ordered bounds must construct"),
+        }
+        assert!(
+            AxisBounds::new(3.0, 3.0).is_some(),
+            "a degenerate min == max is a valid (finite, ordered) interval",
+        );
+    }
+
+    #[test]
+    fn test_project_single_point_yields_ready_with_padded_bounds() {
+        // A single point is renderable: the projection pads the degenerate min == max
+        // interval so each axis has real width (a zero-width axis paints BLANK). The
+        // point itself is unchanged; the pad is max(|v| * 0.005, 1.0) per axis.
         let graph = GraphData::Series(series("one", &[dec(42, 0)], &[dec(7, 0)]));
         let s = ready(&project(&graph)).clone();
         assert_eq!(s.points().len(), 1);
-        assert_close(s.x_bounds()[0], 42.0);
-        assert_close(s.x_bounds()[1], 42.0);
-        assert_close(s.y_bounds()[0], 7.0);
-        assert_close(s.y_bounds()[1], 7.0);
+        let point = s.points().first().copied().unwrap_or_default();
+        assert_close(point.0, 42.0);
+        assert_close(point.1, 7.0);
+        // x pad = max(42 * 0.005, 1.0) = 1.0 -> [41, 43]; y pad = max(7 * 0.005, 1.0)
+        // = 1.0 -> [6, 8].
+        assert_close(s.x_bounds()[0], 41.0);
+        assert_close(s.x_bounds()[1], 43.0);
+        assert_close(s.y_bounds()[0], 6.0);
+        assert_close(s.y_bounds()[1], 8.0);
+        assert!(
+            s.x_bounds()[0] < s.x_bounds()[1],
+            "the x axis has real width"
+        );
+        assert!(
+            s.y_bounds()[0] < s.y_bounds()[1],
+            "the y axis has real width"
+        );
+    }
+
+    // --- A degenerate series still paints ink, never a blank chart ------------
+
+    /// Render a projected series into a `Chart` on a `TestBackend` and count the
+    /// non-blank cells — the "plot ink" a real screen would paint. Zero means the
+    /// chart drew nothing (a blank void), which a zero-width axis range causes.
+    #[track_caller]
+    fn plot_ink_cells(series: &ProjectedSeries) -> usize {
+        let backend = TestBackend::new(40, 12);
+        let mut terminal = match Terminal::new(backend) {
+            Ok(t) => t,
+            Err(e) => panic!("TestBackend terminal construction failed: {e}"),
+        };
+        let draw = |series: &ProjectedSeries, frame: &mut ratatui::Frame| {
+            let dataset = Dataset::default()
+                .name(series.name().to_owned())
+                .marker(ratatui::symbols::Marker::Braille)
+                .graph_type(GraphType::Line)
+                .data(series.points());
+            let chart = Chart::new(vec![dataset])
+                .x_axis(Axis::default().bounds(series.x_bounds()))
+                .y_axis(Axis::default().bounds(series.y_bounds()));
+            frame.render_widget(chart, frame.area());
+        };
+        match terminal.draw(|frame| draw(series, frame)) {
+            Ok(_) => {}
+            Err(e) => panic!("draw failed: {e}"),
+        }
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .filter(|cell| cell.symbol() != " ")
+            .count()
+    }
+
+    #[test]
+    fn test_project_single_point_series_renders_non_blank_chart() {
+        // Regression: a single-point series, padded to a real axis width, plots a
+        // visible dot instead of a blank chart (a zero-width axis would reject it).
+        let graph = GraphData::Series(series("one", &[dec(42, 0)], &[dec(7, 0)]));
+        let s = ready(&project(&graph)).clone();
+        assert!(
+            plot_ink_cells(&s) > 0,
+            "a single-point series must paint some plot ink, not a blank chart",
+        );
+    }
+
+    #[test]
+    fn test_project_flat_series_renders_non_blank_chart() {
+        // Regression: a flat series (constant y across several x) collapses the y axis
+        // to min == max; padding gives it width so the flat line is visible ink.
+        let graph = GraphData::Series(series(
+            "flat",
+            &[dec(1, 0), dec(2, 0), dec(3, 0), dec(4, 0)],
+            &[dec(5, 0), dec(5, 0), dec(5, 0), dec(5, 0)],
+        ));
+        let s = ready(&project(&graph)).clone();
+        assert!(
+            s.y_bounds()[0] < s.y_bounds()[1],
+            "the flat y axis was padded to real width",
+        );
+        assert!(
+            plot_ink_cells(&s) > 0,
+            "a flat series must paint a visible flat line, not a blank chart",
+        );
     }
 
     #[test]
