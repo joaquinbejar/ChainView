@@ -19,6 +19,7 @@
 
 use std::io::{self, Stdout};
 use std::panic;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crossterm::cursor::{Hide, Show};
 use crossterm::execute;
@@ -229,6 +230,40 @@ impl Drop for TerminalGuard {
     }
 }
 
+/// While a supervisor drives the ordered teardown it is the **single** owner of
+/// the terminal restore (`docs/02-tui-architecture.md` §12): it cancels + joins
+/// the render task, then restores the terminal **last**. In that window the panic
+/// hook must NOT restore the terminal itself — a restore racing a still-live
+/// render draw is the double-owner bug. This process-global flag lets the hook
+/// defer to the active supervisor and own the restore only **outside** supervised
+/// operation (a panic during startup or after teardown). The invariant "the
+/// terminal is always restored on panic" holds either way: the supervisor
+/// restores in order, or — if its future is unwound by a main-thread panic — the
+/// [`TerminalGuard`] it owns restores on `Drop`.
+static SUPERVISOR_OWNS_RESTORE: AtomicBool = AtomicBool::new(false);
+
+/// Mark whether the active supervisor owns the terminal restore. Set by the
+/// app-layer task supervisor around its ordered teardown
+/// (`docs/02-tui-architecture.md` §12); read by the panic hook to decide whether
+/// to defer. This is an app -> terminal call (the supervisor depends on this
+/// leaf module), never the reverse — the restore-owner state lives with the
+/// restore code, so the layering stays one-directional.
+pub(crate) fn set_supervisor_owns_restore(owned: bool) {
+    SUPERVISOR_OWNS_RESTORE.store(owned, Ordering::SeqCst);
+}
+
+/// Whether a supervisor currently owns the ordered terminal restore.
+fn supervisor_owns_restore() -> bool {
+    SUPERVISOR_OWNS_RESTORE.load(Ordering::SeqCst)
+}
+
+/// Whether the panic hook should perform its own terminal restore: `true` only
+/// when no supervisor owns the ordered restore. Pure so the single-owner decision
+/// is unit-testable without touching the process-global flag.
+fn should_hook_restore(supervisor_owns_restore: bool) -> bool {
+    !supervisor_owns_restore
+}
+
 /// Install a panic hook that restores the terminal **before** chaining to the
 /// previously installed hook.
 ///
@@ -263,6 +298,15 @@ fn restore_then_chain<T>(restore: impl FnOnce(), next: impl FnOnce(&T), payload:
 /// previous hook prints, so the terminal is already normal when the backtrace
 /// lands.
 fn restore_on_panic() {
+    if !should_hook_restore(supervisor_owns_restore()) {
+        // A supervisor is driving the ordered teardown and owns the single
+        // restore; deferring here removes the double-owner race with a still-live
+        // render draw (`docs/02-tui-architecture.md` §12). The supervisor restores
+        // LAST, after joining the render task; if its future is unwound instead,
+        // the `TerminalGuard` it owns restores on `Drop`. The panic is still
+        // surfaced after restore via the supervisor's `ExitCause` and the log.
+        return;
+    }
     let mut out: Stdout = io::stdout();
     let _ = execute!(out, Show, LeaveAlternateScreen);
     let _ = disable_raw_mode();
@@ -492,6 +536,22 @@ mod tests {
             &0u8,
         );
         assert_eq!(*order.borrow(), vec!["restore", "chained"]);
+    }
+
+    #[test]
+    fn test_should_hook_restore_defers_to_an_active_supervisor() {
+        // Outside supervised operation the hook owns the restore; while a
+        // supervisor owns the ordered restore the hook defers, so the terminal
+        // is restored by a single owner and never out from under a live draw
+        // (`docs/02-tui-architecture.md` §12).
+        assert!(
+            should_hook_restore(false),
+            "no supervisor active: the panic hook owns the restore"
+        );
+        assert!(
+            !should_hook_restore(true),
+            "a supervisor owns the ordered restore: the hook defers"
+        );
     }
 
     #[test]

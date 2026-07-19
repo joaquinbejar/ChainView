@@ -35,12 +35,22 @@
 //!
 //! # Deterministic join order — terminal restored LAST
 //!
-//! On teardown the supervisor: (1) cancels + joins the **provider** tasks (stop
-//! new data), then (2) cancels + joins the **input/tick/replay** tasks, then (3)
-//! lets the **render** thread exit its loop, and only then (4) runs the
-//! [`FinalTeardown`] that restores the terminal ([`TerminalGuard`] via
-//! [`GuardTeardown`], `docs/02-tui-architecture.md` §6). Terminal restore is the
-//! **last** step on every path, including panic.
+//! On teardown the supervisor: (0) drains the **mid-run watch set** (the watched
+//! provider handles, [`watch`](Supervisor::watch)), then (1) cancels + joins the
+//! **provider** tasks (stop new data), then (2) cancels + joins the
+//! **input/tick/replay** tasks, then (3) lets the **render** thread exit its
+//! loop, and only then (4) runs the [`FinalTeardown`] that restores the terminal
+//! ([`TerminalGuard`] via [`GuardTeardown`], `docs/02-tui-architecture.md` §6).
+//! Terminal restore is the **last** step on every path, including panic.
+//!
+//! Restore has a **single owner**. [`run`](Supervisor::run) claims terminal-
+//! restore ownership for the whole supervised lifecycle (via
+//! [`crate::terminal::set_supervisor_owns_restore`]); while it is claimed the
+//! process panic hook DEFERS its own restore, so a worker-task panic can never
+//! restore the terminal out from under a still-live render draw. The supervisor
+//! restores LAST (after joining the render task); if its future is unwound by a
+//! main-thread panic instead, the [`TerminalGuard`] it owns restores on `Drop`.
+//! Either way the "terminal always restored on panic" invariant holds.
 //!
 //! # Bounded join, then abort
 //!
@@ -64,13 +74,17 @@
 //! # Scope of this issue (#11) and the seams left for later
 //!
 //! This lands the supervisor, the cancellation-token tree, the ordered teardown,
-//! the bounded-join-then-abort, error propagation, and per-provider cancellation.
-//! The [`TerminalGuard`]/panic hook itself is #8 (sequenced last here); the
-//! bounded channels are #10; the provider reconnect-loop internals are #16; the
-//! render loop that spawns the real tasks and drives the trigger sources is #13.
-//! The seams are explicit: [`Supervisor::child_token`] hands each task its
-//! cooperative-cancel token, [`Supervisor::exit_reporter`] hands each task's
-//! join-watcher the channel that reports a panic as fatal, and the
+//! the bounded-join-then-abort, error propagation, per-provider cancellation, and
+//! the mid-run watch set that wakes the loop on a task that panics or returns
+//! mid-run. The [`TerminalGuard`]/panic hook itself is #8 (sequenced last here);
+//! the bounded channels are #10; the provider reconnect-loop internals are #16;
+//! the render loop that spawns the real tasks and drives the trigger sources is
+//! #13. The seams are explicit: [`Supervisor::child_token`] hands each task its
+//! cooperative-cancel token, [`Supervisor::watch`] enrols a spawned handle in the
+//! supervisor-owned watch set so its mid-run panic/return wakes `supervise` (the
+//! seam the #22 registry registers a provider task INTO),
+//! [`Supervisor::exit_reporter`] hands a caller-owned join-watcher the channel
+//! that reports a panic as fatal, and the
 //! [`register_provider`](Supervisor::register_provider) /
 //! [`register_ancillary`](Supervisor::register_ancillary) /
 //! [`set_render`](Supervisor::set_render) methods take the [`Box<dyn
@@ -82,6 +96,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio::sync::mpsc;
+use tokio::task::{AbortHandle, JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
 use crate::chain::ProviderId;
@@ -354,6 +369,18 @@ pub struct Supervisor {
     fatal: Option<ExitCause>,
     rx_exit: mpsc::Receiver<TaskExit>,
     tx_exit: mpsc::Sender<TaskExit>,
+    /// The supervisor-owned mid-run watch set: one watcher per handle registered
+    /// through [`watch`](Supervisor::watch). Each watcher awaits its task's
+    /// terminal outcome and yields a [`TaskExit`], so a task that panics or
+    /// returns **mid-run** wakes the `supervise` loop via
+    /// [`JoinSet::join_next`], and every watcher is reaped (bounded, then aborted)
+    /// at teardown — never a detached orphan.
+    watchers: JoinSet<TaskExit>,
+    /// The [`AbortHandle`] of each **watched task** (not its watcher). Aborting a
+    /// watcher would merely drop the task's [`JoinHandle`] and DETACH the task; to
+    /// truly stop a wedged watched task at teardown the drain aborts it through
+    /// its own handle here.
+    watch_aborts: Vec<AbortHandle>,
 }
 
 impl Supervisor {
@@ -380,6 +407,8 @@ impl Supervisor {
             fatal: None,
             rx_exit,
             tx_exit,
+            watchers: JoinSet::new(),
+            watch_aborts: Vec::new(),
         }
     }
 
@@ -420,15 +449,59 @@ impl Supervisor {
     /// over its **own** handle (`let exit = task.join().await;
     /// reporter.report(exit);`), while the supervisor's ordered teardown join is
     /// the **fallback** that reaps a panic surfaced at shutdown for the tasks it
-    /// holds. #13 closes the loop — e.g. by having `supervise` also select over the
-    /// registered handles, or by registering an [`AbortHandle`](tokio::task::AbortHandle)
-    /// beside each watcher — so no task is left unobserved between report and
-    /// teardown.
+    /// holds. [`watch`](Self::watch) closes the loop for handles the supervisor
+    /// owns — `supervise` selects over its watch [`JoinSet`], so a registered
+    /// handle that panics or returns mid-run wakes the loop directly, with no
+    /// separate reporter needed. This `ExitReporter` seam stays for a
+    /// caller-owned watcher (e.g. a reconnect loop, #16) that prefers to report
+    /// through the channel instead.
     #[must_use]
     pub fn exit_reporter(&self) -> ExitReporter {
         ExitReporter {
             tx: self.tx_exit.clone(),
         }
+    }
+
+    /// Enrol a spawned task's [`JoinHandle`] in the supervisor's **mid-run** watch
+    /// set, returning its [`AbortHandle`] for an optional targeted abort.
+    ///
+    /// This is the seam that closes Codex's "supervisor never notices a task that
+    /// panics or returns mid-run" gap: the supervisor spawns a watcher over
+    /// `handle` into its owned [`JoinSet`], and the `supervise` loop
+    /// selects on that set — so a Deribit provider loop that PANICS or RETURNS
+    /// mid-run wakes it (a panic is fatal; a self-completion is a
+    /// clean shutdown trigger) instead of leaving the UI stale forever. A watched
+    /// handle is single-owned by the watcher (a [`JoinHandle`] is not `Clone` and
+    /// awaiting consumes it), and is reaped at teardown by the bounded watch drain
+    /// (`docs/02-tui-architecture.md` §12) — never a detached orphan.
+    ///
+    /// The registration path (#22, `spawn_supervised_subscription`) registers a
+    /// **provider** task INTO this: it keeps a clone of the task's
+    /// [`child_token`](Self::child_token) for a per-provider `Unsubscribe`/
+    /// `Rediscover` cancel, and hands the task's `JoinHandle` here so the mid-run
+    /// panic/return is observed. Watched tasks are the data producers, so the
+    /// teardown drains them **first** (before the ancillary and render groups),
+    /// keeping the "stop new data first" order.
+    ///
+    /// Must be called from within a tokio runtime (it spawns the watcher).
+    pub fn watch(&mut self, handle: JoinHandle<()>) -> AbortHandle {
+        // The WATCHED task's own abort handle (not the watcher's): aborting the
+        // watcher would only drop this `JoinHandle` and detach the task. Kept so
+        // the teardown drain can truly stop a wedged watched task, and returned so
+        // the caller (#22) can drive a targeted abort.
+        let task_abort = handle.abort_handle();
+        self.watch_aborts.push(task_abort.clone());
+        self.watchers.spawn(async move {
+            match handle.await {
+                Ok(()) => TaskExit::Completed,
+                // A panic is the one fatal join outcome (docs/02 §12); it surfaces
+                // here as the watcher's returned value, not a `JoinError`.
+                Err(error) if error.is_panic() => TaskExit::Panicked,
+                // A cancelled/aborted task is gone, not a failure.
+                Err(_) => TaskExit::Completed,
+            }
+        });
+        task_abort
     }
 
     /// Register a **provider** task under its id (joined first). `child` **must**
@@ -513,6 +586,12 @@ impl Supervisor {
     /// lets the supervisor call [`std::process::exit`].
     #[must_use = "the returned ExitCause is main's exit code + post-restore stderr line"]
     pub async fn run(mut self) -> ExitCause {
+        // Claim single ownership of the terminal restore for the whole supervised
+        // lifecycle. While this is set, the panic hook DEFERS its own restore to
+        // the supervisor (docs/02 §12), which cancels + joins the render task and
+        // restores LAST — so a worker-task panic can never restore the terminal
+        // out from under a still-live render draw (the two-restore-owners race).
+        crate::terminal::set_supervisor_owns_restore(true);
         self.supervise().await;
         self.teardown().await
     }
@@ -522,14 +601,15 @@ impl Supervisor {
     /// clone), or a task-exit report (a panic is fatal; a clean completion is a
     /// clean shutdown).
     ///
-    /// Mid-run panic detection currently arrives as an [`ExitReporter`] **report**
-    /// from a caller-owned watcher, not by this loop directly polling the
-    /// registered handles (a handle cannot be both watched and teardown-joined —
-    /// see [`exit_reporter`](Self::exit_reporter)). #13 may extend this `select!`
-    /// to also watch the registered handles so the report seam becomes optional.
+    /// Mid-run detection arrives two ways, both handled here: a watcher the
+    /// supervisor owns for a handle registered through [`watch`](Self::watch)
+    /// (the [`JoinSet`] arm — a handle that panics or returns mid-run wakes this
+    /// loop directly), and an [`ExitReporter`] **report** from a caller-owned
+    /// watcher (the channel arm — see [`exit_reporter`](Self::exit_reporter)).
+    /// Either way, a panic is fatal and a self-completion is a clean shutdown.
     async fn supervise(&mut self) {
         // A cloned (owned) future so the select borrows neither `self.root` nor
-        // entangles with the mutable `rx_exit` borrow below.
+        // entangles with the mutable `rx_exit`/`watchers` borrows below.
         let root = self.root.clone();
         tokio::select! {
             () = root.cancelled_owned() => {}
@@ -538,6 +618,15 @@ impl Supervisor {
                 // A task completing on its own, or every reporter dropping, is a
                 // clean shutdown trigger.
                 Some(TaskExit::Completed) | None => self.request_quit(),
+            },
+            // A supervisor-owned watched handle finishing mid-run. The `if` guard
+            // disables this arm while the set is empty (an empty `JoinSet` yields
+            // `None` immediately, which must not spuriously trip a shutdown).
+            watched = self.watchers.join_next(), if !self.watchers.is_empty() => match watched {
+                Some(Ok(TaskExit::Panicked)) => self.trip_fatal(ExitCause::TaskPanicked),
+                // A clean self-completion, an aborted watcher, or the set draining
+                // to empty is a clean shutdown trigger — no task left unobserved.
+                Some(Ok(TaskExit::Completed)) | Some(Err(_)) | None => self.request_quit(),
             },
         }
     }
@@ -558,6 +647,11 @@ impl Supervisor {
         // dance; it is seeded with any cause a trigger already recorded.
         let mut fatal = self.fatal.take();
 
+        // (0) Mid-run watched handles (the provider/producer tasks registered via
+        // `watch`, #22): drained FIRST so new data stops before anything else, and
+        // aborted-then-AWAITED so no watched task outlives the terminal restore.
+        drain_watchers(&mut self.watchers, &self.watch_aborts, budget, &mut fatal).await;
+
         // (1) Provider tasks: stop new data first.
         for (_id, supervised) in &mut self.providers {
             let outcome = join_supervised(supervised, budget).await;
@@ -574,10 +668,15 @@ impl Supervisor {
             record_group_outcome(&mut fatal, outcome);
         }
 
-        // (4) Terminal restore — the LAST step on every path. Moved out of `self`
-        // so `run` on the boxed teardown consumes it exactly once.
+        // (4) Terminal restore — the LAST step on every path, and the SINGLE
+        // owner: the panic hook has been deferring to us since `run` claimed
+        // ownership, so no restore raced a live draw. Moved out of `self` so
+        // `run` on the boxed teardown consumes it exactly once.
         let terminal = self.terminal;
         terminal.run();
+        // Ownership done: a post-teardown panic (if any) falls back to the panic
+        // hook's own restore.
+        crate::terminal::set_supervisor_owns_restore(false);
 
         fatal.unwrap_or(ExitCause::Clean)
     }
@@ -607,7 +706,55 @@ async fn join_bounded(task: &mut dyn SupervisedTask, budget: Duration) -> JoinBu
             // does not detach the task — so this `abort()` reaches a live handle
             // and truly cancels it, and a wedged upstream socket cannot orphan.
             task.abort();
+            // AWAIT the aborted task so it is truly finished before the caller
+            // proceeds to the terminal restore — an aborted-but-not-joined task
+            // could still be running when the terminal is handed back, racing the
+            // restore. Bounded again by the SAME budget so a task that somehow
+            // ignores the abort still cannot hang the exit: on a second timeout we
+            // simply proceed, the abort having already been issued.
+            let _ = tokio::time::timeout(budget, task.join()).await;
             JoinBudget::AbortedAfterBudget
+        }
+    }
+}
+
+/// Drain the mid-run watch set within the budget, folding any panic into the
+/// first-fatal-wins cause. A straggler whose task ignores cancellation past the
+/// budget has its WATCHED task aborted (through `watch_aborts`) and is then
+/// AWAITED, so no watched task outlives the terminal restore
+/// (`docs/02-tui-architecture.md` §12).
+///
+/// The root token is cancelled before this runs (cascading to every watched
+/// task's child), so a cooperative watcher resolves well inside the budget.
+async fn drain_watchers(
+    watchers: &mut JoinSet<TaskExit>,
+    watch_aborts: &[AbortHandle],
+    budget: Duration,
+    fatal: &mut Option<ExitCause>,
+) {
+    while !watchers.is_empty() {
+        match tokio::time::timeout(budget, watchers.join_next()).await {
+            Ok(Some(Ok(exit))) => record_group_outcome(fatal, JoinBudget::Returned(exit)),
+            // A cancelled/aborted watcher is gone, not a failure; the watcher maps
+            // the WATCHED task's panic to `TaskExit::Panicked` as a value, so a
+            // panic never arrives here as a `JoinError`.
+            Ok(Some(Err(_))) => {}
+            // Set drained to empty (a race with the loop guard).
+            Ok(None) => break,
+            Err(_elapsed) => {
+                // A watched task ignored cancellation past the budget: abort the
+                // WATCHED tasks (not the watchers — aborting a watcher would only
+                // detach its task), then AWAIT every watcher so nothing races the
+                // restore. Bounded so even that final drain cannot hang the exit.
+                for task_abort in watch_aborts {
+                    task_abort.abort();
+                }
+                let _ = tokio::time::timeout(budget, async {
+                    while watchers.join_next().await.is_some() {}
+                })
+                .await;
+                break;
+            }
         }
     }
 }
@@ -934,6 +1081,30 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn test_join_bounded_awaits_aborted_task_before_returning() {
+        // Fix 2: a REAL wedged task carrying a drop-guard. `join_bounded` AWAITS
+        // the handle AFTER aborting, so the task is truly finished (its future
+        // dropped) by the time `join_bounded` returns — with NO extra yields,
+        // unlike a fire-and-forget abort that could still be running when the
+        // caller proceeds to the terminal restore.
+        let dropped = Arc::new(AtomicBool::new(false));
+        let guard = DropFlag(dropped.clone());
+        let handle = tokio::spawn(async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        });
+        let mut task = TokioTask::new(handle);
+
+        let outcome = join_bounded(&mut task, super::DEFAULT_JOIN_BUDGET).await;
+
+        assert!(matches!(outcome, JoinBudget::AbortedAfterBudget));
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "the aborted task was AWAITED to completion before join_bounded returned"
+        );
+    }
+
     // === Ordered teardown =====================================================
 
     #[tokio::test]
@@ -1121,6 +1292,121 @@ mod tests {
             recorded.last().map(String::as_str),
             Some("terminal_restore"),
             "terminal restore is still last after an abort: {recorded:?}"
+        );
+    }
+
+    // === Mid-run watch: a registered handle that ends on its own wakes the loop =
+
+    #[tokio::test]
+    async fn test_supervisor_watched_task_panic_mid_run_wakes_supervise_as_fatal() {
+        // A REAL task that panics on its own, MID-RUN, with NO external trigger
+        // and NO manual reporter: `watch` is the only thing observing it. Its
+        // panic must wake `supervise` and record a fatal cause — closing the
+        // "supervisor never notices a task that panics mid-run" gap (the UI would
+        // otherwise run stale forever).
+        let log = new_log();
+        let mut supervisor = recording_supervisor(&log);
+        let handle = tokio::spawn(async { panic!("mid-run provider panic") });
+        let _abort = supervisor.watch(handle);
+
+        let cause = supervisor.run().await;
+
+        assert!(
+            matches!(cause, ExitCause::TaskPanicked),
+            "a watched task panicking mid-run wakes the supervisor as fatal"
+        );
+        assert_eq!(
+            steps(&log).last().map(String::as_str),
+            Some("terminal_restore"),
+            "terminal restore is still last on the watched-panic path"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_supervisor_watched_task_return_mid_run_triggers_clean_shutdown() {
+        // A REAL task that RETURNS on its own, mid-run: a clean self-completion
+        // that must wake `supervise` and trigger an ordered, clean shutdown
+        // (not a stale UI).
+        let log = new_log();
+        let mut supervisor = recording_supervisor(&log);
+        let handle = tokio::spawn(async {});
+        let _abort = supervisor.watch(handle);
+
+        let cause = supervisor.run().await;
+
+        assert!(
+            cause.is_clean(),
+            "a watched task self-completing mid-run is a clean shutdown trigger"
+        );
+        assert_eq!(
+            steps(&log).last().map(String::as_str),
+            Some("terminal_restore")
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_supervisor_watched_wedged_task_is_aborted_at_teardown() {
+        // A REAL watched task that ignores cancellation (wedged) is aborted AND
+        // AWAITED by the teardown drain, so it cannot outlive the terminal
+        // restore. A drop-guard proves the task future was truly dropped.
+        let dropped = Arc::new(AtomicBool::new(false));
+        let guard = DropFlag(dropped.clone());
+        let handle = tokio::spawn(async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        });
+        let log = new_log();
+        let mut supervisor = recording_supervisor(&log);
+        let _abort = supervisor.watch(handle);
+
+        // A clean quit trigger so `supervise` returns and teardown drains the
+        // wedged watcher within the budget, then aborts + awaits it.
+        supervisor.request_quit();
+        let cause = supervisor.run().await;
+
+        assert!(
+            cause.is_clean(),
+            "a wedged (non-panicking) watched task is aborted but does not fail the exit"
+        );
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "the wedged watched task was aborted AND awaited before restore"
+        );
+        assert_eq!(
+            steps(&log).last().map(String::as_str),
+            Some("terminal_restore")
+        );
+    }
+
+    // === Single restore owner under a worker panic ============================
+
+    #[tokio::test]
+    async fn test_supervisor_worker_panic_restores_terminal_exactly_once() {
+        // Single restore owner: under a worker-task panic the supervisor performs
+        // the ONE terminal restore (the panic hook defers to it while supervised,
+        // see `terminal::should_hook_restore`), so restore is recorded exactly
+        // once and is the last step — no second owner racing it.
+        let log = new_log();
+        let mut supervisor = recording_supervisor(&log);
+        let handle = tokio::spawn(async { panic!("worker panic") });
+        let _abort = supervisor.watch(handle);
+
+        let cause = supervisor.run().await;
+
+        assert!(matches!(cause, ExitCause::TaskPanicked));
+        let recorded = steps(&log);
+        assert_eq!(
+            recorded
+                .iter()
+                .filter(|step| step.as_str() == "terminal_restore")
+                .count(),
+            1,
+            "the terminal is restored by a single owner (exactly once): {recorded:?}"
+        );
+        assert_eq!(
+            recorded.last().map(String::as_str),
+            Some("terminal_restore"),
+            "the single restore is the last step: {recorded:?}"
         );
     }
 }
