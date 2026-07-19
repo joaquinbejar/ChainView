@@ -240,19 +240,19 @@ impl Playback {
 /// *different* bundle yields meaningless indices (a caller contract, not
 /// re-validated).
 ///
-/// [`position`](Self::position) and [`end_step`](Self::end_step) are public for
-/// read access (a screen renders "step `position` of `end_step`"); they are
-/// **read-only by convention** — mutate the cursor only through
-/// [`seek`](Self::seek), which re-establishes the index invariant. A direct write
-/// to `position` is not reflected in the slices until the next `seek`.
+/// [`position`](Self::position) and [`end_step`](Self::end_step) are read-only
+/// ACCESSORS (a screen renders "step `position` of `end_step`"); the fields are
+/// private so the cursor can only move through [`seek`](Self::seek), which
+/// re-establishes the index invariant — a desynced direct write is
+/// unrepresentable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TimelineCursor {
     /// The last step of the tape (the first is always `0`). For an empty run this
     /// is `0` and every slice is empty.
-    pub end_step: u32,
+    end_step: u32,
     /// The current scrub step — the one clock (`ts_ns` is display only). Always in
     /// `0..=end_step` after any [`seek`](Self::seek).
-    pub position: u32,
+    position: u32,
     /// Count of `fills` rows with `step <= position` (the exclusive upper bound of
     /// the visible slice `&fills[..fills_ix]`).
     fills_ix: usize,
@@ -265,6 +265,19 @@ pub struct TimelineCursor {
 }
 
 impl TimelineCursor {
+    /// The last step of the tape (the first is always `0`).
+    #[must_use]
+    pub fn end_step(&self) -> u32 {
+        self.end_step
+    }
+
+    /// The current scrub step — always in `0..=end_step` after any
+    /// [`seek`](Self::seek).
+    #[must_use]
+    pub fn position(&self) -> u32 {
+        self.position
+    }
+
     /// Build a cursor over `bundle` at `position = 0` with each index resolved by
     /// binary search (`docs/01-domain-model.md` §10).
     ///
@@ -463,7 +476,14 @@ impl TimelineCursor {
 /// is unreachable (`N <= MAX_TABLE_ROWS < u32::MAX`) and keeps the conversion
 /// checked.
 fn end_step_of(bundle: &LoadedBundle) -> u32 {
-    u32::try_from(bundle.equity.len().saturating_sub(1)).unwrap_or(u32::MAX)
+    // Explicit empty-run case (no banned saturating method, no underflow by
+    // construction); the narrowing stays checked with an unreachable fallback
+    // (`N <= MAX_TABLE_ROWS < u32::MAX`).
+    let last = match bundle.equity.len() {
+        0 => 0,
+        n => n - 1,
+    };
+    u32::try_from(last).unwrap_or(u32::MAX)
 }
 
 /// Walk `ix` to `partition_point(|r| step(r) <= new_pos)` **incrementally** from
@@ -486,8 +506,11 @@ fn walk_index<T>(
     // Extend forward while the row at `ix` still belongs to the as-of window.
     while let Some(row) = rows.get(ix) {
         if step(row) <= new_pos {
-            ix = ix.saturating_add(1);
-            moves = moves.saturating_add(1);
+            // Checked increments (saturating_* is banned): `ix < rows.len()` here
+            // and `moves <= rows.len()`, so overflow is unreachable; the
+            // unwrap_or keeps the walk total rather than wrapping.
+            ix = ix.checked_add(1).unwrap_or(ix);
+            moves = moves.checked_add(1).unwrap_or(moves);
         } else {
             break;
         }
@@ -497,7 +520,7 @@ fn walk_index<T>(
         match rows.get(ix - 1) {
             Some(row) if step(row) > new_pos => {
                 ix -= 1;
-                moves = moves.saturating_add(1);
+                moves = moves.checked_add(1).unwrap_or(moves);
             }
             _ => break,
         }
