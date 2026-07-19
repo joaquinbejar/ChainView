@@ -30,9 +30,11 @@
 //! [`PricingInputs`] ([`PricingModel`]/[`QuoteSelect`]), and [`compute_leg_greeks`]:
 //! it builds an `optionstratlib::Options` and calls the `optionstratlib` Greeks
 //! functions plus IV inversion (never a hand-rolled Black-Scholes/root-finder),
-//! deterministically and cached by `input_generation`, clearing a crossed / stale
-//! / solver-failed leg to `None` with a recorded [`LegStatus`]
-//! (`docs/01-domain-model.md` §7).
+//! deterministically and cached by `input_generation`, clearing a crossed /
+//! stale-quote / stale / solver-failed leg to `None` with a recorded
+//! [`LegStatus`]. Per-leg stream-quote freshness reaches the kernel as pure data
+//! ([`QuoteClocks`]) so a silent feed's last quote is never inverted into a
+//! spuriously-`Computed` IV (`docs/01-domain-model.md` §7, §5.1).
 //!
 //! Issue #7 landed the live [`ChainStore`] in the [`store`] submodule — the
 //! deterministic poll -> stream merge over the `optionstratlib` chain: the
@@ -58,7 +60,7 @@ pub use events::{
 pub use fetch::{AliasCatalog, ChainFetch, ExpirySource};
 pub use greeks::{
     DEFAULT_DIVIDEND_YIELD, DEFAULT_RISK_FREE_RATE, GreeksSidecar, LegGreeks, LegStatus,
-    PricingInputs, PricingModel, QuoteSelect, compute_leg_greeks,
+    PricingInputs, PricingModel, QuoteClocks, QuoteSelect, compute_leg_greeks,
 };
 pub use identity::{
     ContractSpecFingerprint, ExerciseStyle, Instrument, InstrumentKey, ProviderId,

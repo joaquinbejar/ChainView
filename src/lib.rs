@@ -125,7 +125,7 @@ pub use chain::{
     DepthLadder, DepthLevel, ExerciseStyle, ExpirySource, FEED_DELAY_WARN, Freshness,
     GREEKS_STALE_AFTER, GreeksOrigin, GreeksRow, GreeksSidecar, Instrument, InstrumentKey,
     LegGreeks, LegStatus, MAX_PENDING, MarketUpdate, MergeOutcome, PricingInputs, PricingModel,
-    ProviderId, QUOTE_STALE_AFTER, QuoteSelect, QuoteUpdate, RESERVED_PROVIDER_IDS,
+    ProviderId, QUOTE_STALE_AFTER, QuoteClocks, QuoteSelect, QuoteUpdate, RESERVED_PROVIDER_IDS,
     SettlementStyle, StreamHealth, TickDir, chain_stale_after, compute_leg_greeks, pending_ttl,
 };
 pub use config::{CliOverrides, Config, ModeSelect, ProviderSettings, ThemeChoice};
