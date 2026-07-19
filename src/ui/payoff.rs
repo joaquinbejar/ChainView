@@ -1573,6 +1573,525 @@ mod tests {
         );
     }
 
+    // =====================================================================
+    // Issue #28 — the v0.2 acceptance gate: payoff render goldens at the fixed
+    // 120x40, the break-even / max-profit / max-loss parity against
+    // `optionstratlib`, and the draw-purity consolidation. Every golden drives
+    // the REAL path (builder -> commit -> active_graph_data -> project ->
+    // payoff::draw into a TestBackend), so a layout/geometry drift updates the
+    // golden in the same commit (`docs/TESTING.md` §4, §9).
+    // =====================================================================
+    mod milestone {
+        use optionstratlib::Options;
+        use optionstratlib::model::Position;
+        use optionstratlib::prelude::Decimal;
+        use optionstratlib::strategies::base::{BreakEvenable, Strategies};
+        use optionstratlib::strategies::custom::CustomStrategy;
+        use optionstratlib::{ExpirationDate, OptionType, Side as OptionSide};
+
+        use super::*;
+
+        /// The iron-condor underlying (a modest spot). The `optionstratlib`
+        /// `CustomStrategy::new` runs an `O(underlying / 0.01)` break-even scan in
+        /// its constructor (~6M iterations at BTC spot); a spot of 100 keeps that
+        /// cross-check scan a few thousand iterations, so the parity test stays fast
+        /// (the #27 API map's prohibitive-scan note — the scan is acceptable **in a
+        /// test** at a modest underlying).
+        const IC_SPOT: f64 = 100.0;
+
+        /// A reference instant ~30 days before the fixture's 2025-06-27 expiry, so
+        /// the t+0 golden shows a believable, well-separated curve. The expiration
+        /// payoff and the break-evens are IV- **and** time-independent, so the
+        /// numeric parity assertions below do not depend on this value.
+        const IC_AS_OF: i64 = 1_748_457_000;
+
+        /// The number of contracts per iron-condor leg.
+        const IC_QTY: f64 = 1.0;
+
+        /// A **tight, documented** tolerance (in underlying-price units) for the
+        /// break-even parity. ChainView reads its break-evens off exact
+        /// piecewise-linear sign changes on a strike-anchored grid; `optionstratlib`
+        /// brute-forces `|P&L| < 0.01` at a `0.01` price step. Both therefore land on
+        /// the true crossing to within a couple of cents on the underlying, so this
+        /// is a near-exact match — a wider band would signal a real discrepancy, not
+        /// a legitimate numerical gap (issue #28).
+        const BREAK_EVEN_TOLERANCE: f64 = 0.02;
+
+        /// A **tight, documented** tolerance (in P&L units) for the max-profit /
+        /// max-loss parity. ChainView takes the max/min of its committed expiration
+        /// series; `optionstratlib` scans its `range_to_show` in 50 steps. The iron
+        /// condor's max-profit and max-loss are flat plateaus both grids sample
+        /// exactly, so the two agree to within a cent (issue #28).
+        const MAX_PNL_TOLERANCE: f64 = 0.01;
+
+        /// One iron-condor leg spec, shared by BOTH the ChainView builder and the
+        /// `optionstratlib` `CustomStrategy` cross-check so the two are built from a
+        /// single source and cannot drift: strike, style, side, and mid premium.
+        struct IcLeg {
+            strike: f64,
+            style: OptionStyle,
+            side: Side,
+            premium: f64,
+        }
+
+        /// The classic iron condor: a short put spread (long 90 put / short 95 put)
+        /// plus a short call spread (short 105 call / long 110 call) around a spot of
+        /// 100 — a net credit of 3.0, so max-profit +3 between the shorts, max-loss
+        /// -2 at the wings, and break-evens at 92 and 108.
+        fn ic_legs() -> [IcLeg; 4] {
+            [
+                IcLeg {
+                    strike: 90.0,
+                    style: OptionStyle::Put,
+                    side: Side::Buy,
+                    premium: 1.0,
+                },
+                IcLeg {
+                    strike: 95.0,
+                    style: OptionStyle::Put,
+                    side: Side::Sell,
+                    premium: 2.5,
+                },
+                IcLeg {
+                    strike: 105.0,
+                    style: OptionStyle::Call,
+                    side: Side::Sell,
+                    premium: 2.5,
+                },
+                IcLeg {
+                    strike: 110.0,
+                    style: OptionStyle::Call,
+                    side: Side::Buy,
+                    premium: 1.0,
+                },
+            ]
+        }
+
+        /// A one-strike chain row carrying the leg's side quote bracketing its target
+        /// premium (so `set_mid_prices` yields the exact mid) plus a plausible
+        /// per-strike IV, so both the expiration curve (mark-only) and the t+0 curve
+        /// (needs a plausible IV) render.
+        fn ic_row(leg: &IcLeg) -> OptionData {
+            let bid = leg.premium - 0.1;
+            let ask = leg.premium + 0.1;
+            let mut od = OptionData {
+                strike_price: pos(leg.strike),
+                implied_volatility: pos(0.3),
+                ..Default::default()
+            };
+            match leg.style {
+                OptionStyle::Call => {
+                    od.call_bid = Some(pos(bid));
+                    od.call_ask = Some(pos(ask));
+                }
+                OptionStyle::Put => {
+                    od.put_bid = Some(pos(bid));
+                    od.put_ask = Some(pos(ask));
+                }
+            }
+            od.set_mid_prices();
+            od
+        }
+
+        /// The iron-condor chain: the four leg strikes around a spot of 100, expiry
+        /// 2025-06-27.
+        fn ic_chain() -> OptionChain {
+            let mut chain =
+                OptionChain::new("IC", pos(IC_SPOT), "2025-06-27".to_owned(), None, None);
+            for leg in &ic_legs() {
+                let _ = chain.options.insert(ic_row(leg));
+            }
+            chain
+        }
+
+        /// A committed iron-condor [`LiveState`]: the four legs built directly
+        /// through the builder (long by default; the two short legs toggled) and
+        /// committed against the seeded store — the exact `commit` path #27 runs.
+        fn ic_state() -> LiveState {
+            let store = ChainStore::seed(
+                ChainFetch::new(
+                    ic_chain(),
+                    ExpirySource::new("IC", resolved_expiry(), pid("deribit")),
+                    AliasCatalog::new(),
+                ),
+                ChainSource::Merged,
+                Duration::from_secs(2),
+                utc(IC_AS_OF),
+            );
+            let mut state = LiveState::new(
+                SourceBinding::new(pid("deribit"), caps(), StreamHealth::Live),
+                store,
+            );
+            for leg in &ic_legs() {
+                state.payoff_builder.append(pos(leg.strike), leg.style);
+                if leg.side == Side::Sell {
+                    state.payoff_builder.toggle_cursor_side();
+                }
+            }
+            let LiveState {
+                store,
+                payoff_builder,
+                ..
+            } = &mut state;
+            assert!(
+                payoff_builder.commit(store),
+                "the iron condor commits (every leg has a mark)",
+            );
+            state
+        }
+
+        /// The SAME iron condor as an `optionstratlib` [`CustomStrategy`], built from
+        /// the committed ChainView legs and their frozen chain marks so the two
+        /// cannot drift. IV and DTE are immaterial here — the break-evens and the
+        /// max-profit / max-loss all read the IV- and time-independent expiration
+        /// payoff.
+        fn ic_custom_strategy(state: &LiveState) -> CustomStrategy {
+            let chain = state.store.chain();
+            let legs = match state.payoff_builder.committed() {
+                Some(committed) => committed.legs(),
+                None => panic!("expected a committed iron condor"),
+            };
+            let open_date = match chrono::DateTime::<chrono::Utc>::from_timestamp(IC_AS_OF, 0) {
+                Some(dt) => dt,
+                None => panic!("bad fixed test instant"),
+            };
+            let mut positions = Vec::with_capacity(legs.len());
+            for leg in legs {
+                let premium = match leg.mark_in(chain) {
+                    Some(p) => p,
+                    None => panic!("a committed leg must have a mark"),
+                };
+                let side = match leg.side {
+                    Side::Buy => OptionSide::Long,
+                    Side::Sell => OptionSide::Short,
+                };
+                let option = Options::new(
+                    OptionType::European,
+                    side,
+                    "IC".to_owned(),
+                    leg.strike,
+                    ExpirationDate::Days(pos(30.0)),
+                    pos(0.3),
+                    pos(IC_QTY),
+                    pos(IC_SPOT),
+                    Decimal::ZERO,
+                    leg.style,
+                    Positive::ZERO,
+                    None,
+                );
+                positions.push(Position::new(
+                    option,
+                    premium,
+                    open_date,
+                    Positive::ZERO,
+                    Positive::ZERO,
+                    None,
+                    None,
+                ));
+            }
+            match CustomStrategy::new(
+                "ic".to_owned(),
+                "IC".to_owned(),
+                "iron condor".to_owned(),
+                pos(IC_SPOT),
+                positions,
+                pos(0.01),
+                1_000,
+                Positive::ONE,
+            ) {
+                Ok(strategy) => strategy,
+                Err(e) => panic!("CustomStrategy::new failed: {e}"),
+            }
+        }
+
+        /// The finite x-values, sorted ascending with points within `tol` collapsed —
+        /// so a break-even set is compared as a set, tolerant of a scan that clusters
+        /// adjacent near-zero samples.
+        fn sorted_dedup(points: &[Positive], tol: f64) -> Vec<f64> {
+            let mut xs: Vec<f64> = points
+                .iter()
+                .map(Positive::to_f64)
+                .filter(|x| x.is_finite())
+                .collect();
+            xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let mut out: Vec<f64> = Vec::new();
+            for x in xs {
+                if out.last().is_none_or(|last| (x - *last).abs() > tol) {
+                    out.push(x);
+                }
+            }
+            out
+        }
+
+        /// The (min, max) P&L of a committed expiration `GraphData::Series` — the
+        /// max-loss (as `min`) and max-profit (as `max`).
+        #[track_caller]
+        fn expiration_extent(graph: &GraphData) -> (f64, f64) {
+            match graph {
+                GraphData::Series(series) => {
+                    let mut min = f64::INFINITY;
+                    let mut max = f64::NEG_INFINITY;
+                    for y in &series.y {
+                        let v = y.to_f64().unwrap_or(0.0);
+                        min = min.min(v);
+                        max = max.max(v);
+                    }
+                    (min, max)
+                }
+                other => panic!("expected a Series, got {other:?}"),
+            }
+        }
+
+        /// Draw a committed payoff `state` into a fixed 120x40 `TestBackend` through
+        /// the real projection path and return the buffer as golden text.
+        #[track_caller]
+        fn render_payoff_golden(state: &LiveState) -> String {
+            use crate::ui::golden::{GOLDEN_HEIGHT, GOLDEN_WIDTH, buffer_to_text};
+            let theme = Theme::resolve(ThemeChoice::Auto, false);
+            let payoff = projection(state);
+            let mut term = terminal(GOLDEN_WIDTH, GOLDEN_HEIGHT);
+            let area = Rect::new(0, 0, GOLDEN_WIDTH, GOLDEN_HEIGHT);
+            match term.draw(|frame| draw(state, &payoff, frame, area, theme)) {
+                Ok(_) => {}
+                Err(e) => panic!("payoff golden draw failed: {e}"),
+            }
+            buffer_to_text(term.backend().buffer())
+        }
+
+        // --- The payoff render goldens (docs/TESTING.md §4) ------------------
+
+        #[test]
+        fn test_payoff_iron_condor_expiration_render_golden() {
+            let state = ic_state();
+            assert_eq!(
+                state.payoff_builder.curve(),
+                CurveMode::Expiration,
+                "the committed strategy defaults to the expiration curve",
+            );
+            let text = render_payoff_golden(&state);
+            crate::ui::golden::assert_golden("payoff", "iron_condor_expiration.txt", &text);
+        }
+
+        #[test]
+        fn test_payoff_iron_condor_t0_render_golden() {
+            let mut state = ic_state();
+            state.payoff_builder.toggle_curve();
+            assert_eq!(state.payoff_builder.curve(), CurveMode::TPlus0);
+            assert!(
+                projection(&state).ready().is_some(),
+                "the iron condor t+0 curve is Ready (a plausible IV per leg)",
+            );
+            let text = render_payoff_golden(&state);
+            crate::ui::golden::assert_golden("payoff", "iron_condor_t0.txt", &text);
+        }
+
+        #[test]
+        fn test_payoff_empty_render_golden() {
+            // Nothing built, nothing committed -> the deliberate "add a leg" empty
+            // state, not a blank void.
+            let state = live_state();
+            assert!(state.payoff_builder.is_empty() && state.payoff_builder.committed().is_none());
+            let text = render_payoff_golden(&state);
+            crate::ui::golden::assert_golden("payoff", "payoff_empty.txt", &text);
+        }
+
+        #[test]
+        fn test_payoff_invalid_combo_render_golden() {
+            // A deliberate INVALID-combo state: a leg at a strike absent from the
+            // chain (the un-listed ATM 100) has no mark, so `Enter` fails validation
+            // and the builder shows its inline `!` error over the leg list — it must
+            // look deliberate, never like a blank bug (docs/TESTING.md §4).
+            let mut state = ic_state();
+            state.payoff_builder.discard();
+            state.payoff_builder.append(pos(90.0), OptionStyle::Put); // valid, has a mark
+            state.payoff_builder.append(pos(IC_SPOT), OptionStyle::Call); // absent strike -> no mark
+            {
+                let LiveState {
+                    store,
+                    payoff_builder,
+                    ..
+                } = &mut state;
+                assert!(
+                    !payoff_builder.commit(store),
+                    "a no-mark leg fails validation (the invalid state)",
+                );
+            }
+            assert_eq!(
+                state.payoff_builder.errors(),
+                &[LegError::NoMark { idx: 1 }],
+                "the invalid combo reports the un-marked leg",
+            );
+            let text = render_payoff_golden(&state);
+            crate::ui::golden::assert_golden("payoff", "payoff_invalid.txt", &text);
+        }
+
+        // --- Break-even + max-profit / max-loss parity vs optionstratlib -----
+
+        #[test]
+        fn test_iron_condor_break_even_and_max_pnl_match_optionstratlib() {
+            // ChainView does not re-test optionstratlib's payoff math; it asserts that
+            // its OWN read of it (the break-evens off the expiration sign changes, and
+            // the max/min of the committed expiration series) matches optionstratlib's
+            // own `get_break_even_points` / `get_max_profit` / `get_max_loss` for the
+            // SAME iron condor (docs/TESTING.md §9).
+            let state = ic_state();
+
+            let cv_bes = sorted_dedup(
+                state.payoff_builder.break_even_points(),
+                BREAK_EVEN_TOLERANCE,
+            );
+            let (cv_min, cv_max) = expiration_extent(state.payoff_builder.active_graph_data());
+
+            let strategy = ic_custom_strategy(&state);
+            let osl_bes = match strategy.get_break_even_points() {
+                Ok(bes) => sorted_dedup(bes, BREAK_EVEN_TOLERANCE),
+                Err(e) => panic!("get_break_even_points failed: {e}"),
+            };
+            let osl_max = match strategy.get_max_profit() {
+                Ok(p) => p.to_f64(),
+                Err(e) => panic!("get_max_profit failed: {e}"),
+            };
+            let osl_loss = match strategy.get_max_loss() {
+                Ok(p) => p.to_f64(),
+                Err(e) => panic!("get_max_loss failed: {e}"),
+            };
+
+            // Break-evens: same count, matching pairwise within the tight tolerance.
+            assert_eq!(
+                cv_bes.len(),
+                osl_bes.len(),
+                "same break-even count (ChainView {cv_bes:?} vs optionstratlib {osl_bes:?})",
+            );
+            for (a, b) in cv_bes.iter().zip(osl_bes.iter()) {
+                assert!(
+                    (a - b).abs() <= BREAK_EVEN_TOLERANCE,
+                    "break-even {a} vs optionstratlib {b} (tol {BREAK_EVEN_TOLERANCE})",
+                );
+            }
+            // Max profit = max of the expiration series; max loss magnitude = |min|.
+            assert!(
+                (cv_max - osl_max).abs() <= MAX_PNL_TOLERANCE,
+                "max profit {cv_max} vs optionstratlib {osl_max} (tol {MAX_PNL_TOLERANCE})",
+            );
+            assert!(
+                ((-cv_min) - osl_loss).abs() <= MAX_PNL_TOLERANCE,
+                "max loss {} vs optionstratlib {osl_loss} (tol {MAX_PNL_TOLERANCE})",
+                -cv_min,
+            );
+        }
+
+        // --- Draw-purity consolidation: drawing recomputes nothing -----------
+
+        #[test]
+        fn test_draw_payoff_and_matrix_recomputes_nothing_and_mutates_no_state() {
+            // The milestone-level consolidation of the #24/#27 draw-purity assertions:
+            // drawing BOTH the committed payoff and the Greeks-populated chain matrix
+            // into a TestBackend runs no pricing / root-finder / build_geometry /
+            // compute_leg_greeks call and mutates no state — the committed geometry and
+            // the analytics sidecar are byte-identical across the draw. Structurally,
+            // both `draw`s take `&LiveState` (an immutable borrow), so a mutation is a
+            // compile error; these assertions document and pin that guarantee.
+            let state = ic_state();
+
+            let geometry_before = state.payoff_builder.active_graph_data().clone();
+            let break_evens_before = state.payoff_builder.break_even_points().to_vec();
+            let graph_rev_before = state.payoff_builder.graph_revision();
+            let revision_before = state.payoff_builder.revision();
+            let sidecar_before = representative_leg_greeks(&state);
+
+            // Draw the payoff (committed expiration chart) and the chain matrix.
+            let _ = render_payoff_golden(&state);
+            render_matrix(&state, GOLDEN_WIDTH_MATRIX, GOLDEN_HEIGHT_MATRIX);
+            // A tight body, still pure.
+            render_matrix(&state, 40, 12);
+
+            assert_eq!(
+                state.payoff_builder.active_graph_data(),
+                &geometry_before,
+                "draw built or mutated no payoff GraphData",
+            );
+            assert_eq!(
+                state.payoff_builder.break_even_points(),
+                break_evens_before.as_slice(),
+                "draw recomputed no break-evens",
+            );
+            assert_eq!(
+                state.payoff_builder.graph_revision(),
+                graph_rev_before,
+                "draw reprojected nothing",
+            );
+            assert_eq!(
+                state.payoff_builder.revision(),
+                revision_before,
+                "draw bumped no builder revision",
+            );
+            assert_eq!(
+                representative_leg_greeks(&state),
+                sidecar_before,
+                "draw ran no compute_leg_greeks (the sidecar is byte-identical)",
+            );
+        }
+
+        /// The fixed matrix draw size for the purity check (the golden size).
+        const GOLDEN_WIDTH_MATRIX: u16 = 120;
+        /// The fixed matrix draw height for the purity check (the golden size).
+        const GOLDEN_HEIGHT_MATRIX: u16 = 40;
+
+        /// Draw the chain matrix for `state` into a `TestBackend` (tick 0) — used only
+        /// to prove the draw mutates nothing.
+        #[track_caller]
+        fn render_matrix(state: &LiveState, width: u16, height: u16) {
+            let theme = Theme::resolve(ThemeChoice::Auto, false);
+            let mut term = terminal(width, height);
+            let area = Rect::new(0, 0, width, height);
+            match term.draw(|frame| crate::ui::chain::draw(state, frame, area, theme, 0, utc(EXP)))
+            {
+                Ok(_) => {}
+                Err(e) => panic!("matrix draw failed at {width}x{height}: {e}"),
+            }
+        }
+
+        /// A `Copy` snapshot of the 90-put leg's analytics sidecar entry, for the
+        /// before/after draw-purity identity check.
+        fn representative_leg_greeks(state: &LiveState) -> Option<crate::chain::LegGreeks> {
+            let key = InstrumentKey {
+                underlying: "IC".to_owned(),
+                expiration_utc: resolved_expiry(),
+                strike: pos(90.0),
+                style: OptionStyle::Put,
+            };
+            state.store.leg_greeks(&key).copied()
+        }
+
+        // --- render_never_panics extended to every payoff/matrix state -------
+
+        #[test]
+        fn test_every_payoff_and_matrix_state_renders_without_panic() {
+            // The milestone `render_never_panics` roll-up: the empty, invalid,
+            // committed-expiration, committed-t+0, and curve-unavailable payoff
+            // states, plus the Greeks-populated matrix, all draw without panic across
+            // sizes (docs/TESTING.md §3).
+            let committed = ic_state();
+            let mut t0 = ic_state();
+            t0.payoff_builder.toggle_curve();
+            let empty = live_state();
+            let unavailable = past_live_state(); // committed but unpriceable -> "curve unavailable"
+            for (w, h) in [(40u16, 8u16), (80, 24), (120, 40), (200, 60)] {
+                for state in [&committed, &t0, &empty, &unavailable] {
+                    let theme = Theme::resolve(ThemeChoice::Auto, false);
+                    let payoff = projection(state);
+                    let mut term = terminal(w, h);
+                    let area = Rect::new(0, 0, w, h);
+                    match term.draw(|frame| draw(state, &payoff, frame, area, theme)) {
+                        Ok(_) => {}
+                        Err(e) => panic!("payoff draw failed at {w}x{h}: {e}"),
+                    }
+                }
+                render_matrix(&committed, w, h);
+            }
+        }
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig { cases: 128, ..ProptestConfig::default() })]
 

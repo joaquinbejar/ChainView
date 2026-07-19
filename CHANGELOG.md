@@ -14,6 +14,45 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- **v0.2 acceptance gate — payoff goldens, break-even / max-P&L parity, and the
+  computed-Greeks tolerance fixture** (`src/ui/payoff.rs`, `src/ui/chain.rs`,
+  `src/providers/deribit.rs`, `tests/render/golden/payoff/`, issue #28; docs
+  TESTING §3–§5, §9, ROADMAP v0.2). Turns the v0.2 ROADMAP acceptance bullets
+  into committed, executable tests — it ADDS tests/fixtures/goldens and changes no
+  production behavior.
+  - **Payoff render goldens at the fixed 120×40**
+    (`tests/render/golden/payoff/iron_condor_expiration.txt`, `iron_condor_t0.txt`,
+    `payoff_empty.txt`, `payoff_invalid.txt`), built from a committed **iron
+    condor** (short put spread + short call spread) through the REAL path
+    (builder → commit → `active_graph_data` → `project` → `payoff::draw` into a
+    `TestBackend`), rendering both `CurveMode`s plus the empty "add a leg" and the
+    invalid "no mark" states so each looks deliberate.
+  - **Break-even + max-profit / max-loss parity vs `optionstratlib`.** For the
+    SAME iron condor, ChainView's rendered break-evens (`PayoffBuilder::break_even_points`)
+    and its max/min of the committed expiration series MATCH the `optionstratlib`
+    `CustomStrategy`'s own `get_break_even_points` / `get_max_profit` /
+    `get_max_loss` — an **exact** match (break-evens 92 / 108, max +3, loss 2) well
+    inside the tight, documented `BREAK_EVEN_TOLERANCE` (0.02) / `MAX_PNL_TOLERANCE`
+    (0.01) constants. ChainView does not re-test the upstream math (TESTING §9) — it
+    asserts its read of it agrees.
+  - **Deribit computed-Greeks-vs-venue tolerance fixture.** The #24 engine, fed the
+    **venue `mark_iv`** from the recorded `ticker_normal.json` (never a locally
+    inverted IV — garbage for a Deribit inverse / BTC-settled contract, issue #83),
+    reproduces the venue ticker's dimensionless **delta** (`DELTA_TOLERANCE` 0.02;
+    measured 0.5648 vs 0.55) and **gamma** (`GAMMA_TOLERANCE` 1e-5; measured 0.0001031
+    vs 0.0001) within tight, documented constants. **Theta / vega are scoped PENDING
+    the #83 unit-aware inverse-contract fix** (local theta −125 vs venue −9.9 ≈ 12.7×,
+    vega 30.5 vs 8.8 ≈ 3.5×, from the inverse-contract currency convention, not a
+    365× per-year/per-day slip) — asserted only finite + correctly signed, never a
+    fabricated wide tolerance.
+  - **Populated-matrix golden assertion** (`test_populated_matrix_shows_greeks_row_and_computed_origin_glyph`)
+    pins the #25 Greeks row + `~` origin glyph on the committed `chain/deribit_btc_atm`
+    golden (Δ + Θ, the responsive set at the fixed 120 width).
+  - **Draw-purity consolidation.** Drawing BOTH the committed payoff and the
+    Greeks-populated matrix into a `TestBackend` runs no pricing / root-finder /
+    `build_geometry` / `compute_leg_greeks` call and mutates no state (the committed
+    geometry + analytics sidecar are byte-identical across the draw), and
+    `render_never_panics` is extended across every payoff/matrix state and size.
 - Payoff **curve** render — the expiration and t+0 diagrams from the committed
   builder (`src/app/payoff_build.rs`, `src/app.rs`, `src/ui/payoff.rs`,
   `src/ui/view.rs`, `src/ui/driver.rs`, `src/ui/mod.rs`, issue #27; docs 05 §4,
