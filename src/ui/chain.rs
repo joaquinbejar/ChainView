@@ -1778,7 +1778,7 @@ mod tests {
     fn render_chain_golden(live: &LiveState) -> String {
         use crate::ui::golden::{GOLDEN_HEIGHT, GOLDEN_WIDTH, buffer_to_text};
         let mut term = terminal(GOLDEN_WIDTH, GOLDEN_HEIGHT);
-        match term.draw(|frame| draw(live, frame, frame.area(), theme(), 0)) {
+        match term.draw(|frame| draw(live, frame, frame.area(), theme(), 0, utc(EXP))) {
             Ok(_) => {}
             Err(e) => panic!("golden draw failed: {e}"),
         }

@@ -2,7 +2,7 @@
 name = "chainview"
 version = "0.0.1"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 authors = ["Joaquin Bejar <jb@taunais.com>"]
 description = "Terminal UI for option chains, Greeks and volatility - real-time market data and backtest replay in your terminal."
 license = "MIT"

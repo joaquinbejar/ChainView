@@ -14,6 +14,39 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- CI pipeline and supply-chain gates from v0.1 (`.github/workflows/ci.yml`,
+  `deny.toml`, `.github/pull_request_template.md`, issue #20; `docs/SECURITY.md`
+  §7.1, `docs/TESTING.md` §13.5, `docs/specs/providers.md` §0). The GitHub
+  Actions pipeline runs five jobs: **check** (the four non-negotiables on stable
+  — `fmt --all --check`, `clippy --all-targets --all-features -- -D warnings`,
+  `test --all-features`, `build --release` — mirroring `make pre-push` exactly,
+  plus the `RUSTDOCFLAGS="-D warnings" cargo doc` gate and the Spanish-text
+  guard); a pinned **MSRV 1.88** build+test job; a non-blocking **coverage** job
+  (`cargo-llvm-cov`); **audit** (`cargo audit`); and **deny** (`cargo deny
+  check` — advisories + licenses + bans + sources). CI never contacts a real
+  venue — fixtures only, and the future live smoke (#22) stays `#[ignore]`.
+  `cargo-audit` / `cargo-deny` are CI tooling, **not** added to `Cargo.toml`
+  `[dependencies]`. Supply-chain notes (no crate dependency was added):
+  - **`deny.toml` policy validated against the ACTUAL tree.** License allow-list
+    is the permissive union actually present (MIT/Apache-2.0 plus BSD-2/BSD-3/
+    ISC/Zlib/Unicode-3.0/CC0-1.0 and the single-license data crates
+    `CDLA-Permissive-2.0` and `bzip2-1.0.6`); sources are crates.io-only (a
+    substitution fails); `[bans].multiple-versions = "warn"` because the mandated
+    upstream clients (`deribit-http`/`deribit-websocket`, `optionstratlib`,
+    `ratatui`) pull disjoint dependency-tree epochs — the duplicated families
+    (`rand`/`rand_core`/`getrandom`, `hmac`/`sha2`/`digest`/`block-buffer`/
+    `crypto-common`/`cpufeatures`, `darling`, `hashbrown`, `itertools`,
+    `unicode-width`, `core-foundation`) are named in-comment.
+  - **Three documented transitive advisory ignores** (mirrored in the CI
+    `cargo audit --ignore` flags), each with a reason + re-evaluation trigger:
+    RUSTSEC-2021-0141 (`dotenv`, unmaintained), RUSTSEC-2024-0436 (`paste`,
+    unmaintained), and RUSTSEC-2026-0002 (`lru`, unsound — fixed only by the
+    separate ratatui 0.30 upgrade). All three are fix-less unmaintained/unsound
+    notices. The `time` DoS (RUSTSEC-2026-0009) is **patched, not ignored** (see
+    `### Changed`). Verified locally: `cargo deny check` and `cargo audit --deny
+    warnings` both pass green on the current tree (0 vulnerabilities).
+  - The dependency-addition **audit-note convention** is documented durably in
+    `.github/pull_request_template.md` and `docs/TESTING.md` §10.
 - Chain render goldens and the terminal escape-sequence sanitizer
   (`src/ui/theme.rs`, `src/ui/golden.rs`, `tests/render/golden/chain/`, issue #19;
   `docs/TESTING.md` §4, §13.2, `docs/SECURITY.md` §6.4). Because stdout **is** the
@@ -1009,6 +1042,17 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Changed
 
+- **MSRV raised from 1.85 to 1.88** (a minor bump per
+  [docs/SEMVER.md §MSRV](docs/SEMVER.md), issue #20; `Cargo.toml`
+  `rust-version = "1.88"`, the CI `msrv` job pin, and this callout move
+  together). Two forces required it: `optionstratlib 0.18` → `zip` →
+  `deflate64` uses the `unbounded_shr` intrinsic stabilized in Rust 1.87 (no
+  1.85-compatible `deflate64` is resolvable), and adopting `time >=0.3.47` to
+  **patch the RUSTSEC-2026-0009 DoS** (stack exhaustion) requires Rust 1.88.
+  `time` was bumped **0.3.45 → 0.3.53** (pulling `num-conv`, `time-core`, and
+  `time-macros` bumps in `Cargo.lock`), so the vulnerability is removed from the
+  tree rather than ignored. A consumer on a toolchain below 1.88 must upgrade
+  before `cargo install`.
 - Tightened the `ProviderId` grammar from `^[a-z][a-z0-9_-]{1,31}$` to
   `^[a-z][a-z0-9]*(?:[_-][a-z0-9]+)*$` (2–32 chars, `-`/`_` isolated between
   alphanumerics — no leading/trailing/adjacent separator), a strict superset

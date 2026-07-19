@@ -1685,10 +1685,9 @@ async fn run_reconnect_loop<T: DeribitTransport>(
             &cancel,
         )
         .await
+            && !fresh.is_empty()
         {
-            if !fresh.is_empty() {
-                instruments = fresh;
-            }
+            instruments = fresh;
         }
     }
 }

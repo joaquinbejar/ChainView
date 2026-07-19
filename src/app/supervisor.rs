@@ -769,10 +769,10 @@ enum JoinBudget {
 /// Fold one group member's join outcome into the first-fatal-wins cause: a
 /// panic recorded at any join is fatal even when the trigger was a clean quit.
 fn record_group_outcome(fatal: &mut Option<ExitCause>, outcome: JoinBudget) {
-    if let JoinBudget::Returned(TaskExit::Panicked) = outcome {
-        if fatal.is_none() {
-            *fatal = Some(ExitCause::TaskPanicked);
-        }
+    if let JoinBudget::Returned(TaskExit::Panicked) = outcome
+        && fatal.is_none()
+    {
+        *fatal = Some(ExitCause::TaskPanicked);
     }
 }
 

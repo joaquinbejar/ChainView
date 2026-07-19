@@ -62,10 +62,10 @@ impl KeyChord {
     /// `None` and the dispatch forwards it (or ignores it).
     #[must_use]
     pub fn from_event(key: KeyEvent) -> Option<Self> {
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
-            if let KeyCode::Char(c) = key.code {
-                return Some(Self::Ctrl(c.to_ascii_lowercase()));
-            }
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && let KeyCode::Char(c) = key.code
+        {
+            return Some(Self::Ctrl(c.to_ascii_lowercase()));
         }
         match key.code {
             KeyCode::Char(c) => Some(Self::Char(c)),
