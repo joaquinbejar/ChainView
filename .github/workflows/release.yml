@@ -158,6 +158,22 @@ jobs:
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # The tag MUST match [package].version exactly (vX.Y.Z == Cargo.toml
+      # X.Y.Z): a mismatched tag would otherwise publish the WRONG version (or
+      # fail after building every asset). Fail fast, before any publish side
+      # effect - the second-pass #58 review gate.
+      - name: Verify the tag matches Cargo.toml version
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          MANIFEST_VERSION="$(cargo metadata --no-deps --format-version 1 \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
+          if [ "$TAG_VERSION" != "$MANIFEST_VERSION" ]; then
+            echo "tag v$TAG_VERSION does not match Cargo.toml version $MANIFEST_VERSION - refusing to publish"
+            exit 1
+          fi
+          echo "tag v$TAG_VERSION == Cargo.toml $MANIFEST_VERSION"
       - name: cargo publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
