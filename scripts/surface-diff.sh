@@ -42,13 +42,17 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # The frozen public-surface source files (docs/SEMVER.md). One per line.
+# Cargo.toml is monitored for the MSRV (rust-version - a minor bump with a
+# MANDATORY release-note callout) and the feature surface, so a rust-version
+# change can never land unannotated.
 SURFACE_FILES='src/main.rs
 src/config.rs
 src/app/keymap.rs
 src/ui/theme.rs
 src/providers/mod.rs
 src/chain/identity.rs
-src/lib.rs'
+src/lib.rs
+Cargo.toml'
 
 usage() {
   cat <<'EOF'
