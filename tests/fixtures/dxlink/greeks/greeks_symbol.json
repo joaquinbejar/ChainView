@@ -1,0 +1,10 @@
+{
+  "eventType": "Greeks",
+  "eventSymbol": ".BTC250627C60000",
+  "delta": 0.55,
+  "gamma": 0.0002,
+  "theta": -12.5,
+  "vega": 40.0,
+  "rho": 8.0,
+  "volatility": 0.4922
+}

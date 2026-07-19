@@ -2928,4 +2928,128 @@ mod tests {
             }
         }
     }
+
+    // === The spot pseudo-instrument stays harmless in the store (issue #46) ====
+    //
+    // The Alpaca underlying stream rides a spot pseudo-instrument `QuoteUpdate`
+    // with a `Positive::ONE` sentinel strike (the underlying has no real chain
+    // strike, `docs/03-data-providers.md` §7.5). The #46 store fold of underlying
+    // spot into `chain.underlying_price` is NOT wired here (out of this issue's
+    // scope). Until it is, this proves the current behavior is harmless: on a
+    // liquid underlying (no genuine $1 strike) the spot update BUFFERS as an
+    // unknown strike and TTL-EXPIRES, never touching a real chain row. It must
+    // never fold onto a $1 row by a bare strike match (the collision hazard the
+    // `spot_instrument` doc-comment records).
+
+    use crate::chain::{ChainStore, MergeOutcome};
+
+    #[track_caller]
+    fn at(secs: i64) -> DateTime<Utc> {
+        match DateTime::<Utc>::from_timestamp(secs, 0) {
+            Some(t) => t,
+            None => panic!("invalid test timestamp: {secs}"),
+        }
+    }
+
+    /// A two-strike SPY chain with NO $1 strike, as an Alpaca-sourced fetch.
+    #[track_caller]
+    fn spy_fetch_without_dollar_strike() -> ChainFetch {
+        let expiry = utc_rfc3339("2026-03-20T20:00:00+00:00");
+        let mut chain = OptionChain::new("SPY", pos(402.0), expiry.to_rfc3339(), None, None);
+        for strike in [400.0, 405.0] {
+            chain.add_option(
+                pos(strike),
+                Some(pos(1.5)),
+                Some(pos(1.7)),
+                Some(pos(1.4)),
+                Some(pos(1.6)),
+                Positive::ZERO,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
+        ChainFetch::new(
+            chain,
+            ExpirySource::new("SPY", expiry, pid("alpaca")),
+            AliasCatalog::new(),
+        )
+    }
+
+    #[track_caller]
+    fn call_bid_at(store: &ChainStore, strike: Positive) -> Option<Positive> {
+        store
+            .chain()
+            .options
+            .iter()
+            .find(|o| o.strike_price == strike)
+            .and_then(|o| o.call_bid)
+    }
+
+    #[test]
+    fn test_spot_pseudo_instrument_buffers_then_ttl_expires_never_touches_a_row() {
+        let seeded_at = at(1_700_000_000);
+        let mut store = ChainStore::seed(
+            spy_fetch_without_dollar_strike(),
+            ChainSource::Merged,
+            Duration::from_secs(2),
+            seeded_at,
+        );
+
+        // The adapter no longer emits any spot pseudo-instrument (#41 removed the
+        // Positive::ONE sentinel and its emission entirely); this test now pins
+        // the STORE-level defense that made the old hazard harmless: an update
+        // keyed by a strike absent from the chain buffers and TTL-expires, never
+        // touching a real row. Build the hypothetical instrument inline.
+        let spot = Instrument {
+            key: InstrumentKey {
+                underlying: "SPY".to_owned(),
+                expiration_utc: utc_rfc3339("2026-03-20T20:00:00+00:00"),
+                strike: Positive::ONE,
+                style: OptionStyle::Call,
+            },
+            provider: pid("alpaca"),
+            native_symbol: "SPY".to_owned(),
+            stream_symbol: Some("SPY".to_owned()),
+            spec: ContractSpecFingerprint {
+                contract_multiplier: 1,
+                settlement: SettlementStyle::Cash,
+                exercise: ExerciseStyle::European,
+                quote_currency: "USD".to_owned(),
+                venue_product_code: "SPY".to_owned(),
+            },
+        };
+        assert_eq!(spot.key.strike, Positive::ONE);
+
+        let spot_quote = QuoteUpdate {
+            instrument: spot.clone(),
+            bid: Some(pos(500.25)),
+            ask: Some(pos(500.30)),
+            last: None,
+            bid_size: None,
+            ask_size: None,
+            event_time: None,
+            received_time: at(1_700_000_001),
+        };
+
+        // The $1 sentinel strike is not a real chain strike -> BUFFERED, never
+        // written onto a row.
+        assert_eq!(store.apply_quote(&spot_quote), MergeOutcome::Buffered);
+        assert_eq!(store.pending_len(), 1);
+        assert!(!store.contains_strike(Positive::ONE));
+        assert_eq!(call_bid_at(&store, pos(400.0)), Some(pos(1.5)));
+        assert_eq!(call_bid_at(&store, pos(405.0)), Some(pos(1.5)));
+
+        // A later re-poll (still no $1 strike) past the pending TTL (refresh 2 s +
+        // 2 s slack = 4 s) EXPIRES the buffered spot update — never resurrected onto
+        // a row, and the real rows are untouched.
+        store.apply_poll(spy_fetch_without_dollar_strike(), at(1_700_000_010));
+        assert_eq!(store.pending_len(), 0, "the spot update TTL-expired");
+        assert!(!store.contains_strike(Positive::ONE));
+        assert_eq!(call_bid_at(&store, pos(400.0)), Some(pos(1.5)));
+        assert_eq!(call_bid_at(&store, pos(405.0)), Some(pos(1.5)));
+    }
 }

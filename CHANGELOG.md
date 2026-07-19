@@ -14,6 +14,41 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- **The v0.4 provider fixtures, the overlay pair, and the capability-matrix
+  reconcile** (issue #46; `docs/TESTING.md` §5, `docs/03-data-providers.md` §8,
+  `docs/specs/providers.md`). The v0.4 acceptance gate — fixture normalization
+  for the landed adapters, the cross-provider overlay integration, and the
+  documented capability matrix turned into an executable assertion. Tests and
+  fixtures only; the default suite stays green and each gated adapter's tests run
+  under its feature.
+  - **DXLink symbol-stream fixtures** (`tests/fixtures/dxlink/`, new). Committed
+    `quote/quote_symbol.json` + `greeks/greeks_symbol.json` at the pinned `dxlink`
+    0.2.0 `QuoteEvent`/`GreeksEvent` wire shape (camelCase), each deserialized
+    into the real upstream event and driven through the adapter's real
+    `map_market_event` -> `route_event` decode into a `QuoteUpdate` / `GreeksRow`
+    (dxlink provider, no venue time, IV carried as-is). A `README.md` documents
+    the constructed-to-wire-shape rule, mirroring the Deribit fixtures.
+  - **The cross-provider overlay pair** (`src/providers/dxlink.rs` tests). A
+    Deribit source chain (from the committed `instruments_btc.json` fixture) is
+    joined with a DXLink overlay leg through the domain `AliasCatalog`, then a
+    decoded DXLink quote is folded through the **real `ChainStore` gate**:
+    `overlay_matching.json` (fingerprint equals the source) merges and the overlay
+    wins; `overlay_mismatched.json` (a differing `contract_multiplier`) is refused
+    with the source leg kept and the leg badged overlay-refused — the
+    `overlay_spec_gate` invariant end to end. The leg-selection rule (#42) is
+    asserted: the overlay subscribes the dxfeed **stream** legs
+    (`subscription_symbols`), never the Deribit native legs.
+  - **The Alpaca spot pseudo-instrument harmlessness proof**
+    (`src/providers/alpaca.rs` tests, #41). The underlying-spot fold into
+    `chain.underlying_price` is out of this issue's scope and is NOT wired; a new
+    store test proves the current behavior stays harmless — the `Positive::ONE`
+    spot-sentinel `QuoteUpdate` **buffers** as an unknown strike and **TTL-expires**
+    on a later poll, never touching a real chain row.
+  - **The capability-matrix reconcile** (`src/tests_capability_matrix.rs`, new).
+    A single executable table asserting every bundled adapter's live
+    `ProviderCapabilities` equals its documented `docs/03-data-providers.md` §8
+    row, cell by cell; the gated adapters are checked under their feature and the
+    deferred `ig` row is marked N/A (stays reserved, no adapter ships).
 - **The external-provider end-to-end conformance test** (`tests/integration.rs`,
   issue #45; `docs/TESTING.md` §7, `docs/03-data-providers.md` §11/§5, ADR-0006).
   Extends the `FauxProvider` conformance suite (a test-only external adapter

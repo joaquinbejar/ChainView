@@ -169,6 +169,16 @@ mod tests_integration;
 #[cfg(test)]
 mod tests_replay_integration;
 
+// In-crate v0.4 acceptance-gate capability-matrix reconcile (issue #46): the
+// single executable table asserting every bundled adapter's live
+// `ProviderCapabilities` equals its documented `docs/03-data-providers.md` §8 row
+// (cell by cell), with the gated adapters checked under their feature and the
+// IG-deferred row marked N/A. In-crate because it reads each adapter's
+// crate-private `<id>_capabilities()`, none on the public surface
+// (`docs/TESTING.md` §5, `docs/03-data-providers.md` §8).
+#[cfg(test)]
+mod tests_capability_matrix;
+
 // Bench-only support surface (issue #21), compiled ONLY under the `bench` Cargo
 // feature. It exposes the constructors the `benches/*` targets need — a
 // populated render `App`, a seeded `ChainStore`, a scripted `MarketUpdate`
