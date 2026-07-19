@@ -152,28 +152,63 @@ impl App {
     // --- Event handlers (each sets `dirty` only when it mutates state) --------
 
     fn on_key(&mut self, key: KeyEvent) {
+        // Fold a key through the GLOBAL level only. The render-loop dispatch (#13,
+        // `src/ui`) forwards a [`KeyRoute::ToScreen`] key on to the active screen's
+        // `handle_key`; a non-loop caller (this fan-in entry, and #9's tests) folds
+        // only the globals and discards the route, so an unbound key is a no-op —
+        // exactly the prior behavior.
+        let _ = self.dispatch_key_global(key);
+    }
+
+    /// The **global** half of the two-level key dispatch
+    /// (`docs/02-tui-architecture.md` §9): handle the quit / help / reconnect /
+    /// rediscover globals and the modal-help intercept, and report whether the key
+    /// was [`Consumed`](KeyRoute::Consumed) or should be forwarded
+    /// [`ToScreen`](KeyRoute::ToScreen). The render loop (#13) forwards a
+    /// `ToScreen` key to the active screen's `handle_key`; a `Consumed` key stops
+    /// here.
+    ///
+    /// **Modal help precedence (`docs/05-views-and-ux.md` §3).** While the help
+    /// overlay is open it is modal: it intercepts **every** key, honoring only `?`
+    /// and `Esc` (both close it) and swallowing the rest — no background screen
+    /// action fires behind the overlay, so a keystroke can never mutate hidden
+    /// state. Screen-switch keys (`1`–`4` / `Tab`) are the keymap's concern (#14)
+    /// and are not bound here; until then an unbound global key is forwarded to the
+    /// active screen.
+    #[must_use = "the route decides whether the active screen also handles the key"]
+    pub(crate) fn dispatch_key_global(&mut self, key: KeyEvent) -> KeyRoute {
         // On some platforms crossterm reports `Release`/`Repeat` in addition to
-        // `Press`; act on the press only so a key never fires twice.
+        // `Press`; act on the press only so a key never fires twice, and never
+        // forward a non-press to a screen.
         if key.kind != KeyEventKind::Press {
-            return;
+            return KeyRoute::Consumed;
         }
-        // `Ctrl-C` is a hard quit regardless of the character key mapping.
+        // `Ctrl-C` is a hard quit regardless of the character key mapping or the
+        // overlay state.
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             self.request_quit();
-            return;
+            return KeyRoute::Consumed;
         }
-        // `KeyCode` is crossterm's OPEN key vocabulary, not a ChainView closed
-        // set, so a catch-all for keys this skeleton does not bind is correct
-        // here — the full keybinding map and per-screen key forwarding land in
-        // #14. The ChainView closed sets (`AppEvent` / `Mode` / `LiveScreen` /
-        // `ReplayScreen`) stay wildcard-free.
+        // Modal help: intercept every key. `?`/`Esc` close it; everything else is
+        // swallowed (never forwarded to the screen behind the overlay). `KeyCode`
+        // is crossterm's OPEN key vocabulary, so a catch-all is correct — the
+        // ChainView closed sets stay wildcard-free.
+        if self.help_open {
+            if matches!(key.code, KeyCode::Char('?') | KeyCode::Esc) {
+                self.toggle_help();
+            }
+            return KeyRoute::Consumed;
+        }
+        // The bound globals. An unbound key is forwarded to the active screen (the
+        // two-level dispatch); the ChainView closed sets stay wildcard-free.
         match key.code {
             KeyCode::Char('q') => self.request_quit(),
             KeyCode::Char('?') => self.toggle_help(),
             KeyCode::Char('r') => self.request_reconnect(),
             KeyCode::Char('R') => self.request_rediscover(),
-            _ => {}
+            _ => return KeyRoute::ToScreen,
         }
+        KeyRoute::Consumed
     }
 
     fn on_resize(&mut self, _width: u16, _height: u16) {
@@ -261,6 +296,24 @@ impl App {
             }
         }
     }
+}
+
+/// The outcome of the **global** key-dispatch level
+/// (`docs/02-tui-architecture.md` §9): whether [`App::dispatch_key_global`]
+/// consumed the key, or the render loop (#13) should forward it to the active
+/// screen's `handle_key`.
+///
+/// A ChainView closed set matched exhaustively with no wildcard arm, so the
+/// render-loop forwarding site is revisited by the compiler if a routing outcome
+/// is ever added.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum KeyRoute {
+    /// The global level handled the key (quit / help / reconnect / rediscover, or
+    /// a modal-help intercept); the active screen must **not** also see it.
+    Consumed,
+    /// The global level did not bind the key; forward it to the active screen.
+    ToScreen,
 }
 
 // ---------------------------------------------------------------------------
@@ -780,11 +833,161 @@ fn merged(outcome: MergeOutcome) -> bool {
     }
 }
 
+/// Shared, crate-internal test constructors for a fully-formed [`App`] in any
+/// reachable state, used by both this module's tests and the `src/ui` render-loop
+/// tests (#13). Kept minimal and self-contained so a render test can enumerate
+/// every reachable mode × screen × load state without reaching into a provider.
+#[cfg(test)]
+pub(crate) mod tests_support {
+    use std::path::PathBuf;
+    use std::time::Duration;
+
+    use optionstratlib::chains::OptionData;
+    use optionstratlib::chains::chain::OptionChain;
+    use optionstratlib::prelude::Positive;
+    use tokio::sync::mpsc;
+
+    use super::{
+        App, LiveScreen, LiveState, Mode, ReplayScreen, ReplayState, ScreenLoad, SourceBinding,
+    };
+    use crate::chain::{
+        AliasCatalog, ChainFetch, ChainSource, ChainStore, ExpirySource, ProviderId, StreamHealth,
+    };
+    use crate::config::ThemeChoice;
+    use crate::event::Command;
+    use crate::providers::{
+        ChainCapability, ChainPollCapability, GreeksCapability, ProviderCapabilities,
+    };
+
+    const EXP: i64 = 1_700_000_000;
+
+    #[track_caller]
+    fn pid(id: &str) -> ProviderId {
+        match ProviderId::new(id) {
+            Ok(p) => p,
+            Err(e) => panic!("expected a valid provider id `{id}`: {e}"),
+        }
+    }
+
+    #[track_caller]
+    fn utc(secs: i64) -> chrono::DateTime<chrono::Utc> {
+        match chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0) {
+            Some(t) => t,
+            None => panic!("invalid test timestamp: {secs}"),
+        }
+    }
+
+    #[track_caller]
+    fn pos(value: f64) -> Positive {
+        match Positive::new(value) {
+            Ok(p) => p,
+            Err(e) => panic!("invalid test positive `{value}`: {e}"),
+        }
+    }
+
+    fn row(strike: f64) -> OptionData {
+        let mut od = OptionData {
+            strike_price: pos(strike),
+            call_bid: Some(pos(1.0)),
+            call_ask: Some(pos(1.2)),
+            put_bid: Some(pos(2.0)),
+            put_ask: Some(pos(2.4)),
+            implied_volatility: pos(0.5),
+            ..Default::default()
+        };
+        od.set_mid_prices();
+        od
+    }
+
+    fn chain_with(strikes: &[f64]) -> OptionChain {
+        let mut chain = OptionChain::new("BTC", pos(60_000.0), "2025-06-27".to_owned(), None, None);
+        for strike in strikes {
+            let _ = chain.options.insert(row(*strike));
+        }
+        chain
+    }
+
+    fn store() -> ChainStore {
+        ChainStore::seed(
+            ChainFetch::new(
+                chain_with(&[60_000.0]),
+                ExpirySource::new("BTC", utc(EXP), pid("deribit")),
+                AliasCatalog::new(),
+            ),
+            ChainSource::Merged,
+            Duration::from_secs(2),
+            utc(EXP),
+        )
+    }
+
+    /// A Deribit-like capability set: assembled chain, depth, provided Greeks — so
+    /// every live screen is reachable and every screen body can be exercised.
+    fn full_caps() -> ProviderCapabilities {
+        ProviderCapabilities::builder()
+            .chain(ChainCapability::Assemble)
+            .depth(true)
+            .greeks(GreeksCapability::Provided)
+            .chain_poll(ChainPollCapability::Poll {
+                interval_hint_secs: 2,
+            })
+            .build()
+    }
+
+    /// A live [`App`] forced onto `screen` in `load` with `help_open == help`,
+    /// plus the receiver half of its command channel so a test can assert on
+    /// emitted [`Command`]s. The screen is set on the `pub` field directly (the
+    /// reachability gate is proven separately, #9) so any screen can be rendered.
+    #[must_use]
+    pub(crate) fn live_app(
+        screen: LiveScreen,
+        load: ScreenLoad,
+        help: bool,
+    ) -> (App, mpsc::Receiver<Command>) {
+        let (tx, rx) = mpsc::channel::<Command>(8);
+        let mut live = LiveState::new(
+            SourceBinding::new(pid("deribit"), full_caps(), StreamHealth::Live),
+            store(),
+        );
+        live.screen = screen;
+        live.load = load;
+        let mut app = App::new(Mode::Live(live), ThemeChoice::Auto, tx);
+        app.help_open = help;
+        app.mark_drawn();
+        (app, rx)
+    }
+
+    /// A replay [`App`] forced onto `screen` with `help_open == help`, plus its
+    /// command-channel receiver.
+    #[must_use]
+    pub(crate) fn replay_app(screen: ReplayScreen, help: bool) -> (App, mpsc::Receiver<Command>) {
+        let (tx, rx) = mpsc::channel::<Command>(8);
+        let mut replay = ReplayState::new(PathBuf::from("/bundle"));
+        replay.screen = screen;
+        let mut app = App::new(Mode::Replay(replay), ThemeChoice::Auto, tx);
+        app.help_open = help;
+        app.mark_drawn();
+        (app, rx)
+    }
+
+    /// A live [`App`] in a given state, dropping the command receiver — for render
+    /// tests that never assert on commands.
+    #[must_use]
+    pub(crate) fn live_app_on(screen: LiveScreen, load: ScreenLoad, help: bool) -> App {
+        live_app(screen, load, help).0
+    }
+
+    /// A replay [`App`] in a given state, dropping the command receiver.
+    #[must_use]
+    pub(crate) fn replay_app_on(screen: ReplayScreen, help: bool) -> App {
+        replay_app(screen, help).0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
     use optionstratlib::OptionStyle;
     use optionstratlib::chains::OptionData;
     use optionstratlib::chains::chain::OptionChain;
@@ -792,8 +995,8 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::{
-        App, BundleLoad, LiveScreen, LiveState, Mode, OverlayBinding, Playback, ReplayScreen,
-        ReplayState, ScreenLoad, SourceBinding, is_screen_reachable,
+        App, BundleLoad, KeyRoute, LiveScreen, LiveState, Mode, OverlayBinding, Playback,
+        ReplayScreen, ReplayState, ScreenLoad, SourceBinding, is_screen_reachable,
     };
     use crate::chain::{
         AliasCatalog, ChainFetch, ChainSnapshot, ChainSource, ChainStore, ExpirySource, Instrument,
@@ -1303,6 +1506,72 @@ mod tests {
         app.on_event(key(KeyCode::Char('?')));
         assert!(!app.help_open);
         assert!(app.dirty);
+    }
+
+    // --- Two-level key dispatch: global route vs. forward-to-screen ----------
+
+    #[track_caller]
+    fn key_event(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn test_dispatch_key_global_bound_global_is_consumed() {
+        let (mut app, _rx) = live_app(full_caps());
+        // A bound global (`q`) is consumed at the global level, never forwarded.
+        assert_eq!(
+            app.dispatch_key_global(key_event(KeyCode::Char('q'))),
+            KeyRoute::Consumed
+        );
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn test_dispatch_key_global_unbound_key_routes_to_screen() {
+        let (mut app, _rx) = live_app(full_caps());
+        // An unbound key (`j`, a chain-nav key owned by the screen) is forwarded.
+        assert_eq!(
+            app.dispatch_key_global(key_event(KeyCode::Char('j'))),
+            KeyRoute::ToScreen
+        );
+        assert!(!app.dirty, "forwarding a key mutates no global state");
+    }
+
+    #[test]
+    fn test_dispatch_key_global_modal_help_swallows_and_never_forwards() {
+        let (mut app, _rx) = live_app(full_caps());
+        assert_eq!(
+            app.dispatch_key_global(key_event(KeyCode::Char('?'))),
+            KeyRoute::Consumed
+        );
+        assert!(app.help_open);
+        app.mark_drawn();
+        // With help open, an unbound key is swallowed (Consumed), NOT forwarded to
+        // the screen behind the overlay — the modal intercept.
+        assert_eq!(
+            app.dispatch_key_global(key_event(KeyCode::Char('j'))),
+            KeyRoute::Consumed
+        );
+        assert!(app.help_open, "a swallowed key leaves the overlay open");
+        assert!(!app.dirty, "a swallowed key mutates no state");
+        // `Esc` closes the modal overlay.
+        assert_eq!(
+            app.dispatch_key_global(key_event(KeyCode::Esc)),
+            KeyRoute::Consumed
+        );
+        assert!(!app.help_open);
+        assert!(app.dirty);
+    }
+
+    #[test]
+    fn test_dispatch_key_global_non_press_is_consumed_not_forwarded() {
+        let (mut app, _rx) = live_app(full_caps());
+        let release = KeyEvent::new_with_kind(
+            KeyCode::Char('j'),
+            KeyModifiers::NONE,
+            KeyEventKind::Release,
+        );
+        assert_eq!(app.dispatch_key_global(release), KeyRoute::Consumed);
     }
 
     // --- Capability-driven reachability (no ProviderId match) ----------------

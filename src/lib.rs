@@ -39,6 +39,20 @@ pub use app::{
 // The closed event set folded by the state machine and the render -> data
 // command channel (`docs/02-tui-architecture.md` §4).
 pub use event::{AppEvent, Command, SeekTo};
+// The pure draw dispatch and the synchronous, event-driven render loop
+// (`docs/02-tui-architecture.md` §7, §8, §9): `render` (pure over `&App`), the root
+// layout, the loop driver, the bounded `AppEvent` channel, and the tick/input task
+// seams the supervisor (#11) owns. These are the render-loop **composition
+// internals**; they are exposed provisionally so the loop is reachable while it has
+// no runtime caller yet (its `registry::run` composition seam is wired in #15).
+// NOTE: this is NOT the ADR-0006 external-extension surface — ADR-0006's external
+// model is `ChainViewApp::builder()…run()`, not a hand-rolled loop. Nothing here is
+// semver-frozen pre-v1.0; #15's `run()` becomes the canonical driver and revisits
+// whether these stay public or narrow to `pub(crate)`.
+pub use ui::driver::{
+    EVENT_CHANNEL_CAPACITY, event_channel, run_render_loop, spawn_input_reader, spawn_tick_task,
+};
+pub use ui::{RootLayout, layout_root, render};
 
 pub use chain::{
     AliasCatalog, CHAIN_STALE_SLACK, ChainFetch, ChainSnapshot, ChainSource, ChainStore,
