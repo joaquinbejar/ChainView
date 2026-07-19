@@ -31,7 +31,23 @@ dotenvy = "0.15"
 optionstratlib = { version = "0.18.0", default-features = false }
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 async-trait = "0.1"
-tokio = { version = "1", default-features = false, features = ["sync"] }
+# `rt`/`macros`/`time` join the existing `sync` for the task supervisor (issue
+# #11): `rt` for `JoinHandle`/`abort`/`JoinError::is_panic`, `macros` for the
+# `tokio::select!` in the supervise loop, `time` for the 2 s bounded-join
+# `tokio::time::timeout`. Still no `net`/`fs`/`rt-multi-thread` — the render loop
+# (#13) picks the runtime flavor.
+tokio = { version = "1", default-features = false, features = [
+    "sync",
+    "rt",
+    "macros",
+    "time",
+] }
+# The cancellation-token tree owned by the supervisor (issue #11): the root
+# `CancellationToken` + one `child_token` per task. `default-features = false`
+# keeps only `tokio_util::sync::CancellationToken` (no codec/io); RUSTSEC-clean,
+# MSRV 1.71 (below our 1.85). Explicit-approval addition (CLAUDE.md "Coding
+# Rules") — audit note in CHANGELOG.
+tokio-util = { version = "0.7", default-features = false }
 # The terminal stack (ADR-0001, issue #8, first TUI pull). ratatui 0.30 requires
 # rustc 1.88, above our 1.85 MSRV, so the resolver pins 0.29 — which re-exports
 # crossterm 0.28.1. `crossterm` is pinned to that same `0.28` line so cargo
@@ -42,6 +58,12 @@ crossterm = "0.28"
 
 [dev-dependencies]
 proptest = "1"
+# `test-util` enables the controllable virtual clock (`#[tokio::test(start_paused
+# = true)]`, `tokio::time::pause`/`advance`) so the supervisor's 2 s
+# bounded-join-then-abort is asserted with ZERO real wall-clock wait (issue #11).
+# Dev-only, so it never rides in the release binary; the runtime/macros/time
+# features it needs are already in the main `tokio` dependency.
+tokio = { version = "1", default-features = false, features = ["test-util"] }
 
 # The panic-injection restore harness is a bare subprocess (no libtest capture),
 # so the child panics on a normal process with the default hook as the chained

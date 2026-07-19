@@ -26,9 +26,10 @@ pub(crate) mod ui;
 // the render loop (#13) can name and drive them.
 pub use app::{
     App, BridgeSenders, BundleLoad, COMMAND_CHANNEL_CAPACITY, CONTROL_CHANNEL_CAPACITY,
-    EventBridge, LiveScreen, LiveState, LoadedReplay, Mode, OverlayBinding, PayoffBuilder,
-    Playback, ReplayScreen, ReplayState, ScreenLoad, Selection, SourceBinding, StatusLine,
-    is_screen_reachable,
+    DEFAULT_JOIN_BUDGET, EventBridge, ExitCause, ExitReporter, FinalTeardown, GuardTeardown,
+    LiveScreen, LiveState, LoadedReplay, Mode, OverlayBinding, PayoffBuilder, Playback,
+    ReplayScreen, ReplayState, ScreenLoad, Selection, SourceBinding, StatusLine, SupervisedTask,
+    Supervisor, TaskExit, TokioTask, is_screen_reachable,
 };
 // The closed event set folded by the state machine and the render -> data
 // command channel (`docs/02-tui-architecture.md` §4).
