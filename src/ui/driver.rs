@@ -607,7 +607,7 @@ mod tests {
         );
         match &app.mode {
             Mode::Replay(replay) => match &replay.bundle {
-                BundleLoad::Ready(loaded) => assert_eq!(loaded.cursor.position, 1),
+                BundleLoad::Ready(loaded) => assert_eq!(loaded.cursor.position(), 1),
                 other => panic!("expected a Ready bundle, got {other:?}"),
             },
             Mode::Live(_) => panic!("expected a replay app"),
@@ -627,7 +627,8 @@ mod tests {
             Mode::Replay(replay) => match &replay.bundle {
                 BundleLoad::Ready(loaded) => {
                     assert_eq!(
-                        loaded.cursor.position, 0,
+                        loaded.cursor.position(),
+                        0,
                         "the modal overlay swallows the key"
                     );
                 }

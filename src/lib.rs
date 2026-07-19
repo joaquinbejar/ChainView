@@ -60,11 +60,10 @@ pub use app::{
     App, BridgeSenders, BuilderLeg, BundleLoad, COMMAND_CHANNEL_CAPACITY, CONTROL_CHANNEL_CAPACITY,
     ChainViewApp, ChainViewAppBuilder, CommittedStrategy, CurveMode, DEFAULT_JOIN_BUDGET,
     EventBridge, ExitCause, ExitReporter, FinalTeardown, GuardTeardown, LegError, LegFocus,
-    LiveScreen, LiveState, LoadedReplay, Mode, OverlayBinding, PayoffBuilder,
-    ProviderSubscription, ReplayScreen, ReplayState, Resolved, ScreenLoad, Selection, Side,
-    SourceBinding, StatusLine, SupervisedTask, Supervisor, TaskExit, TokioTask,
-    is_replay_screen_reachable, is_screen_reachable, spawn_bundle_load,
-    spawn_supervised_subscription,
+    LiveScreen, LiveState, LoadedReplay, Mode, OverlayBinding, PayoffBuilder, ProviderSubscription,
+    ReplayScreen, ReplayState, Resolved, ScreenLoad, Selection, Side, SourceBinding, StatusLine,
+    SupervisedTask, Supervisor, TaskExit, TokioTask, is_replay_screen_reachable,
+    is_screen_reachable, spawn_bundle_load, spawn_supervised_subscription,
 };
 // The closed event set folded by the state machine and the render -> data
 // command channel (`docs/02-tui-architecture.md` §4).

@@ -94,6 +94,13 @@ pub use supervisor::{
 /// press still clears it sooner.
 pub const HINT_TICKS: u8 = 8;
 
+/// The one-line keybar hint flashed when a replay reload (`R`) cannot be enqueued
+/// because the command channel is full or closed — the data layer is gone
+/// (`docs/05-views-and-ux.md` §6). On such a dropped send the bundle load screen is
+/// **not** flipped to [`BundleLoad::Loading`] (which, with no load in flight, would
+/// spin forever): the prior bundle state is kept and this hint is flashed instead.
+const RELOAD_UNAVAILABLE_HINT: &str = "reload unavailable: data layer not responding";
+
 /// All state the render loop reads, as a `Live | Replay` [`Mode`] state machine
 /// (`docs/02-tui-architecture.md` §3).
 ///
@@ -477,7 +484,9 @@ impl App {
 
     fn request_reconnect(&mut self) {
         match &self.mode {
-            Mode::Live(_) => self.send_command(Command::Reconnect),
+            Mode::Live(_) => {
+                let _ = self.send_command(Command::Reconnect);
+            }
             // `r` has no replay binding — `R` reloads the bundle instead (§6).
             Mode::Replay(_) => {}
         }
@@ -485,28 +494,44 @@ impl App {
 
     fn request_rediscover(&mut self) {
         match &mut self.mode {
-            Mode::Live(_) => self.send_command(Command::Rediscover),
+            Mode::Live(_) => {
+                let _ = self.send_command(Command::Rediscover);
+            }
             Mode::Replay(replay) => {
-                // Reset to `Loading` immediately so the load screen shows the
-                // connecting state, then ask the data layer to re-open + revalidate;
-                // the fresh bundle lands back via `AppEvent::BundleLoaded`.
-                replay.begin_reload();
-                let command = Command::ReloadBundle(replay.dir.clone());
-                self.send_command(command);
-                self.dirty = true;
+                // Enqueue the reload FIRST and flip to `Loading` only once it is
+                // actually on the command channel. A dropped send (a full/closed
+                // command channel — the data layer is gone; the drop is counted by
+                // `commands_dropped`, #9) would otherwise strand the load screen at
+                // `Loading` forever with no load in flight, so on a failed send the
+                // prior bundle state is kept and a one-line hint is flashed instead
+                // (`docs/05-views-and-ux.md` §6). The fresh bundle lands back via
+                // `AppEvent::BundleLoaded`. Cloning the dir first ends the `replay`
+                // borrow so the `&mut self` send is free of an overlapping borrow.
+                let dir = replay.dir.clone();
+                if self.send_command(Command::ReloadBundle(dir)) {
+                    if let Mode::Replay(replay) = &mut self.mode {
+                        replay.begin_reload();
+                    }
+                    self.dirty = true;
+                } else {
+                    self.set_status_hint(RELOAD_UNAVAILABLE_HINT.to_owned());
+                }
             }
         }
     }
 
-    /// Enqueue a command for the data layer, non-blocking. Never blocks or awaits
-    /// the render loop. A full or closed command channel does **not** silently
-    /// swallow a recovery keypress: the failure is counted in
-    /// [`commands_dropped`](App::commands_dropped) so the status line can surface
-    /// it. A command storm is impossible (commands are user-driven, `docs/02`
+    /// Enqueue a command for the data layer, non-blocking, returning whether it was
+    /// actually enqueued. Never blocks or awaits the render loop. A full or closed
+    /// command channel does **not** silently swallow a recovery keypress: the
+    /// failure is counted in [`commands_dropped`](App::commands_dropped) (so the
+    /// status line can surface it) **and** reported as `false`, so a caller that
+    /// must not change state on a dropped send — the replay reload, which would
+    /// otherwise strand the load screen at `Loading` with no load in flight — can
+    /// react. A command storm is impossible (commands are user-driven, `docs/02`
     /// §5), so a full channel is not expected; a closed channel means the data
     /// layer is gone, which the surfaced count now makes visible rather than
     /// hidden.
-    fn send_command(&mut self, command: Command) {
+    fn send_command(&mut self, command: Command) -> bool {
         if self.tx_command.try_send(command).is_err() {
             // Checked, not `saturating_add` (a banned method): increment only
             // when it does not overflow, so the counter stops at the ceiling
@@ -515,6 +540,9 @@ impl App {
             if let Some(next) = self.commands_dropped.checked_add(1) {
                 self.commands_dropped = next;
             }
+            false
+        } else {
+            true
         }
     }
 
@@ -2995,7 +3023,7 @@ mod tests {
     #[track_caller]
     fn cursor_position(app: &App) -> u32 {
         match replay(app).loaded() {
-            Some(loaded) => loaded.cursor.position,
+            Some(loaded) => loaded.cursor.position(),
             None => panic!("expected a Ready bundle"),
         }
     }
@@ -3059,8 +3087,8 @@ mod tests {
         assert!(app.dirty, "a completed load redraws");
         match replay(&app).loaded() {
             Some(loaded) => {
-                assert_eq!(loaded.cursor.position, 0, "the cursor starts at step 0");
-                assert_eq!(loaded.cursor.end_step, 4, "end_step is n_steps - 1");
+                assert_eq!(loaded.cursor.position(), 0, "the cursor starts at step 0");
+                assert_eq!(loaded.cursor.end_step(), 4, "end_step is n_steps - 1");
                 assert!(loaded.selection.is_none(), "no drill-down yet");
             }
             None => panic!("expected Ready after a successful load"),
@@ -3098,6 +3126,33 @@ mod tests {
             Ok(Command::ReloadBundle(dir)) => assert_eq!(dir, PathBuf::from("/bundle")),
             other => panic!("expected ReloadBundle, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_shift_r_on_a_closed_command_channel_keeps_prior_state_not_loading() {
+        // Finding 2 (#34): the reload flips to `Loading` only AFTER the
+        // `ReloadBundle` command actually enqueues. A dropped send (a closed command
+        // channel — the data layer is gone) must NOT strand the load screen at
+        // `Loading` with no load in flight: the prior `Ready` bundle is kept, the
+        // drop is counted (#9), and a one-line hint is flashed.
+        let (mut app, rx) = ready_replay_app(5);
+        assert!(replay(&app).loaded().is_some(), "starts Ready");
+        // Close the command channel: the data layer is gone.
+        drop(rx);
+        app.on_event(key(KeyCode::Char('R')));
+        assert!(
+            replay(&app).loaded().is_some(),
+            "a dropped reload send keeps the prior Ready bundle, not a stuck Loading",
+        );
+        assert!(
+            !matches!(replay(&app).bundle, BundleLoad::Loading),
+            "the load screen must not spin forever with no load in flight",
+        );
+        assert_eq!(app.commands_dropped, 1, "the dropped reload is counted");
+        assert!(
+            app.status_hint.is_some(),
+            "a dropped reload flashes a hint instead of silently no-op'ing",
+        );
     }
 
     #[test]
