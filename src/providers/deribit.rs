@@ -32,9 +32,10 @@
 //!
 //! [`subscribe`](Provider::subscribe) opens the live overlay over
 //! [`deribit-websocket`](DeribitWebSocketClient): `ticker.{instrument}`
-//! (mark/IV/Greeks → [`QuoteUpdate`] + [`GreeksRow`]) and `book.{instrument}`
-//! depth (snapshots + deltas → [`DepthLadder`] with the upstream `change_id`
-//! captured for later gap-detect/resync). The **`trades.` tape is not
+//! (mark/IV/Greeks → [`QuoteUpdate`] + [`GreeksRow`]) and the grouped
+//! `book.{instrument}.{group}.{depth}.{interval}` depth (each frame a complete
+//! snapshot → [`DepthLadder`] with the upstream `change_id` captured for later
+//! gap-detect/resync). The **`trades.` tape is not
 //! subscribed** (deferred). Streamed theta/vega/rho are **deliberately
 //! discarded** — [`OptionData`](optionstratlib::chains::OptionData) cannot store
 //! them and the local sidecar owns them
@@ -1379,11 +1380,14 @@ struct GreeksPayload {
     gamma: Option<f64>,
 }
 
-/// The `book.{instrument}.{group}` notification payload
+/// The grouped `book.{instrument}.{group}.{depth}.{interval}` notification payload
 /// (`docs/03-data-providers.md` §7.1): best-first `bids`/`asks`, the upstream
-/// `change_id` for gap-detect/resync, and a venue `timestamp`. A snapshot and a
-/// delta frame share this shape; delta application is the depth screen's job
-/// (v0.5) — the adapter normalizes each frame's levels into a [`DepthLadder`].
+/// `change_id` for gap-detect/resync, and a venue `timestamp`. The grouped channel
+/// emits each frame as a **complete** aggregated snapshot of the top `depth`
+/// levels (not a raw delta), so the adapter normalizes each frame's levels directly
+/// into a full [`DepthLadder`] — no delta merge is needed. `#[serde(default)]` on
+/// every field keeps a frame that omits one (a grouped frame carries no
+/// `prev_change_id`/`type`) decoding without error.
 #[derive(Debug, Clone, Deserialize)]
 struct BookPayload {
     #[serde(default)]
@@ -1396,16 +1400,20 @@ struct BookPayload {
     asks: Vec<BookLevel>,
 }
 
-/// One order-book level, in either Deribit encoding: an aggregated
-/// `[price, amount]` pair, or a raw-book `[action, price, amount]` triple whose
-/// leading action string (`"new"`/`"change"`/`"delete"`) is ignored here — only
-/// the price and size are normalized (`docs/03-data-providers.md` §7.1).
+/// One order-book level. The subscribed **grouped** channel sends the aggregated
+/// `[price, amount]` encoding ([`Priced`](Self::Priced)). The raw-book
+/// `[action, price, amount]` triple ([`Actioned`](Self::Actioned)) — whose leading
+/// action string (`"new"`/`"change"`/`"delete"`) is ignored, only price and size
+/// normalized — is retained as a **defensive decoder** for a legacy raw frame; the
+/// adapter no longer subscribes the raw delta channel (#48,
+/// `docs/03-data-providers.md` §7.1).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 enum BookLevel {
-    /// The aggregated-book encoding: `[price, amount]`.
+    /// The aggregated grouped-book encoding: `[price, amount]` (the subscribed
+    /// shape).
     Priced([f64; 2]),
-    /// The raw-book encoding: `[action, price, amount]`.
+    /// The legacy raw-book encoding: `[action, price, amount]` (defensive only).
     Actioned(String, f64, f64),
 }
 
@@ -1474,12 +1482,14 @@ fn normalize_ticker(
     (quote_update, greeks_row)
 }
 
-/// Normalize a `book.{instrument}.{group}` payload into a [`DepthLadder`] for the
-/// resolved [`Instrument`], capturing the upstream `change_id` for later
-/// gap-detect/resync (`docs/01-domain-model.md` §5, `docs/03-data-providers.md`
-/// §7.1). A level whose price or size is `NaN`/`Inf`/negative is dropped (the
-/// rest of the ladder survives); the venue `timestamp` becomes the optional
-/// `event_time`. Levels are forwarded best-first, as Deribit sends them.
+/// Normalize a grouped `book.{instrument}.{group}.{depth}.{interval}` snapshot
+/// payload into a [`DepthLadder`] for the resolved [`Instrument`], capturing the
+/// upstream `change_id` for later gap-detect/resync (`docs/01-domain-model.md` §5,
+/// `docs/03-data-providers.md` §7.1). Each grouped frame is a complete snapshot, so
+/// the whole ladder is normalized as-is — no delta merge. A level whose price or
+/// size is `NaN`/`Inf`/negative is dropped (the rest of the ladder survives); the
+/// venue `timestamp` becomes the optional `event_time`. Levels are forwarded
+/// best-first, as Deribit sends them.
 fn normalize_book(
     instrument: &Instrument,
     payload: &BookPayload,
@@ -1832,10 +1842,43 @@ fn chain_snapshot(fetch: &ChainFetch, last_poll: DateTime<Utc>) -> ChainSnapshot
     }
 }
 
-/// The `ticker.{instrument}` and `book.{instrument}.{group}` channels to
-/// subscribe for these legs, built through the upstream [`SubscriptionChannel`]
-/// helper (never hand-formatted). **`trades.{instrument}` is intentionally not
-/// subscribed** — the trades tape is deferred (`docs/03-data-providers.md` §8).
+/// The grouped-order-book **grouping** for the depth subscription: `none` = no
+/// price aggregation. Option premiums are already fine-grained (fractions of the
+/// underlying), so no price bucketing is wanted — each level is a real price. The
+/// grouped channel (unlike `book.{instrument}.raw`) emits a *full* aggregated
+/// snapshot of the top [`BOOK_DEPTH`](self::BOOK_DEPTH) levels every
+/// [`BOOK_INTERVAL`](self::BOOK_INTERVAL), which is what makes the coalesce +
+/// overwrite fold correct (#48, `docs/03-data-providers.md` §7.1/§8).
+const BOOK_GROUP: &str = "none";
+
+/// The bounded number of price levels per side the grouped book streams (Deribit
+/// accepts `1`/`10`/`20`). Twenty is generous for an option book yet bounded, so a
+/// ladder can never grow without limit.
+const BOOK_DEPTH: &str = "20";
+
+/// The grouped-book update interval: a bucketed `100ms`, never `raw`. The `raw`
+/// interval requires authentication (Deribit server code 13778), which would break
+/// the zero-config **unauthenticated** default; `100ms` is public and every frame
+/// is a full snapshot.
+const BOOK_INTERVAL: &str = "100ms";
+
+/// The `ticker.{instrument}` and grouped
+/// `book.{instrument}.{group}.{depth}.{interval}` channels to subscribe for these
+/// legs, built through the upstream [`SubscriptionChannel`] helper (never
+/// hand-formatted). **`trades.{instrument}` is intentionally not subscribed** —
+/// the trades tape is deferred (`docs/03-data-providers.md` §8).
+///
+/// The book leg is the **grouped** channel
+/// ([`GroupedOrderBook`](SubscriptionChannel::GroupedOrderBook)), not the raw
+/// `book.{instrument}.raw` delta feed: each grouped frame is a *complete*
+/// aggregated snapshot of the top [`BOOK_DEPTH`](self::BOOK_DEPTH) levels, so the
+/// coalescing sink (latest-value-wins) and the
+/// [`DepthStore`](crate::chain::depth::DepthStore) overwrite fold to a correct book
+/// on every frame. A raw *delta* frame carries only the changed levels and would
+/// tear the book through the coalescing overwrite (#48) — hence the grouped
+/// channel. Parameters: `group` = [`BOOK_GROUP`](self::BOOK_GROUP),
+/// `depth` = [`BOOK_DEPTH`](self::BOOK_DEPTH),
+/// `interval` = [`BOOK_INTERVAL`](self::BOOK_INTERVAL).
 fn subscription_channels(instruments: &[Instrument]) -> Vec<String> {
     // Two channels (ticker + book) per leg; fall back to the leg count if the
     // doubled hint would overflow (a purely defensive capacity hint).
@@ -1847,7 +1890,15 @@ fn subscription_channels(instruments: &[Instrument]) -> Vec<String> {
     for instrument in instruments {
         let native = instrument.native_symbol.clone();
         channels.push(SubscriptionChannel::Ticker(native.clone()).channel_name());
-        channels.push(SubscriptionChannel::OrderBook(native).channel_name());
+        channels.push(
+            SubscriptionChannel::GroupedOrderBook {
+                instrument: native,
+                group: BOOK_GROUP.to_owned(),
+                depth: BOOK_DEPTH.to_owned(),
+                interval: BOOK_INTERVAL.to_owned(),
+            }
+            .channel_name(),
+        );
     }
     channels
 }
@@ -1892,9 +1943,10 @@ fn route_message(
     let received = now_utc();
 
     // The instrument is always the SECOND dotted segment for both families —
-    // `ticker.{instrument}[.{interval}]` and `book.{instrument}.{group}`. Deribit
-    // can echo a trailing interval on the ticker channel, so we must take the
-    // instrument segment and ignore any suffix (a plain `strip_prefix("ticker.")`
+    // `ticker.{instrument}[.{interval}]` and the grouped
+    // `book.{instrument}.{group}.{depth}.{interval}`. Deribit can echo a trailing
+    // interval on the ticker channel, so we must take the instrument segment and
+    // ignore any suffix (a plain `strip_prefix("ticker.")`
     // would leave `{instrument}.{interval}` and silently drop every quote).
     // Instrument names carry `-`, never `.`, so the segment split is safe.
     let instrument_segment = channel.split('.').nth(1);
@@ -3062,8 +3114,9 @@ mod tests {
 
     #[test]
     fn test_deribit_normalize_book_decodes_raw_action_levels() {
-        // The raw-book `[action, price, amount]` encoding decodes; the action tag
-        // is ignored (delta application is v0.5).
+        // The legacy raw-book `[action, price, amount]` encoding still decodes
+        // defensively; the action tag is ignored (the adapter subscribes the
+        // grouped full-snapshot channel now — #48).
         let payload = BookPayload {
             change_id: Some(2),
             timestamp: Some(1_751_011_200_000),
@@ -3340,18 +3393,29 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<MarketUpdate>(8);
         let lookup = instrument_lookup(&[sample_instrument()]);
         let mut sink = sink_from(&tx);
+        // A grouped-book frame (`book.{instrument}.{group}.{depth}.{interval}`) —
+        // the subscribed channel — carries `[price, amount]` pairs and normalizes
+        // to a full ladder. The instrument is still the SECOND dotted segment.
         let text = json!({
             "jsonrpc": "2.0",
             "method": "subscription",
             "params": {
-                "channel": "book.BTC-27JUN25-60000-C.raw",
-                "data": { "change_id": 770, "bids": [[60_000.0, 2.0]], "asks": [[60_010.0, 1.0]] }
+                "channel": "book.BTC-27JUN25-60000-C.none.20.100ms",
+                "data": {
+                    "change_id": 770,
+                    "bids": [[60_000.0, 2.0], [59_990.0, 5.0]],
+                    "asks": [[60_010.0, 1.0]]
+                }
             }
         })
         .to_string();
         assert_eq!(route_message(&text, &lookup, &mut sink), SendState::Open);
         match drain_channel(&mut rx).first() {
-            Some(MarketUpdate::Depth(ladder)) => assert_eq!(ladder.change_id, Some(770)),
+            Some(MarketUpdate::Depth(ladder)) => {
+                assert_eq!(ladder.change_id, Some(770));
+                assert_eq!(ladder.bids.len(), 2, "the grouped frame is a full ladder");
+                assert_eq!(ladder.asks.len(), 1);
+            }
             other => panic!("expected a Depth update with change_id, got {other:?}"),
         }
     }
@@ -3409,10 +3473,15 @@ mod tests {
         let channels = subscription_channels(&[sample_instrument()]);
         assert!(channels.contains(&"ticker.BTC-27JUN25-60000-C".to_owned()));
         assert!(
-            channels
+            channels.contains(&"book.BTC-27JUN25-60000-C.none.20.100ms".to_owned()),
+            "the book leg is the grouped full-snapshot channel (group/depth/interval), \
+             so the coalesce + overwrite fold is correct (#48)"
+        );
+        assert!(
+            !channels
                 .iter()
-                .any(|channel| channel.starts_with("book.BTC-27JUN25-60000-C")),
-            "the book channel is subscribed"
+                .any(|channel| channel == "book.BTC-27JUN25-60000-C.raw"),
+            "the raw delta book channel is never subscribed — it would tear the book"
         );
         assert!(
             !channels
@@ -3557,6 +3626,8 @@ mod tests {
         include_str!("../../tests/fixtures/deribit/book/book_snapshot.json");
     const FIXTURE_BOOK_DELTA: &str =
         include_str!("../../tests/fixtures/deribit/book/book_delta.json");
+    const FIXTURE_BOOK_GROUPED_SNAPSHOT: &str =
+        include_str!("../../tests/fixtures/deribit/book/book_grouped_snapshot.json");
 
     /// Parse a fixture string into a `serde_json::Value` (reached through the
     /// upstream prelude re-export, so no new dependency). Every downstream DTO is
@@ -3816,7 +3887,33 @@ mod tests {
     // --- Fixture -> DepthLadder (the WS book path) ---------------------------
 
     #[test]
+    fn test_deribit_fixture_book_grouped_snapshot_normalizes_full_ladder() {
+        // The SUBSCRIBED shape: a grouped-book frame is a complete aggregated
+        // snapshot of `[price, amount]` pairs — every level normalizes as-is into a
+        // full ladder, no delta merge (#48).
+        let payload = book_payload_fixture(FIXTURE_BOOK_GROUPED_SNAPSHOT);
+        let ladder = normalize_book(&sample_instrument(), &payload, utc_millis(0));
+        assert_eq!(ladder.change_id, Some(1_419_600_010));
+        assert_eq!(ladder.event_time, Some(utc_millis(1_751_011_200_000)));
+        assert_eq!(
+            ladder.bids.len(),
+            3,
+            "the grouped snapshot is a full ladder"
+        );
+        assert_eq!(ladder.asks.len(), 2);
+        match ladder.bids.first() {
+            Some(level) => {
+                assert_eq!(level.price, pos(0.05));
+                assert_eq!(level.size, pos(5.0));
+            }
+            None => panic!("expected the best bid at index 0"),
+        }
+    }
+
+    #[test]
     fn test_deribit_fixture_book_snapshot_normalizes_ladder() {
+        // The legacy raw-book `[action, price, amount]` encoding still decodes
+        // defensively (the adapter no longer subscribes it — #48).
         let payload = book_payload_fixture(FIXTURE_BOOK_SNAPSHOT);
         let ladder = normalize_book(&sample_instrument(), &payload, utc_millis(0));
         assert_eq!(ladder.change_id, Some(1_419_600_001));
@@ -3838,11 +3935,13 @@ mod tests {
 
     #[test]
     fn test_deribit_fixture_book_delta_captures_change_and_delete() {
+        // A legacy raw-book delta frame still decodes defensively; the grouped
+        // channel the adapter subscribes never sends this shape (#48).
         let payload = book_payload_fixture(FIXTURE_BOOK_DELTA);
         let ladder = normalize_book(&sample_instrument(), &payload, utc_millis(0));
         assert_eq!(ladder.change_id, Some(1_419_600_002));
         assert_eq!(ladder.bids.len(), 2, "both change and delete levels decode");
-        // The delete level keeps its price with size 0 (delta application is v0.5).
+        // The delete level keeps its price with size 0 (raw-delta shape, defensive).
         match ladder.bids.iter().find(|level| level.price == pos(0.049)) {
             Some(level) => assert_eq!(level.size, Positive::ZERO),
             None => panic!("the delete level should decode with size 0"),
@@ -3870,7 +3969,11 @@ mod tests {
                 let _ = normalize_ticker(&sample_instrument(), &payload, utc_millis(0));
             }
         }
-        for json in [FIXTURE_BOOK_SNAPSHOT, FIXTURE_BOOK_DELTA] {
+        for json in [
+            FIXTURE_BOOK_GROUPED_SNAPSHOT,
+            FIXTURE_BOOK_SNAPSHOT,
+            FIXTURE_BOOK_DELTA,
+        ] {
             let payload = book_payload_fixture(json);
             let _ = normalize_book(&sample_instrument(), &payload, utc_millis(0));
         }

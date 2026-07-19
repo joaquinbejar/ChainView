@@ -269,17 +269,18 @@ pub use ui::theme::{
 pub use app::keymap::{
     Action, Binding, ChainAction, Context, DepthAction, GlobalAction, GlobalCommand, KEYMAP,
     KeyChord, PayoffAction, ReplayAction, SurfaceAction, help_bindings, resolve_chain,
-    resolve_global, resolve_payoff, resolve_replay, resolve_surface,
+    resolve_depth, resolve_global, resolve_payoff, resolve_replay, resolve_surface,
 };
 
 pub use chain::{
     AliasCatalog, CHAIN_STALE_SLACK, ChainFetch, ChainSnapshot, ChainSource, ChainStore,
     ContractSpecFingerprint, DEFAULT_DIVIDEND_YIELD, DEFAULT_RISK_FREE_RATE, DIRECTION_DECAY,
-    DepthLadder, DepthLevel, ExerciseStyle, ExpirySource, FEED_DELAY_WARN, Freshness,
-    GREEKS_STALE_AFTER, GreeksOrigin, GreeksRow, GreeksSidecar, Instrument, InstrumentKey,
-    LegGreeks, LegStatus, MAX_PENDING, MarketUpdate, MergeOutcome, PricingInputs, PricingModel,
-    ProviderId, QUOTE_STALE_AFTER, QuoteClocks, QuoteSelect, QuoteUpdate, RESERVED_PROVIDER_IDS,
-    SettlementStyle, StreamHealth, TickDir, chain_stale_after, compute_leg_greeks, pending_ttl,
+    DepthBook, DepthLadder, DepthLevel, DepthStatus, DepthStore, ExerciseStyle, ExpirySource,
+    FEED_DELAY_WARN, Freshness, GREEKS_STALE_AFTER, GreeksOrigin, GreeksRow, GreeksSidecar,
+    Instrument, InstrumentKey, LegGreeks, LegStatus, MAX_DEPTH_BOOKS, MAX_PENDING, MarketUpdate,
+    MergeOutcome, PricingInputs, PricingModel, ProviderId, QUOTE_STALE_AFTER, QuoteClocks,
+    QuoteSelect, QuoteUpdate, RESERVED_PROVIDER_IDS, SettlementStyle, StreamHealth, TickDir,
+    chain_stale_after, compute_leg_greeks, depth_continues, pending_ttl,
 };
 pub use config::{CliOverrides, Config, ModeSelect, ProviderSettings, ThemeChoice};
 pub use error::{

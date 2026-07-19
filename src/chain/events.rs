@@ -173,7 +173,7 @@ pub struct DepthLadder {
 /// One price/size level in a [`DepthLadder`] (`docs/01-domain-model.md` §5).
 ///
 /// Both fields are `Positive` **display analytics**, never accounting values.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DepthLevel {
     /// The level's price (non-negative).
     pub price: Positive,

@@ -175,6 +175,19 @@ impl Theme {
             self.semantic(Color::Green, Modifier::empty())
         }
     }
+
+    /// The style for an order-book side on the depth ladder (#48): green for a
+    /// **bid** (the buy side), red for an **ask** (the sell side). Color only
+    /// reinforces — the depth screen's `bid`/`ask` text label carries the side under
+    /// `NO_COLOR`, so the ladder reads on a monochrome terminal.
+    #[must_use]
+    pub fn book_side_style(self, is_bid: bool) -> Style {
+        if is_bid {
+            self.semantic(Color::Green, Modifier::empty())
+        } else {
+            self.semantic(Color::Red, Modifier::empty())
+        }
+    }
 }
 
 // ===========================================================================
@@ -1062,12 +1075,15 @@ mod tests {
     fn test_help_overlay_marks_deferred_keys_with_version_suffix() {
         // A key that resolves and is documented but is not yet wired shows a dim
         // "(vX)" suffix in the overlay, so `?` honestly signals it is not live yet
-        // (the reviewed dead-key-trap fix). The Depth scroll key defers to v0.5.
+        // (the reviewed dead-key-trap fix). The chain SwitchExpiry / underlying / Drill
+        // keys defer with "(soon)"; the Depth scroll key is wired now (#48), so it no
+        // longer carries a marker. (The narrow 72-col overlay clips the closing paren
+        // of a marker on a long help line, so match the opening `(soon`.)
         let app = live_app_on(LiveScreen::Chain, ScreenLoad::Ready, true);
         let text = rendered_frame(&app, 100, 40);
         assert!(
-            text.contains("(v0.5)"),
-            "a deferred key shows its version marker in the overlay",
+            text.contains("(soon"),
+            "a deferred key shows its marker in the overlay",
         );
     }
 

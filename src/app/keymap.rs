@@ -417,14 +417,19 @@ pub static KEYMAP: &[Binding] = &[
         help: "Add leg to builder",
         deferred: None,
     },
-    // -- Depth (body v0.5) -----------------------------------------------------
+    // -- Depth (body wired #48) ------------------------------------------------
     Binding {
         context: Context::Live(LiveScreen::Depth),
         action: Action::Depth(DepthAction::Scroll),
-        chords: &[KeyChord::Up, KeyChord::Down],
-        keys_label: "↑↓",
+        chords: &[
+            KeyChord::Up,
+            KeyChord::Down,
+            KeyChord::Char('k'),
+            KeyChord::Char('j'),
+        ],
+        keys_label: "↑↓ / kj",
         help: "Scroll ladder",
-        deferred: Some("v0.5"),
+        deferred: None,
     },
     // -- Surface (body wired #47) ----------------------------------------------
     Binding {
@@ -677,6 +682,32 @@ pub fn resolve_payoff(chord: KeyChord) -> Option<PayoffAction> {
         | Action::Chain(_)
         | Action::Depth(_)
         | Action::Surface(_)
+        | Action::Replay(_)
+        | Action::Ascend => None,
+    }
+}
+
+/// Resolve a chord against the **depth** screen's bindings
+/// (`docs/05-views-and-ux.md` §3), or `None` when no binding matches (the dispatch
+/// then ignores the key).
+///
+/// This is the read side the depth screen's `handle_key` (`src/ui/depth.rs`) uses,
+/// so the depth dispatch and the help overlay share the one map — a bound key and
+/// its documentation cannot drift (#48). The concrete scroll direction (`↑`/`k` up vs
+/// `↓`/`j` down — the chain's `kj` idiom, #48 P3-01) is read from the resolved chord
+/// at dispatch time, the same way [`resolve_global`] derives the screen-switch slot
+/// from the pressed digit.
+#[must_use]
+pub fn resolve_depth(chord: KeyChord) -> Option<DepthAction> {
+    let binding = KEYMAP
+        .iter()
+        .find(|b| b.context == Context::Live(LiveScreen::Depth) && b.chords.contains(&chord))?;
+    match binding.action {
+        Action::Depth(action) => Some(action),
+        Action::Global(_)
+        | Action::Chain(_)
+        | Action::Surface(_)
+        | Action::Payoff(_)
         | Action::Replay(_)
         | Action::Ascend => None,
     }
@@ -1057,6 +1088,61 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_resolve_depth_every_depth_chord_resolves_and_is_documented() {
+        // Every chord in a depth-context binding resolves to a `DepthAction`
+        // (`ui::depth::handle_key` acts on it) AND appears in the help overlay, so the
+        // depth dispatch and its documentation cannot drift (#48).
+        let live = live_app_on(LiveScreen::Depth, ScreenLoad::Ready, false);
+        let documented = help_bindings(&live.mode);
+        for binding in KEYMAP
+            .iter()
+            .filter(|b| b.context == Context::Live(LiveScreen::Depth))
+        {
+            for &chord in binding.chords {
+                assert!(
+                    resolve_depth(chord).is_some(),
+                    "depth chord {chord:?} does not resolve",
+                );
+                assert!(
+                    documented.iter().any(|b| b.chords.contains(&chord)),
+                    "depth chord {chord:?} is dispatched but not in the overlay",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_resolve_depth_ignores_non_depth_chords_and_binds_scroll() {
+        // `↑↓ / kj` all resolve to the one Scroll action; the screen reads the concrete
+        // chord to decide up vs down (the chain's `kj` idiom, #48 P3-01). A non-depth
+        // chord does not resolve here.
+        assert_eq!(resolve_depth(KeyChord::Up), Some(DepthAction::Scroll));
+        assert_eq!(resolve_depth(KeyChord::Down), Some(DepthAction::Scroll));
+        assert_eq!(
+            resolve_depth(KeyChord::Char('k')),
+            Some(DepthAction::Scroll),
+            "k scrolls up (the chain idiom)",
+        );
+        assert_eq!(
+            resolve_depth(KeyChord::Char('j')),
+            Some(DepthAction::Scroll),
+            "j scrolls down (the chain idiom)",
+        );
+        assert_eq!(resolve_depth(KeyChord::Char('q')), None);
+    }
+
+    #[test]
+    fn test_keymap_depth_scroll_is_wired_not_deferred() {
+        // The depth body lands in #48, so the depth Scroll key carries no deferred
+        // marker; the overlay advertises it as live.
+        let deferred = KEYMAP
+            .iter()
+            .find(|b| b.action == Action::Depth(DepthAction::Scroll))
+            .and_then(|b| b.deferred);
+        assert_eq!(deferred, None, "depth Scroll is wired in #48");
     }
 
     #[test]
