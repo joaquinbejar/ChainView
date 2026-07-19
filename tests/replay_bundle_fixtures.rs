@@ -129,7 +129,7 @@ fn test_valid_bundle_round_trips_through_the_full_chain() {
     // The mark-to-market attribution identity holds: theta+delta+vega+spread-fees+
     // residual == step_pnl (equity delta; step 0 vs opening capital).
     let capital = match loaded.manifest.capital_config() {
-        Ok(c) => c.capital_cents,
+        Ok(c) => c.capital_cents().unwrap_or(0),
         Err(e) => panic!("capital_cents must project: {e}"),
     };
     let mut prev = capital;
@@ -304,7 +304,7 @@ fn test_dangling_position_id_drill_down_degrades_gracefully() {
     // a leg for the dangling id. Nothing panics.
     let loaded = load_ok("dangling_position_id");
     let mut cursor = TimelineCursor::new(&loaded);
-    cursor.seek(SeekTo::Step(cursor.end_step), &loaded);
+    cursor.seek(SeekTo::Step(cursor.end_step()), &loaded);
 
     let visible = cursor.visible_fills(&loaded);
     let dangling = visible
@@ -393,4 +393,188 @@ fn test_no_f64_field_on_the_decode_path_except_drawdown() {
         );
         assert!(e.drawdown <= 0.0, "equity row {i}: drawdown must be <= 0");
     }
+}
+
+// =====================================================================
+// (6) The WRITER-PRODUCED conformance anchor — the real IronCondor bundle.
+//
+// `tests/fixtures/bundle/ironcondor_conformance/` holds the five files copied
+// BYTE-IDENTICAL from IronCondor's own writer output
+// (`IronCondor/tests/fixtures/conformance/`, the `ironcondor.bundle.v1` freeze;
+// see that directory's README for the byte-identity contract). Unlike the
+// self-authored `valid/` corpus — whose bytes ChainView's own generator writes,
+// so it can only prove the reader agrees with ITSELF — this fixture is the
+// cross-repo CONFORMANCE anchor: it proves `BundleReader::open + load` reads what
+// the writer actually emits. This resolves the second-pass #110/#117 gap ("the
+// golden cannot prove bundle compatibility because it is self-authored"): the
+// bytes here are writer-produced. Any drift surfaced here is a real reader↔writer
+// contract finding, per the PR #95 maintainer ruling that the READER adapts to
+// the WRITER.
+// =====================================================================
+
+/// The writer's opaque `run_id` (a key, never re-derived) frozen into the real
+/// `manifest.json`.
+const IC_RUN_ID: &str = "c4cd155fc156f3ed1488661d9cfd448af59b216c962ea4716f76685f92b21459";
+/// Opening capital in **integer cents** — `config.initial_capital`, reconciled at
+/// IronCondor #29 (`$100,000.00`).
+const IC_CAPITAL_CENTS: i64 = 10_000_000;
+/// The short-put leg the writer closes mid-run (`manual_close` at step 2).
+const IC_CLOSED_PUT_CID: &str = "v1:SPX:1752883200000000000:490000:P";
+/// The `position_id` of that closed short put.
+const IC_CLOSED_PUT_POSITION_ID: u64 = 3;
+
+#[test]
+fn test_ironcondor_conformance_bundle_round_trips_through_the_full_chain() {
+    // Open + load the WRITER'S OWN bytes through the whole #30/#31/#32 chain: the
+    // schema gate, the resource ceilings, the footer/row_counts cross-check, the
+    // typed per-column decode, and every §5 validation step.
+    let loaded = load_ok("ironcondor_conformance");
+
+    // The manifest gate accepted the real schema tag and preserved the opaque keys.
+    assert_eq!(loaded.manifest.schema, chainview::SUPPORTED_SCHEMA);
+    assert_eq!(loaded.manifest.run_id, IC_RUN_ID);
+    assert_eq!(
+        loaded.manifest.code_version, "0.5.0",
+        "the writer's code_version is preserved verbatim (provenance only)"
+    );
+
+    // The footer/`row_counts` cross-check (enforced inside `load`) agreed with the
+    // decoded lengths: {fills:10, equity_curve:5, positions:18, greeks_attribution:5}.
+    assert_eq!(loaded.fills.len(), 10, "fills rows");
+    assert_eq!(loaded.equity.len(), 5, "equity_curve rows");
+    assert_eq!(loaded.positions.len(), 18, "positions rows");
+    assert_eq!(loaded.greeks.len(), 5, "greeks_attribution rows");
+
+    // Every fill's `strategy_run_id` equals the opaque `run_id` key (§5 step 8).
+    for (i, f) in loaded.fills.iter().enumerate() {
+        assert_eq!(
+            f.strategy_run_id, IC_RUN_ID,
+            "fills row {i}: strategy_run_id must equal the opaque run_id key"
+        );
+    }
+
+    // §5 step 5 — the equity identity at exact integer cents on the real numbers.
+    for (i, e) in loaded.equity.iter().enumerate() {
+        assert_eq!(
+            e.equity_cents,
+            e.cash_cents + e.position_value_cents,
+            "equity row {i}: equity_cents == cash_cents + position_value_cents"
+        );
+    }
+
+    // The one narrow typed projection over `config` reads `initial_capital` as
+    // unsigned integer cents, verbatim from the writer.
+    let capital = match loaded.manifest.capital_config() {
+        Ok(c) => c.capital_cents().unwrap_or(0),
+        Err(e) => panic!("capital_cents must project from the real manifest: {e}"),
+    };
+    assert_eq!(
+        capital, IC_CAPITAL_CENTS,
+        "opening capital in integer cents"
+    );
+
+    // §5 step 6 — the cross-table attribution identity on the writer's numbers:
+    // theta+delta+vega+spread-fees+residual == step_pnl (equity delta; step 0 vs
+    // opening capital).
+    let mut prev = capital;
+    for (i, (e, g)) in loaded.equity.iter().zip(loaded.greeks.iter()).enumerate() {
+        let step_pnl = e.equity_cents - prev;
+        let fees = i64::try_from(g.fees_cents).unwrap_or(i64::MAX);
+        let terms =
+            g.theta_pnl_cents + g.delta_pnl_cents + g.vega_pnl_cents + g.spread_capture_cents
+                - fees
+                + g.residual_cents;
+        assert_eq!(
+            terms, step_pnl,
+            "greeks row {i}: attribution terms must sum to the equity-delta step_pnl"
+        );
+        prev = e.equity_cents;
+    }
+
+    // The equivalence oracle is reflexive on the real writer bundle.
+    assert_eq!(
+        compare_bundles(&loaded, &loaded),
+        Ok(()),
+        "the oracle must find the writer bundle equivalent to itself"
+    );
+}
+
+#[test]
+fn test_ironcondor_conformance_drill_down_closes_the_short_put() {
+    // The realistic condor: four legs sharing trade_id 1 open at step 0, the short
+    // put (position_id 3, contract 490000:P) is manual_close'd at step 2, and the
+    // other three legs are left open_at_end. Drive the drill-down over the writer's
+    // own rows.
+    let loaded = load_ok("ironcondor_conformance");
+    let mut cursor = TimelineCursor::new(&loaded);
+
+    // Before the close (step 1), all four legs are open.
+    cursor.seek(SeekTo::Step(1), &loaded);
+    let ids_before: Vec<u64> = cursor
+        .open_positions(&loaded)
+        .iter()
+        .map(|p| p.position_id)
+        .collect();
+    assert_eq!(
+        ids_before,
+        vec![1, 2, 3, 4],
+        "all four condor legs are open before the mid-run close"
+    );
+
+    // At the last step, the manual_close short put is excluded; the three legs left
+    // open_at_end remain (ordered by position_id).
+    cursor.seek(SeekTo::Step(cursor.end_step()), &loaded);
+    let open = cursor.open_positions(&loaded);
+    let open_ids: Vec<u64> = open.iter().map(|p| p.position_id).collect();
+    assert_eq!(
+        open_ids,
+        vec![1, 2, 4],
+        "the closed short put must not appear open at the end of the tape"
+    );
+    assert!(
+        !open
+            .iter()
+            .any(|p| p.position_id == IC_CLOSED_PUT_POSITION_ID),
+        "open_positions must exclude the manual_close short put"
+    );
+
+    // The writer's terminal row for the short put carries its `exit_reason` and its
+    // contract identity, closed at step 2.
+    let terminal = loaded
+        .positions
+        .iter()
+        .find(|p| p.position_id == IC_CLOSED_PUT_POSITION_ID && p.exit_reason.is_some());
+    match terminal {
+        Some(p) => {
+            assert_eq!(p.exit_reason.as_deref(), Some("manual_close"));
+            assert_eq!(p.contract_id, IC_CLOSED_PUT_CID);
+            assert_eq!(p.step, 2, "the writer closes the short put at step 2");
+        }
+        None => panic!("the short put must carry a terminal manual_close row"),
+    }
+
+    // The close is also visible as the buy-back fills at step 2 (position_id 3 flips
+    // to the `long` side to close). The fill's own columns render without any join.
+    let close_fills: Vec<&chainview::Fill> = loaded
+        .fills
+        .iter()
+        .filter(|f| f.step == 2 && f.position_id == IC_CLOSED_PUT_POSITION_ID)
+        .collect();
+    assert!(
+        !close_fills.is_empty(),
+        "the short put close must appear as fills at step 2"
+    );
+    for f in &close_fills {
+        assert_eq!(f.contract_id, IC_CLOSED_PUT_CID, "close fill contract_id");
+    }
+}
+
+#[test]
+fn test_ironcondor_conformance_load_is_deterministic() {
+    // Two loads of the writer's committed bytes yield identical decoded tables — the
+    // reader never sorts and carries no hidden state.
+    let a = load_ok("ironcondor_conformance");
+    let b = load_ok("ironcondor_conformance");
+    assert_eq!(a, b, "loading the writer bytes twice must be identical");
+    assert_eq!(compare_bundles(&a, &b), Ok(()));
 }

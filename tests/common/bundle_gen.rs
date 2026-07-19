@@ -52,7 +52,7 @@ pub const SCHEMA: &str = "ironcondor.bundle.v1";
 pub const BAD_SCHEMA: &str = "ironcondor.bundle.v2";
 /// The opaque producer run identity — used only as a referential key.
 pub const RUN_ID: &str = "run-036-conformance";
-/// Opening capital in integer cents (the `config.capital_cents` projection).
+/// Opening capital in integer cents (the `config.initial_capital` projection).
 pub const CAPITAL_CENTS: i64 = 1_000_000;
 /// The base event time (ns since the Unix epoch); step `s` carries `BASE_TS + s`.
 pub const BASE_TS: i64 = 1_700_000_000_000_000_000;
@@ -288,7 +288,7 @@ pub fn manifest_json(schema: &str, run_id: &str, capital_cents: i64, counts: [u6
   "code_version": "0.3.0",
   "lockfile_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
   "seed": 36,
-  "config": {{ "capital_cents": {capital_cents}, "execution_mode": "realistic" }},
+  "config": {{ "initial_capital": {capital_cents}, "execution_mode": "realistic" }},
   "strategy": {{ "kind": "iron_condor", "params": {{}} }},
   "data_source": {{ "kind": "simulator", "seed": 36 }},
   "metrics": {{ "total_pnl_cents": -11415, "sharpe": 1.25 }},

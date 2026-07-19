@@ -2634,7 +2634,7 @@ mod tests {
             &|| false,
             &mut |_batch| {
                 invoked.set(true);
-                Ok(())
+                Ok(0)
             },
         );
         (result, invoked.get(), budget.used())
