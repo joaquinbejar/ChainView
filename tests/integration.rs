@@ -68,7 +68,8 @@ use chainview::{
     ProviderError, ProviderId, QuoteUpdate, RESERVED_PROVIDER_IDS, RegistryError, ScreenLoad,
     SettlementStyle, SourceBinding, StreamHealth, SubscriptionHandle, SubscriptionRequest,
     Supervisor, ThemeChoice, UnderlyingRef, ViewState, is_screen_reachable, render,
-    spawn_supervised_subscription,};
+    spawn_supervised_subscription,
+};
 
 // --- Test constructors (no unwrap/expect/indexing per the ruleset) -----------
 
