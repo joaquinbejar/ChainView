@@ -2549,6 +2549,37 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Security
 
+- **Root `SECURITY.md` vulnerability-report channel + frozen v1.0 supply-chain
+  gate** (issue #54; new root `SECURITY.md`, `deny.toml`,
+  `.github/workflows/ci.yml`, `docs/SECURITY.md` §7-§8, `docs/ROADMAP.md`). Lands
+  the intake channel a researcher actually uses and freezes the `cargo audit` /
+  `cargo deny` allow-lists as the reviewed v1.0 set. Docs + CI-config only — no
+  runtime dependency added, no runtime surface changed.
+  - **Root `SECURITY.md` (committed; GitHub Security tab).** Private
+    vulnerability reporting on `joaquinbejar/ChainView` (preferred) with an email
+    fallback (`jb@taunais.com`), a **90-day** coordinated-disclosure window, a
+    pre-1.0 supported-versions statement, an in/out-of-scope note, and a pointer
+    to the fuller `docs/SECURITY.md` posture. Acknowledgment/assessment aims are
+    stated as **best-effort** for a solo maintainer; no fabricated PGP key and no
+    contractual SLA.
+  - **`deny.toml` frozen as the reviewed v1.0 policy.** The permissive license
+    allow-list, the crates.io-only source allow-list, the `warn`-not-`deny`
+    duplicate-versions policy, and the three transitive-only advisory ignores —
+    RUSTSEC-2021-0141 (`dotenv`, unmaintained), RUSTSEC-2024-0436 (`paste`,
+    unmaintained), RUSTSEC-2026-0002 (`lru`, unsound) — are frozen **unchanged**:
+    each ignore keeps its pull-path reason and lift trigger; none is added or
+    dropped. RUSTSEC-2026-0009 (`time` DoS) stays **patched**, not ignored.
+  - **Gate proven to fail closed (real local runs, not fabricated).**
+    `cargo deny check` passes (advisories/bans/licenses/sources ok); a dry-run
+    breach of each list — dropping `Unicode-3.0` from the license allow-list
+    (exit 4), banning an in-tree crate (exit 2), emptying the source allow-list
+    (exit 8) — fails the gate. `cargo audit` with the documented `--ignore` flags
+    exits 0; **without** them it exits 1 on exactly the three recorded
+    advisories, the honest red-run proof that the audit gate is not vacuous.
+  - **Dependency-addition audit-note workflow** confirmed wired into the
+    binding pre-submission checklist (`docs/TESTING.md` §10, §13.5): a new
+    dependency carries an audit note and both supply-chain gates must pass.
+
 ## [0.0.1] - 2026-07-12
 
 ### Added

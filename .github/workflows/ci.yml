@@ -16,10 +16,13 @@
 # `cargo audit` / `cargo deny` are CI TOOLING, installed here — never added to
 # Cargo.toml [dependencies].
 #
-# Action pins: third-party actions are pinned to a major release tag. Hardening
-# to full commit-SHA pins is a follow-up (workflow supply-chain, tracked with
-# #54); the toolchain action (`dtolnay/rust-toolchain`) is used at its supported
-# `@stable` / `@1.88` refs.
+# Action pins: third-party actions are pinned to a major release tag; the
+# toolchain action (`dtolnay/rust-toolchain`) is used at its supported
+# `@stable` / `@1.88` refs. Hardening to full commit-SHA action pins is a
+# SEPARATE workflow-supply-chain follow-up and is NOT delivered by #54: that
+# issue froze the `cargo audit` / `cargo deny` allow-lists as the reviewed v1.0
+# supply-chain gate and added the root SECURITY.md intake channel (deny.toml,
+# docs/SECURITY.md §7-§8).
 
 name: CI
 
@@ -157,8 +160,11 @@ jobs:
   # transitive-only unmaintained/unsound notices with no in-MSRV fix; each
   # carries a documented reason + re-evaluation trigger in deny.toml
   # [advisories].ignore and docs/SECURITY.md §7.1 — this list mirrors deny.toml
-  # so both tools agree. The RUSTSEC-2026-0009 `time` DoS is NOT here: it was
-  # PATCHED (time 0.3.45 -> 0.3.53) via the MSRV 1.85 -> 1.88 bump, not ignored.
+  # so both tools agree, and is FROZEN as the reviewed v1.0 set (issue #54). The
+  # RUSTSEC-2026-0009 `time` DoS is NOT here: it was PATCHED (time 0.3.45 ->
+  # 0.3.53) via the MSRV 1.85 -> 1.88 bump, not ignored. Removing the three
+  # `--ignore` flags fails this job on exactly those advisories — the honest
+  # red-run proof that the gate is not vacuous.
   # --------------------------------------------------------------------------
   audit:
     name: audit (cargo audit)
@@ -274,7 +280,10 @@ jobs:
 
   # --------------------------------------------------------------------------
   # cargo deny — advisories + licenses (permissive allow-list) + bans
-  # (duplicate versions warn) + sources (crates.io only). Policy in deny.toml.
+  # (duplicate versions warn) + sources (crates.io only). Policy in deny.toml,
+  # FROZEN as the reviewed v1.0 supply-chain gate (issue #54). A dry-run breach
+  # of any allow-list (drop a license, ban an in-tree crate, empty the source
+  # list) fails this job — the gate fails closed, not vacuously.
   # --------------------------------------------------------------------------
   deny:
     name: deny (cargo deny check)
