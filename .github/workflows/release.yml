@@ -1,0 +1,221 @@
+# ChainView release pipeline (issue #58, docs/RELEASE-PROCESS.md §6).
+#
+# TAG-TRIGGERED ONLY. It fires on a `v*` tag push (the operator's single manual
+# action at a release cut, docs/RELEASE-PROCESS.md §5) and NEVER on a normal push
+# or pull_request, so it does not gate PR CI (that is `.github/workflows/ci.yml`).
+# `workflow_dispatch` allows a build+smoke REHEARSAL with no publish and no
+# release (the publish/release jobs are guarded on a `v*` tag ref).
+#
+# What it owns, in order (each side effect has a single owner — the operator never
+# runs `cargo publish` or `gh release create` by hand):
+#   1. build-assets  — build the release binary per target, SMOKE it
+#                      (`--version` / `--help`, which exit before any terminal
+#                      setup, so this is TTY-less-safe and NEVER touches a venue),
+#                      package `chainview-<target>.tar.gz` to match the
+#                      `[package.metadata.binstall]` naming, upload the artifact.
+#   2. install-smoke — `cargo install --path .` source build + `--version`/`--help`
+#                      smoke (the crates.io `cargo install chainview` path shape).
+#   3. publish       — `cargo publish` to crates.io (tag-gated), the canonical
+#                      source build; gated on build-assets + install-smoke green.
+#   4. release       — `gh release create` with notes from
+#                      `scripts/changelog-section.sh` (the same extractor as the
+#                      tag message, docs/RELEASE-PROCESS.md §4) + attach every
+#                      `chainview-<target>.tar.gz` so `cargo binstall` can discover
+#                      them.
+#
+# HONESTY (issue #58): this workflow is DORMANT automation. It runs only when a
+# human pushes a `v*` tag at the actual cut; nothing here runs on this PR. CI
+# NEVER runs a live-venue chain here — the zero-config clean-machine acceptance
+# (`cargo install chainview && chainview` rendering a live Deribit BTC chain) is a
+# post-publish release-cut STEP the operator runs by hand (docs/RELEASE-PROCESS.md
+# §12), underwritten by the offline live-path integration test (#22) in ci.yml and
+# the `#[ignore]` Deribit live smoke (docs/TESTING.md §8) the operator runs
+# pre-cut. The `CRATES_IO_TOKEN` secret must be configured before the first cut.
+#
+# Action pins mirror ci.yml: third-party actions at their major release tag; the
+# toolchain action at `@stable`. The MSRV floor (Rust 1.88) is exercised by the
+# ci.yml `msrv` job, so "installs on the MSRV" is proven there — this workflow
+# builds the shipped artifact on `@stable`.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build + smoke the release artifacts without publishing or creating a release."
+        type: boolean
+        default: true
+
+# Least privilege by default; the release job elevates to `contents: write` to
+# create the GitHub Release and upload assets.
+permissions:
+  contents: read
+
+# Never cancel an in-flight release (a partially-run publish must not be killed).
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # --------------------------------------------------------------------------
+  # Build the release binary NATIVELY per target (no cross-compilation), smoke
+  # it, and package the archive named to match [package.metadata.binstall].
+  # --------------------------------------------------------------------------
+  build-assets:
+    name: build + smoke (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          - target: x86_64-apple-darwin
+            os: macos-13
+          - target: aarch64-apple-darwin
+            os: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+      # `--locked` builds against the committed Cargo.lock for a reproducible cut.
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      # Smoke the JUST-BUILT binary. `--version` / `--help` are handled by clap and
+      # exit BEFORE the panic hook and the terminal guard, so they run cleanly on a
+      # TTY-less runner and never open the alternate screen or reach a venue.
+      - name: Smoke the built binary (--version / --help)
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="target/${{ matrix.target }}/release/chainview"
+          "$BIN" --version | tee version.txt
+          grep -q "chainview" version.txt
+          "$BIN" --help | tee help.txt
+          grep -q "chainview" help.txt
+      # Package to EXACTLY the [package.metadata.binstall] naming: one gzip tarball
+      # per target, `chainview` at the archive root.
+      - name: Package archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -czf "chainview-${{ matrix.target }}.tar.gz" \
+            -C "target/${{ matrix.target }}/release" chainview
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: chainview-${{ matrix.target }}
+          path: chainview-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+  # --------------------------------------------------------------------------
+  # The crates.io `cargo install chainview` path shape: a from-source install +
+  # the same `--version` / `--help` smoke. Bounded to one runner.
+  # --------------------------------------------------------------------------
+  install-smoke:
+    name: cargo install --path . (source build smoke)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo install --path .
+        run: cargo install --path . --locked --force
+      - name: Smoke installed binary (--version / --help)
+        shell: bash
+        run: |
+          set -euo pipefail
+          chainview --version | grep -q "chainview"
+          chainview --help | grep -q "chainview"
+
+  # --------------------------------------------------------------------------
+  # Publish to crates.io — the canonical source build. Tag-gated and gated on a
+  # green build + smoke, so a broken artifact is never published.
+  # --------------------------------------------------------------------------
+  publish:
+    name: cargo publish (crates.io)
+    needs: [build-assets, install-smoke]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The tag MUST match [package].version exactly (vX.Y.Z == Cargo.toml
+      # X.Y.Z): a mismatched tag would otherwise publish the WRONG version (or
+      # fail after building every asset). Fail fast, before any publish side
+      # effect - the second-pass #58 review gate.
+      - name: Verify the tag matches Cargo.toml version
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          MANIFEST_VERSION="$(cargo metadata --no-deps --format-version 1 \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
+          if [ "$TAG_VERSION" != "$MANIFEST_VERSION" ]; then
+            echo "tag v$TAG_VERSION does not match Cargo.toml version $MANIFEST_VERSION - refusing to publish"
+            exit 1
+          fi
+          echo "tag v$TAG_VERSION == Cargo.toml $MANIFEST_VERSION"
+      - name: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: cargo publish --locked
+
+  # --------------------------------------------------------------------------
+  # Create the GitHub Release and attach every prebuilt archive so
+  # `cargo binstall chainview` can discover them. Notes come from the SAME
+  # `scripts/changelog-section.sh <version>` extractor as the tag message
+  # (docs/RELEASE-PROCESS.md §4), so the two are byte-identical; an empty section
+  # fails the job (matching the SemVer rule that `[Unreleased]` is never empty at
+  # a tag).
+  # --------------------------------------------------------------------------
+  release:
+    name: GitHub Release + assets
+    needs: [publish]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Extract release notes for this tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          bash scripts/changelog-section.sh "$VERSION" > release-notes.md
+          test -s release-notes.md || { echo "empty release section for $VERSION"; exit 1; }
+      - name: Create release and upload assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --notes-file release-notes.md \
+            dist/*.tar.gz

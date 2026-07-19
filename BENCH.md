@@ -2,10 +2,10 @@
 
 | Field      | Value                                       |
 |------------|---------------------------------------------|
-| Status     | v0.1 baseline (HP-1…HP-3) + v0.3 HP-4 + v1.0 regression gate (section 6) |
-| Last run   | 2026-07-17 (HP-4); 2026-07-16 (HP-1…HP-3)   |
+| Status     | v0.1 baseline (HP-1…HP-3) + v0.3 HP-4 + v1.0 regression gate (section 6) + v1.0 acceptance disposition (section 7) |
+| Last run   | 2026-07-19 (§7 NFR-14 confirmation); 2026-07-17 (HP-4); 2026-07-16 (HP-1…HP-3) |
 | Suite      | `bench_render_chain`, `bench_event_fanin`, `bench_chain_merge`, `bench_replay_decode` |
-| Issue      | #21 (HP-1…HP-3), #36 (HP-4), #52 (gate)     |
+| Issue      | #21 (HP-1…HP-3), #36 (HP-4), #52 (gate), #58 (v1.0 acceptance disposition) |
 
 These are **real measured runs on the machine below** — not design targets and
 not fabricated. The no-fabricated-benchmarks rule is absolute (`CLAUDE.md`): every
@@ -196,7 +196,7 @@ into a tempdir. Figures are in **microseconds**.
 |-----|--------|--------|----------|
 | **NFR-14** — 16 ms / 60 fps p99 frame budget | draw ≤ 16 000 µs @ p99 | **MEASURED — met** | HP-1 p99 = **232 µs** (≈ 1.4 % of budget). Even render + fan-in + merge combined per frame is ≈ 713 µs p99 (sum of the three p99s), well under 16 000 µs. |
 | **NFR-15** — bounded memory under N-instrument streaming | steady-state working set O(`N`), not O(burst)/O(session) | **MEASURED — met** | HP-3 staging probe: 384 updates/burst → 128 slots, capacity flat across 2 000 bursts, store pending 0. |
-| **NFR-16** — startup-to-first-chain < 1 s (cold) | first Deribit chain < 1 s | **PENDING** | Cold, network-dominated (one public-venue round trip). Deliberately **not** measured here — the suite is fixture-fed and deterministic. Per [06 §3.3](docs/06-performance.md#33-startup-to-first-chain-hp-1--hp-3-cold) it is measured as a **distribution against a live venue** in a future `#[ignore]` smoke, never a hard CI gate. |
+| **NFR-16** — startup-to-first-chain < 1 s (cold) | first Deribit chain < 1 s | **PENDING (release-cut)** | Cold, network-dominated (one public-venue round trip). Deliberately **not** measured here — the suite is fixture-fed and deterministic. Per [06 §3.3](docs/06-performance.md#33-startup-to-first-chain-hp-1--hp-3-cold) it is measured as a **distribution against a live venue** at the release cut, on the clean machine, **post-publish** ([RELEASE-PROCESS.md §12.3](docs/RELEASE-PROCESS.md), recorded in §7 below) — never fabricated, never a hard CI gate. |
 
 ## 5. Reproduce
 
@@ -320,3 +320,83 @@ The three NFR figures (frame budget NFR-14, bounded memory NFR-15, startup
 NFR-16) are re-baselined the same way; NFR-16 stays PENDING (section 4) until a
 live-venue distribution is measured — a fabricated startup number would violate
 the no-fabricated-benchmarks rule.
+
+## 7. v1.0 acceptance disposition (issue #58)
+
+The v1.0 stability commitment ships the three NFR figures as MEASURED facts
+where they are genuinely measurable, and records the one cold, network-dominated
+figure HONESTLY as a release-cut measurement. This section states the disposition
+of each so the packaging acceptance (issue #58) makes **no** claim it cannot
+back with a number.
+
+### 7.1 NFR-14 — frame budget (16 ms/60 fps p99) — MEASURED, ships as a fact
+
+The v0.1 baseline (§3 HP-1, #21) recorded `bench_render_chain` at **p99 =
+232.319 µs** and folded a full burst through the fan-in (HP-2) at **p99 =
+96.639 µs** — the committed gate baselines (§6.2). Issue #58 **re-measured HP-1
+on the same baseline host** (§1 environment: Apple M4 Max, `rustc 1.97.1`,
+`cargo bench --features bench --bench bench_render_chain`, 2026-07-19) as a
+confirmation:
+
+| Metric | v0.1 baseline (§3, gated) | #58 confirmation re-run (2026-07-19) |
+|--------|--------------------------:|-------------------------------------:|
+| p50    |                   204.671 |                              214.143 |
+| p99    |                   232.319 |                              254.335 |
+| p99.9  |                   279.807 |                              329.215 |
+| max    |                   624.639 |                              927.231 |
+| mean (context) |               205.708 |                              216.365 |
+
+- The confirmation p99 (**254.335 µs**) is **within the committed §6.2 ceiling**
+  (baseline 232.319 + threshold 250.000 = **482.319 µs**) — ≈ **1.6 %** of the
+  16 000 µs frame budget. The small rise over the baseline is interactive-laptop
+  tail jitter (the host was under normal desktop load, incl. a concurrent bench),
+  **not** a structural regression, so this is a **confirmation, not a
+  re-baseline**: §3 and §6.2 are unchanged (a legitimate re-baseline is a
+  reviewed edit with rationale, §6.4). **NFR-14 ships as a measured fact.**
+- Coordinated omission: none applied — a render has no external arrival schedule;
+  the loop draws on demand, so this is per-draw **service time**, the quantity the
+  p99 frame budget bounds (§2).
+
+### 7.2 NFR-15 — bounded memory under N-instrument streaming — MEASURED, ships as a fact
+
+The bounded-memory face is the `bench_chain_merge` staging probe (§3 "HP-3 —
+bounded memory (NFR-15), measured", #21): a full burst pushed per round for
+**2 000** rounds against **N = 128** subscribed legs collapses **384** updates
+to **128 staged slots** (one per instrument), the staging-map capacity stays
+**flat (224)** across all 2 000 bursts, and the store pending buffer stays **0**
+(≤ `MAX_PENDING`). Memory is O(`N` subscribed), not O(burst) or O(session
+length) — a **structural, deterministic** result, demonstrated not asserted.
+**NFR-15 ships as a measured fact** on the §3 baseline; the disposition here does
+not re-run or re-baseline it (a legitimate re-baseline is a reviewed §6.4 edit).
+
+### 7.3 NFR-16 — startup-to-first-chain (cold) — PENDING, release-cut measurement
+
+Startup-to-first-chain is a **cold, network-dominated** path (process start →
+`get_instruments()` → first `ticker.` overlay → first draw), dominated by one
+round-trip to public Deribit. It is **deliberately not** in the deterministic
+fixture suite — a mocked or fabricated startup number would violate the
+no-fabricated-benchmarks rule (§intro, [06 §3.3](docs/06-performance.md#33-startup-to-first-chain-hp-1--hp-3-cold)).
+It is also **not measurable pre-publish**: `cargo install chainview` /
+`cargo binstall chainview` resolve the crates.io release, which is still the
+`v0.0.1` name-reservation placeholder until the first real publish.
+
+It is therefore recorded as a **distribution measured on the clean machine at the
+release cut, post-publish** ([RELEASE-PROCESS.md §12.3](docs/RELEASE-PROCESS.md)),
+over several cold runs, with the environment and the coordinated-omission stance
+(per-cold-start service time; the cold path has no fixed external arrival
+schedule). The table below is the shape the cut fills in — **left PENDING, not
+fabricated**:
+
+| Metric (cold startup-to-first-chain) | Value |
+|--------------------------------------|-------|
+| p50  | _PENDING — awaiting first publish + clean-machine cut_ |
+| p99  | _PENDING — awaiting first publish + clean-machine cut_ |
+| max  | _PENDING — awaiting first publish + clean-machine cut_ |
+| runs / environment | _PENDING — recorded with §1-style disclosure at the cut_ |
+
+Until the cut, the render path that produces the "first draw" is proven **offline**
+by the live-path integration test (#22, fixture → normalize → merge → render
+golden) in `ci.yml`, and the live round-trip is exercised by the operator's
+`#[ignore]` Deribit smoke ([docs/TESTING.md §8](docs/TESTING.md#8-live-provider-smoke),
+`SMOKE_DERIBIT=1`). Neither fabricates the NFR-16 number; both underwrite the
+clean-machine run that will.

@@ -13,6 +13,33 @@ keywords = ["finance", "options", "tui", "terminal", "trading"]
 categories = ["finance", "command-line-utilities"]
 include = ["src/**/*", "Cargo.toml", "README.md", "LICENSE"]
 
+# `cargo binstall` packaging (issue #58, docs/RELEASE-PROCESS.md). These keys let
+# `cargo binstall chainview` resolve the prebuilt binary attached to the GitHub
+# Release instead of a source build. They describe EXACTLY the artifacts
+# `.github/workflows/release.yml` produces at a `v*` tag cut: one gzip tarball per
+# target named `chainview-<target>.tar.gz`, with the `chainview` binary at the
+# archive root. No new runtime dependency — this is metadata only, ignored by
+# `cargo build`.
+#
+# Template tokens resolved by binstall: `{ repo }` = the `repository` field above;
+# `{ name }`/`{ bin }` = `chainview`; `{ version }` = the tag's version;
+# `{ target }` = the Rust target triple; `{ archive-suffix }` = `.tar.gz` (from
+# `pkg-fmt = "tgz"`); `{ binary-ext }` = empty on the four unix targets shipped.
+# Example resolved asset:
+#   https://github.com/joaquinbejar/ChainView/releases/download/v1.0.0/chainview-aarch64-apple-darwin.tar.gz
+#
+# HONESTY (issue #58): the crate on crates.io is still the `v0.0.1`
+# name-reservation placeholder, so `cargo binstall chainview` cannot be run
+# end-to-end until the first real publish. This block is validated for
+# WELL-FORMEDNESS — it parses through `cargo metadata` and the tokens match the
+# release-workflow naming per the binstall spec — NOT by an end-to-end install of
+# an unpublished crate. The end-to-end `cargo binstall` verification is a
+# release-cut step run post-publish (docs/RELEASE-PROCESS.md §12).
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }{ archive-suffix }"
+bin-dir = "{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
 [features]
 # `bench` gates the bench-only support surface (`src/bench_support.rs` plus the
 # `#[cfg(feature = "bench")]` constructors reached by `benches/*`). It is OFF by
