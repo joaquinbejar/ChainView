@@ -169,8 +169,14 @@ pub enum MergeOutcome {
 /// (which cannot hold it) and never persisted.
 #[derive(Debug, Clone, Default)]
 struct InstrumentState {
-    /// `max(event_time)` seen for this key — the out-of-order guard (§5.1).
+    /// `max(event_time)` of an applied update carrying a venue `event_time` — the
+    /// out-of-order guard for timestamped ticks (§5.1). Advanced only on
+    /// acceptance (see [`commit_watermark`]), never during the pre-check.
     watermark: Option<DateTime<Utc>>,
+    /// `max(received_time)` of an applied update with **no** venue `event_time` —
+    /// the receipt-order guard for timestamp-less ticks (§5.1), so they order by
+    /// arrival instead of skipping the discipline. Advanced only on acceptance.
+    receipt_watermark: Option<DateTime<Utc>>,
     /// When the last quote for this key was received (staleness clock).
     quote_received: Option<DateTime<Utc>>,
     /// The venue `event_time` of the last applied quote (feed-delay clock).
@@ -315,14 +321,28 @@ impl ChainStore {
 
         let new_strikes: HashSet<Positive> = chain.options.iter().map(|o| o.strike_price).collect();
         // Strikes present before and absent now are de-listed -> tombstone.
-        for old in &self.chain.options {
-            if !new_strikes.contains(&old.strike_price) {
-                let _ = self.tombstones.insert(old.strike_price);
-            }
+        let delisted: HashSet<Positive> = self
+            .chain
+            .options
+            .iter()
+            .map(|o| o.strike_price)
+            .filter(|strike| !new_strikes.contains(strike))
+            .collect();
+        for strike in &delisted {
+            let _ = self.tombstones.insert(*strike);
         }
         // A strike that reappears is a genuine re-listing -> clear its tombstone.
         for strike in &new_strikes {
             let _ = self.tombstones.remove(strike);
+        }
+        // A de-listed strike leaves no residue: prune its per-instrument sidecar
+        // and any overlay-refused mark, so both maps stay bounded by the live
+        // ladder, never by the number of updates.
+        if !delisted.is_empty() {
+            self.instruments
+                .retain(|key, _| !delisted.contains(&key.strike));
+            self.overlay_refused
+                .retain(|key| !delisted.contains(&key.strike));
         }
 
         self.chain = chain;
@@ -345,7 +365,8 @@ impl ChainStore {
         if let Some(outcome) = self.gate_overlay(key, &update.instrument.provider) {
             return outcome;
         }
-        if self.is_out_of_order(key, update.event_time) {
+        if self.is_out_of_order(key, update.event_time, update.received_time) {
+            self.count_dropped_stale(key);
             return MergeOutcome::DroppedOutOfOrder;
         }
         let strike = key.strike;
@@ -383,7 +404,8 @@ impl ChainStore {
         if let Some(outcome) = self.gate_overlay(key, &update.instrument.provider) {
             return outcome;
         }
-        if self.is_out_of_order(key, update.event_time) {
+        if self.is_out_of_order(key, update.event_time, update.received_time) {
+            self.count_dropped_stale(key);
             return MergeOutcome::DroppedOutOfOrder;
         }
         let strike = key.strike;
@@ -596,14 +618,13 @@ impl ChainStore {
         None
     }
 
-    /// Apply the per-instrument watermark rule (§5.1): an update whose
-    /// `event_time` is below the watermark is out-of-order (returns `true`, drop +
-    /// count); otherwise the watermark advances. An update with no `event_time`
-    /// orders by receipt and never advances the event-time watermark.
     /// Get (or first-time create) the per-instrument sidecar. The owned
     /// [`InstrumentKey`] is cloned **only** on an instrument's first sighting; every
     /// later update on the hot merge path takes the `get_mut` branch with no
-    /// allocation (the per-update path `bench_chain_merge` HP-3 targets).
+    /// allocation (the per-update path `bench_chain_merge` HP-3 targets). Reached
+    /// only from the record path (on acceptance), so a rejected / buffered /
+    /// tombstoned update never allocates a sidecar entry — the `instruments` map
+    /// stays bounded by the live ladder, not by the update count.
     fn instrument_state_mut(&mut self, key: &InstrumentKey) -> &mut InstrumentState {
         if !self.instruments.contains_key(key) {
             self.instruments
@@ -614,24 +635,41 @@ impl ChainStore {
             .unwrap_or_else(|| unreachable!("instrument state was just inserted"))
     }
 
-    fn is_out_of_order(&mut self, key: &InstrumentKey, event_time: Option<DateTime<Utc>>) -> bool {
-        let Some(event_time) = event_time else {
+    /// The per-instrument out-of-order guard (§5.1). **Read-only**: a never-seen
+    /// key has no sidecar (and so no watermark) and is never out-of-order, without
+    /// allocating a permanent entry during the pre-check. A timestamped update is
+    /// ordered against the event-time watermark; a timestamp-less update is ordered
+    /// by its `received_time` against the receipt watermark, so it follows the
+    /// ordering discipline by arrival rather than skipping it. Neither watermark is
+    /// advanced here — that happens only on acceptance (see [`commit_watermark`]),
+    /// so a rejected update never advances it.
+    fn is_out_of_order(
+        &self,
+        key: &InstrumentKey,
+        event_time: Option<DateTime<Utc>>,
+        received_time: DateTime<Utc>,
+    ) -> bool {
+        let Some(state) = self.instruments.get(key) else {
             return false;
         };
-        let state = self.instrument_state_mut(key);
-        if let Some(watermark) = state.watermark {
-            if event_time < watermark {
-                // Checked increment with a self fallback (not `u64::MAX`), so it
-                // is a checked op rather than a magic saturating call.
-                state.dropped_stale = state
-                    .dropped_stale
-                    .checked_add(1)
-                    .unwrap_or(state.dropped_stale);
-                return true;
-            }
+        match event_time {
+            Some(event_time) => state.watermark.is_some_and(|w| event_time < w),
+            None => state.receipt_watermark.is_some_and(|w| received_time < w),
         }
-        state.watermark = Some(event_time);
-        false
+    }
+
+    /// Increment one instrument's out-of-order tally. Only ever reached after
+    /// [`is_out_of_order`](Self::is_out_of_order) returned `true`, which requires a
+    /// watermark and therefore an existing sidecar — so this never allocates.
+    fn count_dropped_stale(&mut self, key: &InstrumentKey) {
+        if let Some(state) = self.instruments.get_mut(key) {
+            // Checked increment with a self fallback (not `u64::MAX`), so it is a
+            // checked op rather than a magic saturating call.
+            state.dropped_stale = state
+                .dropped_stale
+                .checked_add(1)
+                .unwrap_or(state.dropped_stale);
+        }
     }
 
     /// Patch a present row with a quote and, on success, record the receipt and
@@ -718,6 +756,12 @@ impl ChainStore {
     fn record_quote(&mut self, key: &InstrumentKey, update: &QuoteUpdate) {
         let state = self.instrument_state_mut(key);
         state.quote_received = Some(update.received_time);
+        commit_watermark(
+            &mut state.watermark,
+            &mut state.receipt_watermark,
+            update.event_time,
+            update.received_time,
+        );
         if update.event_time.is_some() {
             state.quote_event_time = update.event_time;
         }
@@ -745,6 +789,12 @@ impl ChainStore {
     fn record_greeks(&mut self, key: &InstrumentKey, update: &GreeksRow) {
         let state = self.instrument_state_mut(key);
         state.greeks_received = Some(update.received_time);
+        commit_watermark(
+            &mut state.watermark,
+            &mut state.receipt_watermark,
+            update.event_time,
+            update.received_time,
+        );
         if update.event_time.is_some() {
             state.greeks_event_time = update.event_time;
         }
@@ -902,6 +952,30 @@ fn update_dir(
                 *changed_at = Some(at);
             }
             // Equal: keep the prior direction, change time, and baseline.
+        }
+    }
+}
+
+/// Advance an accepted update's ordering watermark. A timestamped update raises
+/// the event-time watermark by `max` (so a drained-pending straggler can never
+/// lower it); a timestamp-less update raises the receipt-order watermark by its
+/// `received_time`. Called **only** on acceptance (the
+/// [`ChainStore::apply_quote`] / [`ChainStore::apply_greeks`] record paths), so a
+/// rejected, buffered, or tombstoned update never advances either watermark
+/// (§5.1).
+fn commit_watermark(
+    event_watermark: &mut Option<DateTime<Utc>>,
+    receipt_watermark: &mut Option<DateTime<Utc>>,
+    event_time: Option<DateTime<Utc>>,
+    received_time: DateTime<Utc>,
+) {
+    match event_time {
+        Some(event_time) => {
+            *event_watermark = Some((*event_watermark).map_or(event_time, |w| w.max(event_time)));
+        }
+        None => {
+            *receipt_watermark =
+                Some((*receipt_watermark).map_or(received_time, |w| w.max(received_time)));
         }
     }
 }
@@ -1575,6 +1649,103 @@ mod tests {
         assert_eq!(find_row(&store, 60_000.0).call_bid, Some(pos(2.0)));
     }
 
+    #[test]
+    fn test_rejected_update_does_not_advance_watermark() {
+        let mut store = seed_single();
+        // A applies and sets the event-time watermark to 50.
+        assert_eq!(
+            store.apply_quote(&quote(
+                "deribit",
+                60_000.0,
+                OptionStyle::Call,
+                Some(1.0),
+                Some(1.2),
+                Some(EXP + 50),
+                EXP + 100
+            )),
+            MergeOutcome::Applied
+        );
+        // B is crossed (ask < bid) and carries a LATER event_time; it is rejected
+        // and must NOT advance the watermark past 50.
+        assert_eq!(
+            store.apply_quote(&quote(
+                "deribit",
+                60_000.0,
+                OptionStyle::Call,
+                Some(2.0),
+                Some(1.5),
+                Some(EXP + 60),
+                EXP + 101
+            )),
+            MergeOutcome::DroppedCrossed
+        );
+        // C is a valid tick earlier than B but still >= 50; because B did not
+        // advance the watermark, C is a forward tick and applies (under the bug the
+        // watermark would sit at 60 and drop C as stale).
+        assert_eq!(
+            store.apply_quote(&quote(
+                "deribit",
+                60_000.0,
+                OptionStyle::Call,
+                Some(1.3),
+                Some(1.5),
+                Some(EXP + 55),
+                EXP + 102
+            )),
+            MergeOutcome::Applied
+        );
+        let after = find_row(&store, 60_000.0);
+        assert_eq!(after.call_bid, Some(pos(1.3)));
+        assert_eq!(after.call_ask, Some(pos(1.5)));
+    }
+
+    #[test]
+    fn test_no_timestamp_updates_apply_in_receipt_order() {
+        let mut store = seed_single();
+        // The first timestamp-less update applies and sets the receipt watermark.
+        assert_eq!(
+            store.apply_quote(&quote(
+                "deribit",
+                60_000.0,
+                OptionStyle::Call,
+                Some(1.5),
+                Some(1.7),
+                None,
+                EXP + 102
+            )),
+            MergeOutcome::Applied
+        );
+        // A timestamp-less update that ARRIVED earlier (lower received_time) is an
+        // out-of-order straggler by receipt and is dropped, not applied.
+        assert_eq!(
+            store.apply_quote(&quote(
+                "deribit",
+                60_000.0,
+                OptionStyle::Call,
+                Some(2.0),
+                Some(2.2),
+                None,
+                EXP + 101
+            )),
+            MergeOutcome::DroppedOutOfOrder
+        );
+        assert_eq!(find_row(&store, 60_000.0).call_bid, Some(pos(1.5)));
+        // A later-arriving timestamp-less update applies (latest-value-wins).
+        assert_eq!(
+            store.apply_quote(&quote(
+                "deribit",
+                60_000.0,
+                OptionStyle::Call,
+                Some(2.5),
+                Some(2.7),
+                None,
+                EXP + 103
+            )),
+            MergeOutcome::Applied
+        );
+        assert_eq!(find_row(&store, 60_000.0).call_bid, Some(pos(2.5)));
+    }
+
     // --- Price direction: retained baseline, decay, stale-clear --------------
 
     #[test]
@@ -1845,6 +2016,102 @@ mod tests {
         }
         assert_eq!(store.pending_len(), MAX_PENDING);
         assert_eq!(store.dropped_overflow(), 300 - MAX_PENDING as u64);
+    }
+
+    #[test]
+    fn test_rejected_key_burst_does_not_grow_instrument_sidecar() {
+        let mut store = seed_single(); // only 60000 is listed
+        // A burst of updates for never-listed strikes, each carrying a venue
+        // event_time, are buffered (unknown strike) then dropped on overflow. The
+        // ordering pre-check must not allocate a sidecar for a never-accepted key,
+        // so `instruments` stays empty no matter how many keys stream through.
+        for i in 0u32..300 {
+            let outcome = store.apply_quote(&quote(
+                "deribit",
+                70_000.0 + f64::from(i),
+                OptionStyle::Call,
+                Some(1.0),
+                Some(1.2),
+                Some(EXP + 200 + i64::from(i)),
+                EXP + 200 + i64::from(i),
+            ));
+            assert_eq!(outcome, MergeOutcome::Buffered);
+        }
+        // The pending buffer is capped and the sidecar never grew for the rejected
+        // keys — under the bug it would hold 300 entries, one per rejected key.
+        assert_eq!(store.pending_len(), MAX_PENDING);
+        assert_eq!(store.instruments.len(), 0);
+        // Only an ACCEPTED update for a listed strike creates sidecar state.
+        assert_eq!(
+            store.apply_quote(&quote(
+                "deribit",
+                60_000.0,
+                OptionStyle::Call,
+                Some(1.0),
+                Some(1.2),
+                Some(EXP + 600),
+                EXP + 600
+            )),
+            MergeOutcome::Applied
+        );
+        assert_eq!(store.instruments.len(), 1);
+    }
+
+    #[test]
+    fn test_delisted_strike_prunes_instrument_sidecar() {
+        let mut store = ChainStore::seed(
+            fetch_for(
+                chain_with(&[
+                    row(60_000.0, Some(1.0), Some(1.2), Some(2.0), Some(2.4)),
+                    row(61_000.0, Some(1.0), Some(1.2), Some(2.0), Some(2.4)),
+                ]),
+                "deribit",
+                AliasCatalog::new(),
+            ),
+            ChainSource::Merged,
+            refresh(),
+            utc(EXP),
+        );
+        // Give 61000 sidecar state via an accepted update.
+        assert_eq!(
+            store.apply_quote(&quote(
+                "deribit",
+                61_000.0,
+                OptionStyle::Call,
+                Some(1.5),
+                Some(1.7),
+                Some(EXP + 10),
+                EXP + 100
+            )),
+            MergeOutcome::Applied
+        );
+        assert_eq!(store.instruments.len(), 1);
+        // Poll away 61000 -> tombstone AND prune its sidecar residue.
+        store.apply_poll(
+            fetch_for(
+                chain_with(&[row(60_000.0, Some(1.0), Some(1.2), Some(2.0), Some(2.4))]),
+                "deribit",
+                AliasCatalog::new(),
+            ),
+            utc(EXP + 2),
+        );
+        assert!(store.is_tombstoned(pos(61_000.0)));
+        assert_eq!(store.instruments.len(), 0);
+        // A later update for the de-listed strike is dropped and does not recreate
+        // sidecar state.
+        assert_eq!(
+            store.apply_quote(&quote(
+                "deribit",
+                61_000.0,
+                OptionStyle::Call,
+                Some(9.0),
+                Some(9.2),
+                Some(EXP + 11),
+                EXP + 103
+            )),
+            MergeOutcome::DroppedTombstoned
+        );
+        assert_eq!(store.instruments.len(), 0);
     }
 
     #[test]
