@@ -230,6 +230,49 @@ jobs:
         run: bash scripts/check-perf.sh --run --only bench_render_chain --report-only
 
   # --------------------------------------------------------------------------
+  # fuzz — the v1.0 parser-surface fuzz smoke (issue #53, docs/TESTING.md §13.4,
+  # docs/SECURITY.md §7). A bounded, time-boxed pass over the fixture-derived
+  # seed corpus that FAILS on any crash/panic — distinct from an open-ended
+  # campaign. cargo-fuzz needs a NIGHTLY toolchain, so this is a SEPARATE job
+  # from the MSRV/stable non-negotiables. The `fuzz/` crate is its own workspace,
+  # excluded from the default build; `libfuzzer-sys`/`tempfile` are dev tooling
+  # there, never in the root [dependencies], so audit/deny over the shipped tree
+  # are unaffected. `timeout-minutes` bounds the nightly build + two 60s runs.
+  # --------------------------------------------------------------------------
+  fuzz:
+    name: fuzz (nightly parser-surface smoke)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nightly toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          # The ASan-instrumented fuzz build needs a DYNAMIC-libc target: on
+          # this runner cargo-fuzz otherwise defaults to x86_64-unknown-linux-musl,
+          # whose statically linked libc is rejected by the sanitizer
+          # ("sanitizer is incompatible with statically linked libc"). Pin the
+          # gnu target here (and pass it to `cargo fuzz run` below) so the smoke
+          # builds against dynamic libc.
+          targets: x86_64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      # Seeds are DERIVED from the committed provider + replay fixtures, never
+      # hand-typed bytes, so the fuzzer explores from valid shapes (§13.4).
+      - name: Seed the corpora from fixtures
+        run: bash fuzz/gen_corpus.sh
+      # A bounded smoke per target — the -rss_limit_mb backstop sits above the
+      # reader's own MAX_WORKING_SET ceiling so only a true runaway aborts.
+      # --target pins the sanitizer-compatible gnu triple (see the toolchain step).
+      - name: fuzz_replay_decode (60s smoke)
+        run: cargo fuzz run fuzz_replay_decode --target x86_64-unknown-linux-gnu -- -max_total_time=60 -rss_limit_mb=3072
+      - name: fuzz_provider_normalize (60s smoke)
+        run: cargo fuzz run fuzz_provider_normalize --target x86_64-unknown-linux-gnu -- -max_total_time=60
+
+  # --------------------------------------------------------------------------
   # cargo deny — advisories + licenses (permissive allow-list) + bans
   # (duplicate versions warn) + sources (crates.io only). Policy in deny.toml.
   # --------------------------------------------------------------------------

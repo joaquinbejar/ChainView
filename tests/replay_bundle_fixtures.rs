@@ -90,6 +90,7 @@ fn regenerate_committed_fixtures() {
     bundle_gen::write_truncated(&root.join("truncated"));
     bundle_gen::write_decompression_bomb(&root.join("decompression_bomb"));
     bundle_gen::write_dangling_position_id(&root.join("dangling_position_id"));
+    bundle_gen::write_malformed_arrow_schema(&root.join("malformed_arrow_schema"));
 }
 
 // =====================================================================
@@ -248,6 +249,35 @@ fn test_truncated_is_typed_decode_error_not_panic() {
     match load_with("truncated", ResourceCeilings::default()) {
         Err(BundleError::Parquet(_)) | Err(BundleError::Invariant(_)) => {}
         other => panic!("a truncated table must be a typed Parquet/Invariant error, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_malformed_arrow_schema_is_typed_parquet_error_not_panic() {
+    // The #53 fuzz-found crash: `greeks_attribution.parquet` carries a malformed
+    // embedded `ARROW:schema` flatbuffer that panics the upstream `arrow-ipc`
+    // decoder in `get_data_type`, reached through `ParquetRecordBatchReaderBuilder::
+    // try_new` while `load` reads the footer. Before the `catch_unwind` boundary in
+    // `src/replay/mod.rs`, that panic ESCAPED the reader (a `.map_err` cannot catch a
+    // `panic!`); this asserts it is now a typed `BundleError::Parquet` — never a
+    // panic — closing the crash->regression loop (`docs/TESTING.md` §13.3,
+    // `docs/SECURITY.md` §6.2). The three sibling tables and the manifest are valid,
+    // so the reject is the greeks decode specifically, not an earlier stage.
+    match load_with("malformed_arrow_schema", ResourceCeilings::default()) {
+        Err(BundleError::Parquet(detail)) => {
+            assert!(
+                detail.starts_with("greeks_attribution.parquet"),
+                "the reject must name the malformed greeks table: {detail}"
+            );
+            assert!(
+                detail.contains("panicked"),
+                "the decoder-panic boundary produced this typed error: {detail}"
+            );
+        }
+        other => panic!(
+            "a malformed embedded Arrow schema must be a typed Parquet error \
+             (not an escaping panic), got {other:?}"
+        ),
     }
 }
 

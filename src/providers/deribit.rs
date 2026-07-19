@@ -1292,6 +1292,150 @@ impl BenchProducerStaging {
 }
 
 // ---------------------------------------------------------------------------
+// Fuzz-only normalize entry points (#53, docs/TESTING.md §13.4) — the provider
+// parser surface driven with arbitrary bytes.
+//
+// Compiled ONLY under the `fuzz` Cargo feature and reached exclusively by the
+// separate `fuzz/` cargo-fuzz crate through `crate::fuzz_support`. Each entry
+// deserializes arbitrary bytes into one of the adapter's own `Deserialize` DTOs
+// and drives the REAL normalize seam (`normalize_ticker` / `normalize_book` /
+// `instrument_key_from_name`), asserting the produced value is a valid domain
+// numeric — so a bad byte string is a normal reject (return) or a well-formed
+// domain row, never a panic and never a `NaN`/`Inf`/negative reaching a
+// `QuoteUpdate` / `GreeksRow` / `DepthLadder` (governance item 2). A broken
+// invariant panics — the implicit libfuzzer contract.
+// ---------------------------------------------------------------------------
+
+/// A fixed synthetic subscribed [`Instrument`] the streaming normalizers key
+/// against under fuzzing — no socket, no wall clock. Its shape mirrors what a
+/// real `subscribe` resolves, so the fuzzed payload runs the true seam.
+#[cfg(feature = "fuzz")]
+fn fuzz_instrument() -> Instrument {
+    Instrument {
+        key: InstrumentKey {
+            underlying: "BTC".to_owned(),
+            expiration_utc: DateTime::<Utc>::from_timestamp_millis(1_751_011_200_000)
+                .unwrap_or(DateTime::<Utc>::MIN_UTC),
+            strike: Positive::new(60_000.0).unwrap_or(Positive::ZERO),
+            style: OptionStyle::Call,
+        },
+        provider: deribit_provider_id(),
+        native_symbol: "BTC-27JUN25-60000-C".to_owned(),
+        stream_symbol: None,
+        spec: ContractSpecFingerprint {
+            contract_multiplier: 1,
+            settlement: SettlementStyle::Cash,
+            exercise: ExerciseStyle::European,
+            quote_currency: "USD".to_owned(),
+            venue_product_code: "BTC".to_owned(),
+        },
+    }
+}
+
+/// A fixed synthetic `received_time` for fuzzing (no wall-clock read), so the
+/// normalize seam is deterministic across runs.
+#[cfg(feature = "fuzz")]
+fn fuzz_received() -> DateTime<Utc> {
+    DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap_or(DateTime::<Utc>::MIN_UTC)
+}
+
+/// Every present price/size/`last` in a fuzz-produced [`QuoteUpdate`] is a valid
+/// (finite, non-negative) [`Positive`], and the bid/ask is never crossed — the
+/// checked-conversion contract at the `f64` seam.
+#[cfg(feature = "fuzz")]
+fn assert_quote_valid(quote: &QuoteUpdate) {
+    for p in [
+        quote.bid,
+        quote.ask,
+        quote.last,
+        quote.bid_size,
+        quote.ask_size,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        assert!(
+            p >= Positive::ZERO,
+            "a fuzzed quote produced a non-domain Positive"
+        );
+    }
+    if let (Some(bid), Some(ask)) = (quote.bid, quote.ask) {
+        assert!(
+            ask >= bid,
+            "a fuzzed quote must never yield a crossed bid/ask"
+        );
+    }
+}
+
+/// A fuzz-produced [`GreeksRow`] carries a valid IV and honours the documented
+/// theta/vega/rho discard (`docs/01-domain-model.md` §7): the Deribit ticker
+/// seam forwards only delta/gamma.
+#[cfg(feature = "fuzz")]
+fn assert_greeks_valid(greeks: &GreeksRow) {
+    if let Some(iv) = greeks.iv {
+        assert!(
+            iv >= Positive::ZERO,
+            "a fuzzed IV produced a non-domain Positive"
+        );
+    }
+    assert!(
+        greeks.theta.is_none() && greeks.vega.is_none() && greeks.rho.is_none(),
+        "the Deribit ticker seam must never emit theta/vega/rho"
+    );
+}
+
+/// Drive the `ticker.` -> [`QuoteUpdate`] + [`GreeksRow`] seam with arbitrary
+/// JSON bytes. A byte string that will not deserialize into a [`TickerPayload`]
+/// is a normal reject; one that does is run through the REAL
+/// [`normalize_ticker`] and its output asserted a valid domain row.
+#[cfg(feature = "fuzz")]
+pub(crate) fn fuzz_normalize_ticker(bytes: &[u8]) {
+    let Ok(payload) = serde_json::from_slice::<TickerPayload>(bytes) else {
+        return;
+    };
+    let instrument = fuzz_instrument();
+    let (quote, greeks) = normalize_ticker(&instrument, &payload, fuzz_received());
+    assert_quote_valid(&quote);
+    assert_greeks_valid(&greeks);
+}
+
+/// Drive the grouped `book.` -> [`DepthLadder`] seam with arbitrary JSON bytes.
+/// A payload that deserializes is normalized through the REAL [`normalize_book`];
+/// every surviving level is a valid domain numeric and a dropped (bad) level
+/// never fabricates a slot — the ladder is no longer than the input arrays.
+#[cfg(feature = "fuzz")]
+pub(crate) fn fuzz_normalize_book(bytes: &[u8]) {
+    let Ok(payload) = serde_json::from_slice::<BookPayload>(bytes) else {
+        return;
+    };
+    let ladder = normalize_book(&fuzz_instrument(), &payload, fuzz_received());
+    for level in ladder.bids.iter().chain(ladder.asks.iter()) {
+        assert!(
+            level.price >= Positive::ZERO && level.size >= Positive::ZERO,
+            "a fuzzed depth level produced a non-domain Positive"
+        );
+    }
+    assert!(
+        ladder.bids.len() <= payload.bids.len() && ladder.asks.len() <= payload.asks.len(),
+        "normalize_book must never fabricate a depth level"
+    );
+}
+
+/// Drive the `instrument_name` parser with arbitrary bytes (lossy-decoded to a
+/// `str`). A name that parses to an [`InstrumentKey`] always carries a
+/// strictly-positive strike; anything else is a typed reject.
+#[cfg(feature = "fuzz")]
+pub(crate) fn fuzz_instrument_key_from_name(bytes: &[u8]) {
+    let name = String::from_utf8_lossy(bytes);
+    if let Ok(key) = instrument_key_from_name(&name) {
+        assert!(
+            key.strike > Positive::ZERO,
+            "a parsed instrument key must carry a positive strike"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Redaction-safe transport error mapping.
 // ---------------------------------------------------------------------------
 
