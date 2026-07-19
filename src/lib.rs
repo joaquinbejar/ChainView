@@ -22,14 +22,19 @@ pub(crate) mod ui;
 // The application state machine + fan-in (`docs/02-tui-architecture.md` §3, §4):
 // the `App`, the `Live | Replay` `Mode`, the mode-scoped `LiveScreen`/
 // `ReplayScreen`, the composite source/overlay bindings and per-screen state, and
-// the capability-read reachability helper. Public so the app builder (#12) and
-// the render loop (#13) can name and drive them.
+// the capability-read reachability helper. Plus the open-provider entry points
+// (`docs/02-tui-architecture.md` §11, ADR-0006): `ChainViewApp::builder()` and
+// its `ChainViewAppBuilder`, so an external thin binary can register its own
+// `Box<dyn Provider>` and `run()`. The application-owned `ProviderRegistry` is
+// deliberately NOT re-exported — external code composes through the builder, and
+// the UI never receives the registry. Public so the app builder (#12) and the
+// render loop (#13) can name and drive them.
 pub use app::{
     App, BridgeSenders, BundleLoad, COMMAND_CHANNEL_CAPACITY, CONTROL_CHANNEL_CAPACITY,
-    DEFAULT_JOIN_BUDGET, EventBridge, ExitCause, ExitReporter, FinalTeardown, GuardTeardown,
-    LiveScreen, LiveState, LoadedReplay, Mode, OverlayBinding, PayoffBuilder, Playback,
-    ReplayScreen, ReplayState, ScreenLoad, Selection, SourceBinding, StatusLine, SupervisedTask,
-    Supervisor, TaskExit, TokioTask, is_screen_reachable,
+    ChainViewApp, ChainViewAppBuilder, DEFAULT_JOIN_BUDGET, EventBridge, ExitCause, ExitReporter,
+    FinalTeardown, GuardTeardown, LiveScreen, LiveState, LoadedReplay, Mode, OverlayBinding,
+    PayoffBuilder, Playback, ReplayScreen, ReplayState, ScreenLoad, Selection, SourceBinding,
+    StatusLine, SupervisedTask, Supervisor, TaskExit, TokioTask, is_screen_reachable,
 };
 // The closed event set folded by the state machine and the render -> data
 // command channel (`docs/02-tui-architecture.md` §4).

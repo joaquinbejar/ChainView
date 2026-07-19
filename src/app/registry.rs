@@ -1,0 +1,894 @@
+//! The application-owned provider registry and the `ChainViewApp` builder
+//! (`docs/02-tui-architecture.md` §11, `docs/03-data-providers.md` §9,
+//! [ADR-0006]).
+//!
+//! `chainview` is published as a **binary + library**: the stock binary fills
+//! the [`ProviderRegistry`] with the **gate-clear** built-ins via
+//! [`ChainViewAppBuilder::with_builtins`], and an **external** developer depends
+//! on the `chainview` library from their own thin binary and adds their own
+//! `Box<dyn Provider>` before startup — no fork, no central enum to edit
+//! ([ADR-0006] §2–§3). The registry lives in the **application** layer; the UI
+//! never receives it and gates screens off declared
+//! [`ProviderCapabilities`](crate::providers::ProviderCapabilities)
+//! (`docs/02-tui-architecture.md` §3), never off a [`ProviderId`] match, so a
+//! built-in and an external provider are treated identically.
+//!
+//! # Collision is a typed startup error, never a panic
+//!
+//! [`register`](ChainViewAppBuilder::register) reads `provider.id()`. A
+//! **duplicate** id is [`RegistryError::DuplicateId`], a **reserved** built-in id
+//! used through the external `register` path is [`RegistryError::ReservedId`], a
+//! **gated** built-in requested via
+//! [`with_gated_builtin`](ChainViewAppBuilder::with_gated_builtin) while its gate
+//! holds is
+//! [`RegistryError::Gated`], and an **empty** registry at
+//! [`run`](ChainViewAppBuilder::run) is [`RegistryError::Empty`] — all surface as
+//! [`ChainViewError::Registry`], never a panic or a silent last-writer-wins
+//! (`docs/01-domain-model.md` §11). The build-phase errors are accumulated
+//! first-error-wins and reported by [`run`](ChainViewAppBuilder::run), keeping
+//! every builder method infallible-by-signature (`-> Self`) as the design fixes
+//! (`docs/02-tui-architecture.md` §11).
+//!
+//! # `Arc<dyn Provider>`, immutable after validation
+//!
+//! The registry stores each adapter behind an [`Arc`] rather than a bare `Box`:
+//! the same adapter is shared **read-only** across the independent poll and
+//! stream tasks the render loop spawns (#13/#16) without re-fetching it, and the
+//! registry is immutable once [`run`](ChainViewAppBuilder::run) has validated it
+//! (`docs/02-tui-architecture.md` §11 implementation note). [`Provider`] is
+//! `Send + Sync`, so `Arc<dyn Provider>` is registry- and task-ready.
+//!
+//! # Scope of this issue (#12) and the seams left for later
+//!
+//! This lands the registry, the builder, the startup validation, the
+//! `--provider` resolution against the registry, and the capability-driven
+//! composite-source guard. It does **not** spin the event loop: the Deribit
+//! adapter [`with_builtins`](ChainViewAppBuilder::with_builtins) will register
+//! is #15/#16 (so `with_builtins` is an honest no-op today — no fake provider is
+//! fabricated), the seeded [`ChainStore`](crate::chain::ChainStore) comes from
+//! the provider's first fetch (#15), and the tokio runtime, the
+//! [`Supervisor`](super::Supervisor), the bounded channels (#10), and the render
+//! loop (#13) are assembled at the documented seam inside
+//! [`run`](ChainViewAppBuilder::run).
+//!
+//! [ADR-0006]: https://github.com/joaquinbejar/ChainView/blob/main/docs/adr/0006-open-provider-extension.md
+
+use std::collections::HashMap;
+use std::fmt;
+use std::sync::Arc;
+
+use crate::chain::{ProviderId, StreamHealth};
+use crate::config::{CliOverrides, Config, ModeSelect};
+use crate::error::{ChainViewError, ConfigError, RegistryError};
+use crate::providers::Provider;
+
+use super::{SourceBinding, chain_present};
+
+// ---------------------------------------------------------------------------
+// ProviderRegistry: the application-owned set of adapters, keyed by ProviderId.
+// ---------------------------------------------------------------------------
+
+/// The set of providers available to the process, keyed by the open
+/// [`ProviderId`] (`docs/02-tui-architecture.md` §11, [ADR-0006]).
+///
+/// Owned by the application layer and **opaque**: it is assembled only through
+/// [`ChainViewAppBuilder`], its entries are stored behind an [`Arc`] so a single
+/// adapter can be shared read-only across the poll and stream tasks, and it is
+/// immutable once [`run`](ChainViewAppBuilder::run) has validated it. The UI
+/// never receives it — screen gating reads declared [`ProviderCapabilities`]
+/// (`crate::providers`), never the id.
+///
+/// [ADR-0006]: https://github.com/joaquinbejar/ChainView/blob/main/docs/adr/0006-open-provider-extension.md
+/// [`ProviderCapabilities`]: crate::providers::ProviderCapabilities
+pub struct ProviderRegistry {
+    by_id: HashMap<ProviderId, Arc<dyn Provider>>,
+}
+
+impl ProviderRegistry {
+    /// An empty registry.
+    fn new() -> Self {
+        Self {
+            by_id: HashMap::new(),
+        }
+    }
+
+    /// Whether no provider is registered.
+    fn is_empty(&self) -> bool {
+        self.by_id.is_empty()
+    }
+
+    /// The registered adapter for `id`, or `None` when it is absent.
+    fn get(&self, id: &ProviderId) -> Option<&Arc<dyn Provider>> {
+        self.by_id.get(id)
+    }
+
+    /// Whether an adapter is registered under `id`.
+    fn contains(&self, id: &ProviderId) -> bool {
+        self.by_id.contains_key(id)
+    }
+
+    /// Insert `provider` under `id`. The caller has already rejected a reserved
+    /// id and checked for a collision, so this always inserts a fresh entry.
+    fn insert(&mut self, id: ProviderId, provider: Arc<dyn Provider>) {
+        let _ = self.by_id.insert(id, provider);
+    }
+}
+
+impl fmt::Debug for ProviderRegistry {
+    /// Renders the registered ids only (sorted, for determinism). [`Provider`] is
+    /// not `Debug`, and the ids are public, non-secret, so this stays loggable.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut ids: Vec<&ProviderId> = self.by_id.keys().collect();
+        ids.sort();
+        f.debug_struct("ProviderRegistry")
+            .field("ids", &ids)
+            .finish()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ChainViewApp: the entry point for the stock and external binaries.
+// ---------------------------------------------------------------------------
+
+/// The assembled ChainView application — the entry point every binary starts
+/// from (`docs/02-tui-architecture.md` §11, [ADR-0006] §3).
+///
+/// A thin handle whose sole role today is to expose [`builder`](Self::builder):
+/// the stock binary and any external binary compose the app through the
+/// [`ChainViewAppBuilder`] and drive it with
+/// [`run`](ChainViewAppBuilder::run).
+///
+/// ```no_run
+/// use chainview::ChainViewApp;
+///
+/// # fn main() -> Result<(), chainview::ChainViewError> {
+/// // Stock binary: register the gate-clear built-ins and run.
+/// ChainViewApp::builder().with_builtins().run()?;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// [ADR-0006]: https://github.com/joaquinbejar/ChainView/blob/main/docs/adr/0006-open-provider-extension.md
+#[derive(Debug, Clone, Copy)]
+pub struct ChainViewApp;
+
+impl ChainViewApp {
+    /// Start assembling the app. The returned [`ChainViewAppBuilder`] registers
+    /// the built-in and/or external adapters, then [`run`](ChainViewAppBuilder::run)
+    /// validates the registry and composes the app.
+    #[must_use]
+    pub fn builder() -> ChainViewAppBuilder {
+        ChainViewAppBuilder::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ChainViewAppBuilder: builder-style registration + startup validation.
+// ---------------------------------------------------------------------------
+
+/// The builder that registers providers and validates the registry at startup
+/// (`docs/02-tui-architecture.md` §11, [ADR-0006] §3).
+///
+/// Every registration method returns `Self` for fluent chaining and defers its
+/// typed failure to [`run`](Self::run): a build-phase collision (reserved /
+/// duplicate id) or a gated-built-in request records a **first-error-wins**
+/// pending [`ChainViewError`] that [`run`](Self::run) surfaces, so a builder
+/// method never has to return a `Result` mid-chain.
+///
+/// [ADR-0006]: https://github.com/joaquinbejar/ChainView/blob/main/docs/adr/0006-open-provider-extension.md
+#[derive(Debug)]
+pub struct ChainViewAppBuilder {
+    registry: ProviderRegistry,
+    /// The assembled startup config injected by `main.rs` (the CLI-derived
+    /// `--provider`/mode source); `None` falls back to the zero-config default at
+    /// [`run`](Self::run).
+    config: Option<Config>,
+    /// The first build-phase error (reserved / duplicate id, gated built-in),
+    /// recorded first-wins and surfaced by [`run`](Self::run).
+    pending: Option<ChainViewError>,
+}
+
+impl Default for ChainViewAppBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ChainViewAppBuilder {
+    /// A builder with an empty registry and no injected config.
+    #[must_use]
+    fn new() -> Self {
+        Self {
+            registry: ProviderRegistry::new(),
+            config: None,
+            pending: None,
+        }
+    }
+
+    /// Register the bundled adapters whose security gate is **clear** at the
+    /// pinned upstream revisions (`docs/SECURITY.md` §2, `docs/03-data-providers.md`
+    /// §9). Gated adapters (tastytrade / Alpaca / standalone dxlink — credential-
+    /// logging upstreams, `docs/SECURITY.md` §2.3–§2.4) are **never** registered
+    /// implicitly; they require the explicit [`with_gated_builtin`](Self::with_gated_builtin)
+    /// opt-in.
+    ///
+    /// # v0.1: an honest no-op
+    ///
+    /// The only gate-clear built-in is **Deribit** (public, no auth), whose
+    /// adapter lands in #15/#16. No built-in adapter exists to register yet, so
+    /// this is a documented **no-op** in v0.1 — **no fake provider is
+    /// fabricated** (`docs/03-data-providers.md` §9). Consequently
+    /// `builder().with_builtins().run()` reports [`RegistryError::Empty`] until
+    /// the Deribit adapter lands and is registered here; the external
+    /// [`register`](Self::register) path is fully exercised today.
+    #[must_use]
+    pub fn with_builtins(self) -> Self {
+        // #15/#16: register the real Deribit adapter here once it exists, e.g.
+        //   self.register_builtin(DeribitProvider::new())
+        // Gated built-ins stay out of this call by construction (SECURITY.md §2).
+        self
+    }
+
+    /// Opt in to a security-**gated** bundled adapter explicitly. Fails at
+    /// startup with [`RegistryError::Gated`] while the adapter's upstream
+    /// credential-logging gate still holds, so a gated adapter can **never** be
+    /// enabled silently (`docs/SECURITY.md` §2.3–§2.4,
+    /// `docs/02-tui-architecture.md` §11).
+    ///
+    /// # v0.1: the gate always holds
+    ///
+    /// No gated adapter ships in v0.1 and none has cleared its gate, so this
+    /// records a pending [`RegistryError::Gated`] that [`run`](Self::run)
+    /// surfaces. This is the **mechanism**; it is exercised in v0.4 when a gated
+    /// adapter's pinned upstream clears its gate (`docs/ROADMAP.md`).
+    #[must_use]
+    pub fn with_gated_builtin(mut self, id: ProviderId) -> Self {
+        self.record(RegistryError::Gated(id).into());
+        self
+    }
+
+    /// Register an external provider (`docs/02-tui-architecture.md` §11,
+    /// [ADR-0006](https://github.com/joaquinbejar/ChainView/blob/main/docs/adr/0006-open-provider-extension.md) §3).
+    /// The id is read from `provider.id()`: a **reserved** built-in id used here
+    /// records [`RegistryError::ReservedId`] (so a downstream adapter can never
+    /// masquerade as a built-in or shadow its config namespace), and a
+    /// **duplicate** id records [`RegistryError::DuplicateId`] (never a silent
+    /// last-writer-wins). Both are surfaced by [`run`](Self::run).
+    #[must_use]
+    pub fn register(mut self, provider: impl Provider + 'static) -> Self {
+        self.register_arc(Arc::new(provider));
+        self
+    }
+
+    /// Inject the assembled startup [`Config`] — the source of the `--provider`
+    /// selection and the run [`ModeSelect`]. `main.rs` passes the CLI-derived
+    /// config here; when omitted, [`run`](Self::run) loads the zero-config default
+    /// (ADR-0003 Deribit BTC).
+    #[must_use]
+    pub fn with_config(mut self, config: Config) -> Self {
+        self.config = Some(config);
+        self
+    }
+
+    /// Validate the registry, resolve the selected provider, and compose the app
+    /// (`docs/02-tui-architecture.md` §11).
+    ///
+    /// The order is: (1) a build-phase collision / gated-builtin error (recorded
+    /// first-wins) is surfaced; (2) the startup [`Config`] is resolved (injected,
+    /// or the zero-config default loaded here); (3) in [`ModeSelect::Live`] the
+    /// registry is validated non-empty ([`RegistryError::Empty`]), `--provider` is
+    /// resolved against it ([`ConfigError::UnknownProvider`] when absent), the
+    /// selected provider's capabilities are read **once**, the capability-driven
+    /// composite-source guard runs, and the [`SourceBinding`] is built.
+    /// [`ModeSelect::Replay`] needs no live provider, so it skips provider
+    /// resolution.
+    ///
+    /// # Deferred to later issues
+    ///
+    /// The tokio runtime, the [`Supervisor`](super::Supervisor), the bounded
+    /// channels (#10), the seeded [`ChainStore`](crate::chain::ChainStore) (from
+    /// the provider's first fetch, #15), and the render loop (#13) are assembled
+    /// at the documented seam below. This issue validates the registry and
+    /// resolves the live source; it does **not** spin the loop, so it returns
+    /// `Ok(())` once resolution succeeds.
+    ///
+    /// # Errors
+    ///
+    /// [`ChainViewError::Registry`] for a reserved / duplicate id, a gated
+    /// built-in, or an empty registry; [`ChainViewError::Config`] for an unknown
+    /// selected provider or a chain-less source without an overlay chain; and a
+    /// [`Config`]-load failure from the zero-config fallback.
+    pub fn run(self) -> Result<(), ChainViewError> {
+        let Self {
+            registry,
+            config,
+            pending,
+        } = self;
+
+        // (1) A build-phase collision / gated-builtin is the first failure.
+        if let Some(error) = pending {
+            return Err(error);
+        }
+
+        // (2) Resolve the startup config: injected by main.rs, or the zero-config
+        // default loaded here (ADR-0003). Config assembly (issue #3/#4) has
+        // already validated the `--provider` GRAMMAR, so `config.provider` is a
+        // well-formed id; a syntactically invalid `--provider` is
+        // `ConfigError::InvalidValue` there, before ever reaching this seam.
+        let config = match config {
+            Some(config) => config,
+            None => Config::load(CliOverrides::default())?,
+        };
+
+        // (3) Compose per mode.
+        match config.mode {
+            ModeSelect::Live => {
+                let _source = resolve_source(&registry, &config)?;
+                // SEAM (#13/#15/#11): assemble the tokio runtime, the bounded
+                // channels (#10), the `Supervisor` (#11), the render loop (#13),
+                // and the `App` whose `LiveState` is seeded from `_source` plus the
+                // `ChainStore` built off the provider's first `fetch_chain` (#15).
+                // This issue stops after resolving + validating the live source.
+            }
+            ModeSelect::Replay(_) => {
+                // Replay renders an IronCondor bundle read-only and needs NO live
+                // provider, so the registry emptiness / `--provider` resolution do
+                // not apply. The bundle reader + timeline wiring land in v0.3
+                // (#34).
+            }
+        }
+        Ok(())
+    }
+
+    // --- Internal helpers -----------------------------------------------------
+
+    /// Register an already-boxed adapter, rejecting a reserved id and a
+    /// collision (both recorded first-error-wins).
+    fn register_arc(&mut self, provider: Arc<dyn Provider>) {
+        let id = provider.id();
+        // A reserved built-in id used through the EXTERNAL register path is
+        // rejected (ADR-0006 §1); built-ins are added through `with_builtins`,
+        // not here.
+        if id.is_reserved() {
+            self.record(RegistryError::ReservedId(id).into());
+            return;
+        }
+        if self.registry.contains(&id) {
+            self.record(RegistryError::DuplicateId(id).into());
+            return;
+        }
+        self.registry.insert(id, provider);
+    }
+
+    /// Record a build-phase error, first-error-wins (a later error never
+    /// overwrites the first, so `run` reports the first problem encountered).
+    fn record(&mut self, error: ChainViewError) {
+        if self.pending.is_none() {
+            self.pending = Some(error);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Source resolution: capability-driven, never a ProviderId match.
+// ---------------------------------------------------------------------------
+
+/// Resolve the `--provider` selection against the registry and wire it into a
+/// [`SourceBinding`], reading the selected provider's declared capabilities
+/// **once** (`docs/02-tui-architecture.md` §11, §3).
+///
+/// Gating is **capability-driven**: the composite-source guard reads
+/// [`ProviderCapabilities::chain`](crate::providers::ProviderCapabilities), never
+/// matches a [`ProviderId`], so a chain-less provider (standalone dxlink) is
+/// rejected as a live *source* identically whether it is a built-in or an
+/// external adapter.
+///
+/// # Errors
+///
+/// [`RegistryError::Empty`] when nothing is registered, [`ConfigError::UnknownProvider`]
+/// when `--provider` names no registered id, and [`ConfigError::InvalidValue`]
+/// when the selected provider produces no chain of its own (the composite-source
+/// rule — a chain-less feed can only overlay an external chain source; no
+/// composite-source configuration ships in v0.1, so this is the guard exercised
+/// in v0.4).
+fn resolve_source(
+    registry: &ProviderRegistry,
+    config: &Config,
+) -> Result<SourceBinding, ChainViewError> {
+    // An empty registry has no live provider to select.
+    if registry.is_empty() {
+        return Err(RegistryError::Empty.into());
+    }
+
+    // `--provider` resolution: the grammar is already validated (issue #4), so we
+    // only check the id is REGISTERED. An absent id is `UnknownProvider`.
+    let provider = registry.get(&config.provider).ok_or_else(|| {
+        ChainViewError::from(ConfigError::UnknownProvider(
+            config.provider.as_str().to_owned(),
+        ))
+    })?;
+
+    // Read the declared capabilities ONCE — the single startup query the UI gates
+    // every screen on (§3). Never re-queried per frame.
+    let capabilities = provider.capabilities();
+
+    // Composite-source guard (capability-driven, NEVER a `ProviderId` match): a
+    // chain-less provider cannot be a live SOURCE on its own — it can only overlay
+    // an external chain source (v0.4 composite source). No composite-source
+    // configuration exists in v0.1, so selecting a chain-less provider as the
+    // source is rejected here.
+    if !chain_present(capabilities.chain) {
+        return Err(ChainViewError::from(ConfigError::InvalidValue {
+            field: "provider".to_owned(),
+            reason: format!(
+                "provider `{}` produces no option chain, so it cannot be a live \
+                 chain source; a chain-less feed can only overlay an external \
+                 chain source",
+                config.provider
+            ),
+        }));
+    }
+
+    // Wire the selected provider into the source binding. The initial health is
+    // the pre-connection `Reconnecting { attempt: 1 }` (first connect in
+    // progress); the reconnect loop (#16) drives it to `Live` on the first data
+    // and to a later `Reconnecting`/`Stale` on a drop.
+    Ok(SourceBinding::new(
+        config.provider.clone(),
+        capabilities,
+        StreamHealth::Reconnecting { attempt: 1 },
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use async_trait::async_trait;
+    use optionstratlib::ExpirationDate;
+    use proptest::prelude::*;
+    use tokio::sync::mpsc;
+
+    use super::{ChainViewApp, ProviderRegistry, resolve_source};
+    use crate::app::{LiveScreen, SourceBinding, is_screen_reachable};
+    use crate::chain::{ChainFetch, MarketUpdate, ProviderId, RESERVED_PROVIDER_IDS, StreamHealth};
+    use crate::config::{Config, ModeSelect, ThemeChoice};
+    use crate::error::{ChainViewError, ConfigError, ProviderError, RegistryError};
+    use crate::providers::{
+        ChainCapability, GreeksCapability, Provider, ProviderCapabilities, SubscriptionHandle,
+        SubscriptionRequest, UnderlyingRef,
+    };
+
+    // --- Test constructors (no unwrap/expect/indexing per the ruleset) -------
+
+    #[track_caller]
+    fn pid(id: &str) -> ProviderId {
+        match ProviderId::new(id) {
+            Ok(p) => p,
+            Err(e) => panic!("expected a valid provider id `{id}`, got: {e}"),
+        }
+    }
+
+    fn chainful_caps() -> ProviderCapabilities {
+        ProviderCapabilities::builder()
+            .chain(ChainCapability::Assemble)
+            .greeks(GreeksCapability::Provided)
+            .build()
+    }
+
+    fn chainless_caps() -> ProviderCapabilities {
+        ProviderCapabilities::builder()
+            .chain(ChainCapability::None)
+            .build()
+    }
+
+    /// A live config selecting `provider`, with the zero-config defaults for the
+    /// remaining fields (constructed directly — every `Config` field is public —
+    /// so the resolution seam is tested without touching the environment/file).
+    fn live_config(provider: &str) -> Config {
+        Config {
+            provider: pid(provider),
+            underlying: "BTC".to_owned(),
+            refresh_interval: Duration::from_secs(2),
+            tick_interval: Duration::from_millis(250),
+            channel_capacity: 1024,
+            log_file: None,
+            theme: ThemeChoice::Auto,
+            no_color: false,
+            providers: BTreeMap::new(),
+            mode: ModeSelect::Live,
+        }
+    }
+
+    fn replay_config(dir: &str) -> Config {
+        Config {
+            mode: ModeSelect::Replay(PathBuf::from(dir)),
+            ..live_config("deribit")
+        }
+    }
+
+    /// A minimal in-test provider proving [`register`] works against the public
+    /// port without a real adapter — it prefigures the #22 faux provider. Its
+    /// async methods return `Unsupported` (the port shape) and are never awaited
+    /// by these tests, which exercise only the sync `id`/`capabilities` seam.
+    struct FakeProvider {
+        id: ProviderId,
+        capabilities: ProviderCapabilities,
+        capability_calls: Arc<AtomicUsize>,
+    }
+
+    impl FakeProvider {
+        fn new(id: ProviderId, capabilities: ProviderCapabilities) -> Self {
+            Self {
+                id,
+                capabilities,
+                capability_calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn chainful(id: ProviderId) -> Self {
+            Self::new(id, chainful_caps())
+        }
+    }
+
+    #[async_trait]
+    impl Provider for FakeProvider {
+        fn id(&self) -> ProviderId {
+            self.id.clone()
+        }
+
+        fn capabilities(&self) -> ProviderCapabilities {
+            let _ = self.capability_calls.fetch_add(1, Ordering::SeqCst);
+            self.capabilities
+        }
+
+        async fn discover(&self) -> Result<Vec<UnderlyingRef>, ProviderError> {
+            Ok(Vec::new())
+        }
+
+        async fn fetch_chain(
+            &self,
+            _underlying: &str,
+            _expiration: &ExpirationDate,
+        ) -> Result<ChainFetch, ProviderError> {
+            Err(ProviderError::Unsupported("fake provider has no chain"))
+        }
+
+        async fn subscribe(
+            &self,
+            _req: SubscriptionRequest,
+            _tx: mpsc::Sender<MarketUpdate>,
+        ) -> Result<SubscriptionHandle, ProviderError> {
+            Err(ProviderError::Unsupported("fake provider has no stream"))
+        }
+    }
+
+    /// Build a single-entry registry with one chain-capable provider under `id`.
+    fn registry_with(id: &str) -> ProviderRegistry {
+        let mut registry = ProviderRegistry::new();
+        registry.insert(pid(id), Arc::new(FakeProvider::chainful(pid(id))));
+        registry
+    }
+
+    // === register: collision paths ============================================
+
+    #[test]
+    fn test_register_duplicate_id_is_duplicate_error() {
+        let result = ChainViewApp::builder()
+            .register(FakeProvider::chainful(pid("mybroker")))
+            .register(FakeProvider::chainful(pid("mybroker")))
+            .with_config(live_config("mybroker"))
+            .run();
+        match result {
+            Err(ChainViewError::Registry(RegistryError::DuplicateId(id))) => {
+                assert_eq!(id.as_str(), "mybroker");
+            }
+            other => panic!("expected DuplicateId(mybroker), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_register_reserved_id_is_reserved_error() {
+        // An EXTERNAL registration using a reserved built-in id is rejected, so a
+        // downstream adapter can never masquerade as `deribit`.
+        let result = ChainViewApp::builder()
+            .register(FakeProvider::chainful(pid("deribit")))
+            .with_config(live_config("deribit"))
+            .run();
+        match result {
+            Err(ChainViewError::Registry(RegistryError::ReservedId(id))) => {
+                assert_eq!(id.as_str(), "deribit");
+            }
+            other => panic!("expected ReservedId(deribit), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_register_duplicate_wins_over_later_reserved_first_error_wins() {
+        // The FIRST build-phase error is the one reported: a duplicate recorded
+        // before a later reserved-id registration surfaces as DuplicateId.
+        let result = ChainViewApp::builder()
+            .register(FakeProvider::chainful(pid("mybroker")))
+            .register(FakeProvider::chainful(pid("mybroker")))
+            .register(FakeProvider::chainful(pid("alpaca")))
+            .with_config(live_config("mybroker"))
+            .run();
+        assert!(matches!(
+            result,
+            Err(ChainViewError::Registry(RegistryError::DuplicateId(_)))
+        ));
+    }
+
+    // === empty registry =======================================================
+
+    #[test]
+    fn test_run_empty_registry_is_empty_error() {
+        // `with_builtins` is an honest no-op in v0.1 (Deribit lands in #15), so a
+        // stock live startup finds an empty registry.
+        let result = ChainViewApp::builder()
+            .with_builtins()
+            .with_config(live_config("deribit"))
+            .run();
+        assert!(matches!(
+            result,
+            Err(ChainViewError::Registry(RegistryError::Empty))
+        ));
+    }
+
+    // === --provider resolution ================================================
+
+    #[test]
+    fn test_run_unknown_provider_is_unknown_provider_error() {
+        // The selected id is grammar-valid but not registered.
+        let result = ChainViewApp::builder()
+            .register(FakeProvider::chainful(pid("mybroker")))
+            .with_config(live_config("othervendor"))
+            .run();
+        match result {
+            Err(ChainViewError::Config(ConfigError::UnknownProvider(id))) => {
+                assert_eq!(id, "othervendor");
+            }
+            other => panic!("expected UnknownProvider(othervendor), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_provider_selection_invalid_grammar_is_invalid_value() {
+        // A syntactically invalid `--provider` is `ConfigError::InvalidValue` at
+        // the `ProviderId::new` grammar gate (issue #4) — BEFORE it can reach the
+        // registry — so it can never construct a `config.provider` that reaches
+        // `run`. This is the same gate config assembly reuses.
+        match ProviderId::new("Bad-Upper") {
+            Err(ConfigError::InvalidValue { field, .. }) => assert_eq!(field, "provider id"),
+            other => panic!("expected InvalidValue on provider id, got {other:?}"),
+        }
+    }
+
+    // === gated built-in =======================================================
+
+    #[test]
+    fn test_with_gated_builtin_fails_while_gate_holds() {
+        // The gated request records the first (pending) error, surfaced by run()
+        // even though a valid external provider is also registered.
+        let result = ChainViewApp::builder()
+            .with_gated_builtin(pid("tastytrade"))
+            .register(FakeProvider::chainful(pid("mybroker")))
+            .with_config(live_config("mybroker"))
+            .run();
+        match result {
+            Err(ChainViewError::Registry(RegistryError::Gated(id))) => {
+                assert_eq!(id.as_str(), "tastytrade");
+            }
+            other => panic!("expected Gated(tastytrade), got {other:?}"),
+        }
+    }
+
+    // === source resolution: capabilities read once, wired into SourceBinding ==
+
+    #[test]
+    fn test_run_resolves_live_source_reading_capabilities_once() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = FakeProvider {
+            id: pid("mybroker"),
+            capabilities: chainful_caps(),
+            capability_calls: Arc::clone(&calls),
+        };
+        let result = ChainViewApp::builder()
+            .register(provider)
+            .with_config(live_config("mybroker"))
+            .run();
+        assert!(
+            result.is_ok(),
+            "a registered chain source resolves: {result:?}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "capabilities are read exactly once at startup"
+        );
+    }
+
+    #[test]
+    fn test_resolve_source_wires_declared_capabilities_into_source_binding() {
+        let registry = registry_with("mybroker");
+        let config = live_config("mybroker");
+        match resolve_source(&registry, &config) {
+            Ok(binding) => {
+                assert_eq!(binding.provider.as_str(), "mybroker");
+                // The UI-facing seam carries the DECLARED capabilities, never the
+                // `dyn Provider`/registry.
+                assert_eq!(binding.capabilities, chainful_caps());
+                assert!(matches!(
+                    binding.health,
+                    StreamHealth::Reconnecting { attempt: 1 }
+                ));
+            }
+            Err(e) => panic!("expected a resolved SourceBinding, got {e}"),
+        }
+    }
+
+    #[test]
+    fn test_resolve_chainless_source_without_overlay_is_invalid_value() {
+        // The composite-source guard reads CAPABILITIES (chain == None), never the
+        // id: a chain-less provider cannot be a live source on its own.
+        let mut registry = ProviderRegistry::new();
+        registry.insert(
+            pid("myoverlay"),
+            Arc::new(FakeProvider::new(pid("myoverlay"), chainless_caps())),
+        );
+        match resolve_source(&registry, &live_config("myoverlay")) {
+            Err(ChainViewError::Config(ConfigError::InvalidValue { field, .. })) => {
+                assert_eq!(field, "provider");
+            }
+            other => panic!("expected InvalidValue on provider, got {other:?}"),
+        }
+    }
+
+    // === Replay mode needs no live provider ===================================
+
+    #[test]
+    fn test_run_replay_mode_ignores_empty_registry() {
+        // Replay reads a bundle read-only; an empty registry is fine.
+        let result = ChainViewApp::builder()
+            .with_config(replay_config("/bundle"))
+            .run();
+        assert!(result.is_ok(), "replay needs no live provider: {result:?}");
+    }
+
+    // === The registry is application-owned; the UI-facing seam is caps + id ===
+
+    #[test]
+    fn test_ui_facing_seam_is_capabilities_not_the_registry() {
+        // `run` consumes the builder (and the registry) by value; the value the UI
+        // reads for gating is a `SourceBinding` carrying a `ProviderCapabilities`
+        // and a `ProviderId` — never a `ProviderRegistry` or a `dyn Provider`. So
+        // the registry is structurally unreachable from the UI (the arch test that
+        // enforces no `src/ui/*` import lands in #22).
+        let binding = SourceBinding::new(pid("mybroker"), chainful_caps(), StreamHealth::Live);
+        let _caps: ProviderCapabilities = binding.capabilities;
+        let _id: ProviderId = binding.provider;
+        // Gating over the binding's capabilities never consults the id.
+        assert!(is_screen_reachable(LiveScreen::Chain, &chainful_caps()));
+    }
+
+    #[test]
+    fn test_registry_debug_lists_sorted_ids_only() {
+        let mut registry = ProviderRegistry::new();
+        registry.insert(pid("zeta"), Arc::new(FakeProvider::chainful(pid("zeta"))));
+        registry.insert(
+            pid("mybroker"),
+            Arc::new(FakeProvider::chainful(pid("mybroker"))),
+        );
+        let rendered = format!("{registry:?}");
+        // Sorted, ids only (no secret, no provider internals).
+        assert!(rendered.contains("mybroker"));
+        assert!(rendered.contains("zeta"));
+        let mybroker = rendered.find("mybroker");
+        let zeta = rendered.find("zeta");
+        assert!(mybroker < zeta, "ids are rendered sorted: {rendered}");
+    }
+
+    // === Property tests =======================================================
+
+    /// A strategy over grammar-valid, NON-reserved provider ids.
+    fn valid_custom_id() -> impl Strategy<Value = ProviderId> {
+        "[a-z][a-z0-9]{1,10}"
+            .prop_map(ProviderId::new)
+            .prop_filter("valid, non-reserved id", |r| {
+                r.as_ref().is_ok_and(|p| !p.is_reserved())
+            })
+            .prop_map(|r| match r {
+                Ok(p) => p,
+                // Filtered above; unreachable, but no unwrap per the ruleset.
+                Err(e) => panic!("filtered id was invalid: {e}"),
+            })
+    }
+
+    fn chain_capability(idx: u8) -> ChainCapability {
+        match idx % 4 {
+            0 => ChainCapability::Native,
+            1 => ChainCapability::Assemble,
+            2 => ChainCapability::Partial,
+            _ => ChainCapability::None,
+        }
+    }
+
+    fn greeks_capability(idx: u8) -> GreeksCapability {
+        match idx % 3 {
+            0 => GreeksCapability::Provided,
+            1 => GreeksCapability::ComputedLocally,
+            _ => GreeksCapability::None,
+        }
+    }
+
+    proptest! {
+        /// An external registration using ANY reserved built-in id is rejected.
+        #[test]
+        fn prop_registry_rejects_reserved_id(idx in 0usize..RESERVED_PROVIDER_IDS.len()) {
+            let id_str = match RESERVED_PROVIDER_IDS.get(idx) {
+                Some(s) => *s,
+                None => return Ok(()),
+            };
+            let id = match ProviderId::new(id_str) {
+                Ok(p) => p,
+                Err(e) => panic!("reserved id `{id_str}` must be grammar-valid: {e}"),
+            };
+            let result = ChainViewApp::builder()
+                .register(FakeProvider::chainful(id))
+                .run();
+            prop_assert!(matches!(
+                result,
+                Err(ChainViewError::Registry(RegistryError::ReservedId(_)))
+            ));
+        }
+
+        /// Registering the same id twice is always a DuplicateId, never a silent
+        /// last-writer-wins — the pending error is reported before config resolves.
+        #[test]
+        fn prop_registry_rejects_duplicate_id(id in valid_custom_id()) {
+            let result = ChainViewApp::builder()
+                .register(FakeProvider::chainful(id.clone()))
+                .register(FakeProvider::chainful(id))
+                .run();
+            prop_assert!(matches!(
+                result,
+                Err(ChainViewError::Registry(RegistryError::DuplicateId(_)))
+            ));
+        }
+
+        /// Every provider returns a COMPLETE `ProviderCapabilities` (the builder
+        /// always fills every dimension), and screen gating is a TOTAL function of
+        /// the declared capabilities — never the id. Building the caps and reading
+        /// them back is lossless, and `is_screen_reachable` matches the
+        /// capability-derived truth for all four screens.
+        #[test]
+        fn prop_capabilities_total(
+            id in valid_custom_id(),
+            depth in any::<bool>(),
+            chain_idx in any::<u8>(),
+            greeks_idx in any::<u8>(),
+        ) {
+            let chain = chain_capability(chain_idx);
+            let greeks = greeks_capability(greeks_idx);
+            let caps = ProviderCapabilities::builder()
+                .chain(chain)
+                .depth(depth)
+                .greeks(greeks)
+                .build();
+            let provider = FakeProvider::new(id, caps);
+            // A provider reports EXACTLY its declared, complete capabilities.
+            prop_assert_eq!(provider.capabilities(), caps);
+            // Gating is derived from capabilities alone.
+            let chain_ok = !matches!(chain, ChainCapability::None);
+            let greeks_ok = !matches!(greeks, GreeksCapability::None);
+            prop_assert_eq!(is_screen_reachable(LiveScreen::Chain, &caps), chain_ok);
+            prop_assert_eq!(is_screen_reachable(LiveScreen::Payoff, &caps), chain_ok);
+            prop_assert_eq!(is_screen_reachable(LiveScreen::Depth, &caps), depth);
+            prop_assert_eq!(is_screen_reachable(LiveScreen::Surface, &caps), greeks_ok);
+        }
+    }
+}

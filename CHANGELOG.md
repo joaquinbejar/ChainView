@@ -14,6 +14,65 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- The application-owned `ProviderRegistry` and the `ChainViewApp` builder
+  (`src/app/registry.rs`, issue #12; `docs/02-tui-architecture.md` §11,
+  `docs/03-data-providers.md` §9, ADR-0006). The open provider-extension entry
+  point: the stock binary and any external thin binary compose the app through
+  `ChainViewApp::builder()` and drive it with `run()`, so a developer plugs in
+  their own venue with no fork and no central enum to edit. Key behaviours:
+  - **Collision is a typed startup error, never a panic or silent last-wins.**
+    `register(impl Provider + 'static)` reads `provider.id()`: a **reserved**
+    built-in id used through the external path records
+    `RegistryError::ReservedId`, a **duplicate** id records
+    `RegistryError::DuplicateId`, a **gated** built-in requested via
+    `with_gated_builtin(id)` records `RegistryError::Gated(id)`, and an **empty**
+    registry at `run()` is `RegistryError::Empty` — all surface as
+    `ChainViewError::Registry`. Every builder method returns `Self`; build-phase
+    errors are accumulated first-error-wins and reported by `run()`, so no method
+    returns a mid-chain `Result`.
+  - **`with_builtins()` is an honest no-op in v0.1.** The only gate-clear
+    built-in is Deribit (public, no auth), whose adapter lands in #15/#16 — so
+    **no fake provider is fabricated** and `builder().with_builtins().run()`
+    reports `RegistryError::Empty` until Deribit is registered here. The external
+    `register()` path and the collision/empty validation are fully exercised
+    today.
+  - **`with_gated_builtin` fails while the gate holds.** No gated adapter ships
+    in v0.1 (`docs/SECURITY.md` §2.3–§2.4), so the gate always holds and the opt-in
+    records `RegistryError::Gated`; this is the *mechanism*, exercised in v0.4. It
+    also resolves the CV-CODEX-051 drift: the concrete typed error is
+    `RegistryError::Gated` (a runtime hard gate; gated adapter code absent), and
+    the unattached `ChainViewError::ProviderGated` sketch is removed from
+    `docs/02-tui-architecture.md` §11.
+  - **`--provider` resolution and the capability-driven composite-source guard.**
+    `run()` resolves `config.provider` against the registry: an absent id is
+    `ConfigError::UnknownProvider` (a syntactically invalid id is
+    `ConfigError::InvalidValue` at the `ProviderId::new` grammar gate, before it
+    can reach the registry). The selected provider's capabilities are read
+    **once** and wired into `App`'s `SourceBinding`; a **chain-less** provider
+    (standalone dxlink) selected as the live *source* is `ConfigError::InvalidValue`
+    — the composite-source guard, which reads the declared `ChainCapability`,
+    **never** matches a `ProviderId`. Replay mode needs no live provider and skips
+    resolution.
+  - **`Arc<dyn Provider>`, immutable after validation; registry is UI-unreachable.**
+    Each adapter is stored behind an `Arc` so one adapter is shared read-only
+    across the poll + stream tasks (#13/#16) without re-fetching; the registry is
+    immutable once `run()` validates it. `ProviderRegistry` is opaque
+    (private field, assembled only through the builder) and **not** re-exported —
+    the UI-facing gating seam is the `SourceBinding`'s `ProviderCapabilities` +
+    `ProviderId`, never the registry or a `dyn Provider`.
+  - **The composition seam is documented, not spun.** `run()` validates the
+    registry and resolves the live source, then returns `Ok(())`; the tokio
+    runtime, the `Supervisor` (#11), the bounded channels (#10), the seeded
+    `ChainStore` (from the provider's first fetch, #15), and the render loop (#13)
+    are assembled at the documented seam. A test-only `FakeProvider` implementing
+    the public `Provider` port exercises `register()` without a real adapter
+    (prefiguring the #22 faux provider). `ChainViewApp` and `ChainViewAppBuilder`
+    are re-exported from the crate root. Adds `RegistryError::Gated` to `src/error.rs`
+    (pre-v0.1 addition to an unshipped surface — no SemVer event). **No new
+    dependency.** Tests: 13 unit + 3 property (`prop_registry_rejects_reserved_id`,
+    `prop_registry_rejects_duplicate_id`, `prop_capabilities_total` — gating total
+    over declared capabilities, never id) in `src/app/registry.rs`, plus the
+    `RegistryError::Gated` display test in `src/error.rs`.
 - The single task supervisor, cancellation-token tree, and ordered teardown
   (`src/app/supervisor.rs`, issue #11; `docs/02-tui-architecture.md` §12,
   ADR-0005). One `Supervisor`, owned by the application layer, owns **all** task
