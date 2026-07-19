@@ -1,0 +1,6 @@
+      widen the terminal
+ have 30x6, need at least 40x8
+
+
+
+

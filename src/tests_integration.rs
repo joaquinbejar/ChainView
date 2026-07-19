@@ -66,7 +66,7 @@ use optionstratlib::visualization::{GraphData, Series2D, Surface3D};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
-use ratatui::style::Modifier;
+use ratatui::style::{Color, Modifier};
 use tokio::sync::mpsc;
 
 use crate::app::{
@@ -558,13 +558,12 @@ fn test_surface_empty_golden() {
 fn test_depth_ladder_golden() {
     // The populated Deribit ladder assembled from the committed grouped-book fixture.
     //
-    // NOTE (known #48 limitation, surfaced here — NOT a #50 change): the ladder's
-    // `fmt_num` renders prices at a fixed 2 decimals, which UNDER-RESOLVES the
-    // sub-unit BTC option prices this grouped fixture carries — the deeper bids
-    // 0.049 / 0.048 render as `0.04` (a 2-decimal truncation, not a round). The
-    // golden pins this delivered behaviour faithfully so a future precision fix in
-    // `src/ui/depth.rs` (widening depth price precision for sub-unit venues) lands as
-    // a visible golden diff; #50 makes no production change.
+    // #109/#118 (closed here): the ladder's `fmt_num` renders each sub-unit BTC option
+    // price at its OWN decimal scale, so the deeper bids 0.049 / 0.048 keep their
+    // tradeable digits (rendering `0.049` / `0.048`, not the old 2-decimal `0.04`
+    // truncation), and two distinct prices near one never collapse to a shared
+    // 3-significant-figure string. The golden is regenerated in the same commit as the
+    // precision fix (a visible diff), and stays NO_COLOR-safe.
     let text = render_live_frame(depth_ladder_state());
     assert!(
         text.contains("bid") && text.contains("ask"),
@@ -577,6 +576,15 @@ fn test_depth_ladder_golden() {
     assert!(
         text.contains("spread"),
         "the spread footer renders: {text:?}"
+    );
+    // #109/#118: sub-unit BTC prices keep their tradeable digits (no `0.04` truncation).
+    assert!(
+        text.contains("0.049") && text.contains("0.048"),
+        "sub-unit venue prices render at their own decimal scale, not truncated: {text:?}",
+    );
+    assert!(
+        !text.contains(" 0.04 "),
+        "the old 2-decimal truncation is gone: {text:?}",
     );
     assert_golden("depth", "deribit_btc_ladder.txt", &text);
 }
@@ -1264,4 +1272,228 @@ fn test_surface_surface_err_renders_degenerate_state_not_a_corrupt_chart() {
         text.contains("degenerate geometry"),
         "the surface Err path renders the degenerate-geometry state: {text:?}",
     );
+}
+
+// =============================================================================
+// 6. The #57 cross-screen polish pass: NO_COLOR golden pair + color-stripping
+//    proof, the cross-screen too-small state, the surface stale badge, and the
+//    mode-correct Live retry key on every error state (`docs/05-views-and-ux.md`
+//    §6, §7, §8). Every render goes through the REAL draw path at the fixed
+//    golden size (or an explicit small size for the too-small state), tick 0.
+// =============================================================================
+
+/// Render the chain BODY (the flagship screen) into the fixed golden backend under a
+/// resolved theme (`no_color` on/off), returning the raw `Buffer` so a test can probe
+/// BOTH the row-major symbols (marker parity) and the per-cell styles (color
+/// stripping).
+#[track_caller]
+fn render_chain_buffer_themed(live: &LiveState, no_color: bool) -> Buffer {
+    let theme = Theme::resolve(ThemeChoice::Auto, no_color);
+    let mut term = terminal(GOLDEN_WIDTH, GOLDEN_HEIGHT);
+    match term.draw(|frame| draw_chain(live, frame, frame.area(), theme, 0, utc(AS_OF))) {
+        Ok(_) => {}
+        Err(e) => panic!("chain themed draw failed: {e}"),
+    }
+    term.backend().buffer().clone()
+}
+
+/// Whether ANY cell in the buffer sets a non-default foreground or background color —
+/// the render-edge probe that distinguishes a colored frame from a `NO_COLOR` one
+/// (which resolves every semantic style to intensity/markers only, leaving `Reset`).
+fn any_cell_colored(buffer: &Buffer) -> bool {
+    buffer
+        .content()
+        .iter()
+        .any(|cell| cell.fg != Color::Reset || cell.bg != Color::Reset)
+}
+
+#[test]
+fn test_chain_no_color_golden_pair_is_marker_legible_and_color_is_stripped() {
+    // The NO_COLOR golden PAIR (`docs/05-views-and-ux.md` §7): the flagship chain matrix
+    // rendered with color and with NO_COLOR. The bytes (symbols) are IDENTICAL — every
+    // color-encoded state (the ◀ATM marker, the ▲/▼/· tick glyphs, the `~` computed-Greek
+    // glyph, the stale badge) is carried by a glyph/text marker, never color alone — so
+    // the UI is fully legible with markers + intensity only. A style-level probe then
+    // proves color is GENUINELY stripped (not that both happen to match): the color
+    // buffer sets a semantic foreground, the NO_COLOR buffer sets none.
+    let store = ChainStore::seed(
+        fixture_btc_chain_fetch_named("BTC"),
+        ChainSource::Merged,
+        Duration::from_secs(2),
+        utc(AS_OF),
+    );
+    let live = live_ready(store, pid("deribit"));
+
+    let color = render_chain_buffer_themed(&live, false);
+    let no_color = render_chain_buffer_themed(&live, true);
+    let color_text = buffer_to_text(&color);
+    let no_color_text = buffer_to_text(&no_color);
+
+    // The golden pair — both committed (byte-identical, which IS the marker-parity proof).
+    assert_golden("chain", "deribit_btc_atm.txt", &color_text);
+    assert_golden("chain", "deribit_btc_atm_no_color.txt", &no_color_text);
+    assert_eq!(
+        color_text, no_color_text,
+        "NO_COLOR carries no glyph the color mode lacks: the visible marker set is identical",
+    );
+
+    // Color is genuinely stripped under NO_COLOR (intensity + markers only).
+    assert!(
+        any_cell_colored(&color),
+        "the color render sets a semantic foreground somewhere",
+    );
+    assert!(
+        !any_cell_colored(&no_color),
+        "NO_COLOR strips every foreground/background color (falls back to markers + intensity)",
+    );
+}
+
+#[test]
+fn test_too_small_terminal_golden_widen_hint() {
+    // The cross-screen too-small state (`docs/05-views-and-ux.md` §8): below the minimum
+    // size EVERY screen shows the "widen the terminal" hint through the REAL render
+    // dispatch — never a corrupt layout, never a panic. A first-class state with its own
+    // golden at an explicit small size (the golden harness handles any size).
+    let store = ChainStore::seed(
+        fixture_btc_chain_fetch_named("BTC"),
+        ChainSource::Merged,
+        Duration::from_secs(2),
+        utc(AS_OF),
+    );
+    let live = live_ready(store, pid("deribit"));
+    let (tx, _rx) = mpsc::channel::<Command>(16);
+    let mut app = App::new(Mode::Live(live), ThemeChoice::Auto, tx);
+    app.mark_drawn();
+    let mut view = ViewState::new();
+    view.sync(&app);
+    let mut term = terminal(30, 6);
+    match term.draw(|frame| render(&app, &view, frame)) {
+        Ok(_) => {}
+        Err(e) => panic!("too-small render failed: {e}"),
+    }
+    let text = buffer_to_text(term.backend().buffer());
+    assert!(
+        text.contains("widen the terminal"),
+        "the too-small state names its recovery: {text:?}",
+    );
+    assert_golden("common", "too_small.txt", &text);
+}
+
+/// A Surface-screen state on the populated smile chain, Ready, whose stream health is
+/// **stale** — the dropped-stream state the surface must badge (never blank). `toggles`
+/// selects the view (`0` smile / `1` Greek curve / `2` single-expiry heat surface).
+fn surface_stale_state(toggles: u8) -> LiveState {
+    let mut live = surface_state(smile_chain(), toggles);
+    live.source.health = StreamHealth::Stale { since: utc(AS_OF) };
+    live
+}
+
+/// The heat-map ramp glyphs (`src/ui/surface.rs` `RAMP`) — used to probe whether the
+/// 3D surface's heat GRID (not its dim legend/footer) carries color.
+const RAMP_GLYPHS: [char; 7] = ['·', ':', '+', '*', '#', '%', '@'];
+
+/// Whether any ramp-glyph cell in the buffer carries a non-default foreground — the
+/// probe that distinguishes a **bright** (live, intensity-tinted) heat grid from a
+/// **dimmed** (stale) one, where every present cell resolves to the color-less dim
+/// style (`src/ui/surface.rs` `cell_span`, #57 P2-01).
+fn any_ramp_cell_colored(buffer: &Buffer) -> bool {
+    buffer.content().iter().any(|cell| {
+        cell.symbol()
+            .chars()
+            .next()
+            .is_some_and(|c| RAMP_GLYPHS.contains(&c))
+            && cell.fg != Color::Reset
+    })
+}
+
+/// Render a live `state` as a WHOLE frame through the REAL dispatch into the fixed
+/// golden backend, returning the raw `Buffer` (for a per-cell style probe the text
+/// projection cannot carry). Mirrors [`render_live_frame`].
+#[track_caller]
+fn render_live_buffer(state: LiveState) -> Buffer {
+    let (tx, _rx) = mpsc::channel::<Command>(16);
+    let mut app = App::new(Mode::Live(state), ThemeChoice::Auto, tx);
+    app.mark_drawn();
+    let mut view = ViewState::new();
+    view.sync(&app);
+    let mut term = terminal(GOLDEN_WIDTH, GOLDEN_HEIGHT);
+    match term.draw(|frame| render(&app, &view, frame)) {
+        Ok(_) => {}
+        Err(e) => panic!("live buffer render failed: {e}"),
+    }
+    term.backend().buffer().clone()
+}
+
+#[test]
+fn test_surface_stale_golden() {
+    // #57: a dropped stream never blanks the surface — the last-known smile renders with
+    // the stream-health badge in the title (glyph + text, NO_COLOR-safe), the §6 stale
+    // state the surface previously lacked. The golden pins the deliberate stale render.
+    let text = render_live_frame(surface_stale_state(0));
+    assert!(
+        text.contains("stale"),
+        "the surface title badges the dropped stream: {text:?}",
+    );
+    assert!(
+        text.contains("strike"),
+        "the last-known smile still renders (never blanked): {text:?}",
+    );
+    assert_golden("surface", "deribit_btc_smile_stale.txt", &text);
+}
+
+#[test]
+fn test_surface_heat_view_stale_golden_dims_the_grid() {
+    // #57 P2-01: the THIRD surface view (the 3D single-expiry heat map) must also dim on
+    // a dropped stream — not just the 2D smile/curve. The stale heat render badges the
+    // title and dims every present heat cell (the ramp glyph shape still carries the
+    // structure, NO_COLOR-safe), so the grid never reads bright/trusted under `◐ stale`.
+    let stale_text = render_live_frame(surface_stale_state(2));
+    assert!(
+        stale_text.contains("stale"),
+        "the heat-view title badges the dropped stream: {stale_text:?}",
+    );
+    assert_golden("surface", "deribit_btc_surface_stale.txt", &stale_text);
+
+    // bright → dimmed proof: the LIVE heat grid tints high-intensity cells (a colored
+    // ramp cell exists); the STALE grid resolves every cell to the color-less dim style.
+    let live_grid = render_live_buffer(surface_state(smile_chain(), 2));
+    let stale_grid = render_live_buffer(surface_stale_state(2));
+    assert!(
+        any_ramp_cell_colored(&live_grid),
+        "the live heat grid tints high-intensity cells (bright)",
+    );
+    assert!(
+        !any_ramp_cell_colored(&stale_grid),
+        "the stale heat grid dims every cell — no colored ramp cell survives",
+    );
+}
+
+#[test]
+fn test_live_error_states_offer_the_r_reconnect_key_not_reload() {
+    // #57: every Live error state offers the MODE-CORRECT retry key — Live → `r`
+    // (reconnect/refetch) — across the chain, depth, and surface screens. A Live provider
+    // error must never tell the user to press the Replay `R` bundle-reload key (§6).
+    let store = || {
+        ChainStore::seed(
+            fixture_btc_chain_fetch_named("BTC"),
+            ChainSource::Merged,
+            Duration::from_secs(2),
+            utc(AS_OF),
+        )
+    };
+    for screen in [LiveScreen::Chain, LiveScreen::Depth, LiveScreen::Surface] {
+        let mut live = LiveState::new(
+            SourceBinding::new(pid("deribit"), caps(), StreamHealth::Live),
+            store(),
+        );
+        live.screen = screen;
+        live.load = ScreenLoad::Error {
+            message: "provider unreachable".to_owned(),
+        };
+        let text = render_live_frame(live);
+        assert!(
+            text.contains("press r to reconnect"),
+            "the {screen:?} Live error offers the `r` reconnect key: {text:?}",
+        );
+    }
 }
