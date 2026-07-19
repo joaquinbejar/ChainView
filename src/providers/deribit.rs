@@ -4521,7 +4521,8 @@ mod tests {
 
             let ctx = PricingInputs::new(pos(SPOT), utc(AS_OF), 1);
             let chain = fixture_chain();
-            match compute_leg_greeks(&chain, &ctx, &mut sink) {
+            let clocks = crate::chain::QuoteClocks::new();
+            match compute_leg_greeks(&chain, &ctx, &clocks, &mut sink) {
                 Ok(()) => {}
                 Err(e) => panic!("compute_leg_greeks failed: {e}"),
             }

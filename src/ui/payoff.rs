@@ -2044,7 +2044,8 @@ mod tests {
             let theme = Theme::resolve(ThemeChoice::Auto, false);
             let mut term = terminal(width, height);
             let area = Rect::new(0, 0, width, height);
-            match term.draw(|frame| crate::ui::chain::draw(state, frame, area, theme, 0)) {
+            match term.draw(|frame| crate::ui::chain::draw(state, frame, area, theme, 0, utc(EXP)))
+            {
                 Ok(_) => {}
                 Err(e) => panic!("matrix draw failed at {width}x{height}: {e}"),
             }
