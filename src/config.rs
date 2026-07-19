@@ -605,6 +605,12 @@ fn validate_endpoint(raw: &str) -> Result<String, ConfigError> {
 
 /// Build the per-provider settings map: the file entries, then the selected
 /// provider's env/CLI overrides layered on with `CLI > env > file` precedence.
+///
+/// The per-provider env var names are built through [`provider_env_var`] — the
+/// single owner of the `CHAINVIEW_<SEG>_<KEY>` scheme — so the resolution is
+/// **identical for a built-in and an external id**: `deribit` reads
+/// `CHAINVIEW_DERIBIT_*`, `my-broker` reads `CHAINVIEW_MY_BROKER_*`, both under
+/// the total id ↔ segment bijection (`docs/07-configuration.md` §5.1, ADR-0008).
 fn assemble_providers(
     file_providers: BTreeMap<String, RawProviderSettings>,
     selected: &ProviderId,
@@ -636,9 +642,8 @@ fn assemble_providers(
         );
     }
 
-    let seg = encode_segment(selected.as_str());
-    let env_endpoint = env.get(&format!("CHAINVIEW_{seg}_ENDPOINT"));
-    let env_refresh = env.get(&format!("CHAINVIEW_{seg}_REFRESH"));
+    let env_endpoint = env.get(&provider_env_var(selected.as_str(), "endpoint"));
+    let env_refresh = env.get(&provider_env_var(selected.as_str(), "refresh"));
     let endpoint_override = cli_endpoint.or(env_endpoint);
 
     if endpoint_override.is_some() || env_refresh.is_some() || out.contains_key(selected) {
@@ -1268,6 +1273,74 @@ mod tests {
             None => panic!("expected deribit provider settings"),
         };
         assert_eq!(settings.refresh_interval, Some(Duration::from_secs(45)));
+    }
+
+    // --- External-id namespacing resolves identically to a built-in ----------
+    //
+    // The open-provider model requires `providers.<id>.*` / `CHAINVIEW_<ID>_*` to
+    // resolve for a NON-reserved external id exactly as it does for a built-in,
+    // through the total id -> segment bijection (issue #43, ADR-0006/ADR-0008,
+    // `docs/03-data-providers.md` §11.3, `docs/07-configuration.md` §5.1).
+
+    #[test]
+    fn test_config_external_id_endpoint_from_env() {
+        // `my-broker` -> segment `MY_BROKER` -> `CHAINVIEW_MY_BROKER_ENDPOINT`.
+        let env = env(&[("CHAINVIEW_MY_BROKER_ENDPOINT", "https://mybroker.example")]);
+        let cli = CliOverrides {
+            provider: Some("my-broker".to_owned()),
+            ..Default::default()
+        };
+        let config = assembled(cli, &env, None);
+        let settings = match config.providers.get(&pid("my-broker")) {
+            Some(s) => s,
+            None => panic!("expected my-broker provider settings"),
+        };
+        assert_eq!(
+            settings.endpoint.as_deref(),
+            Some("https://mybroker.example")
+        );
+    }
+
+    #[test]
+    fn test_config_external_id_refresh_from_env() {
+        // The per-provider cadence override resolves for an external id too.
+        let env = env(&[("CHAINVIEW_MY_BROKER_REFRESH", "12s")]);
+        let cli = CliOverrides {
+            provider: Some("my-broker".to_owned()),
+            ..Default::default()
+        };
+        let config = assembled(cli, &env, None);
+        let settings = match config.providers.get(&pid("my-broker")) {
+            Some(s) => s,
+            None => panic!("expected my-broker provider settings"),
+        };
+        assert_eq!(settings.refresh_interval, Some(Duration::from_secs(12)));
+    }
+
+    #[test]
+    fn test_config_external_id_uses_bijection_env_var_name() {
+        // The env-var name the loader reads for an external id is exactly the one
+        // `provider_env_var` builds (an underscore-bearing id double-escapes).
+        assert_eq!(
+            provider_env_var("my-broker", "endpoint"),
+            "CHAINVIEW_MY_BROKER_ENDPOINT"
+        );
+        assert_eq!(
+            provider_env_var("my_broker", "refresh"),
+            "CHAINVIEW_MY__BROKER_REFRESH"
+        );
+    }
+
+    #[test]
+    fn test_require_credentials_external_id_resolves_through_bijection() {
+        // A non-reserved external id reads its credentials from `CHAINVIEW_<SEG>_*`
+        // exactly like a built-in — the reserved-id rule keeps namespaces disjoint.
+        let env = env(&[("CHAINVIEW_MY_BROKER_TOKEN", "ext-token-123")]);
+        let provider = pid("my-broker");
+        match require_credentials(&env, &provider, &["token"]) {
+            Ok(map) => assert_eq!(map.get("TOKEN").map(Secret::expose), Some("ext-token-123")),
+            Err(e) => panic!("expected external credentials, got {e}"),
+        }
     }
 
     // --- Bijection -----------------------------------------------------------

@@ -18,6 +18,22 @@
 //! keeps the module graph acyclic — port → domain, never domain → port
 //! (`docs/03-data-providers.md` §12).
 //!
+//! # The delivered external-integration surface
+//!
+//! This port is the **complete, semver-governed surface** an external developer
+//! builds a broker integration against (`docs/03-data-providers.md` §11,
+//! [ADR-0006], [SEMVER.md]). Every type an external `impl Provider` names — this
+//! module's trait, capabilities, and helper types PLUS the emitted domain types
+//! ([`ChainFetch`], [`QuoteUpdate`](crate::chain::QuoteUpdate),
+//! [`GreeksRow`](crate::chain::GreeksRow),
+//! [`DepthLadder`](crate::chain::DepthLadder),
+//! [`MarketUpdate`](crate::chain::MarketUpdate), the identity types, and the
+//! `optionstratlib` chain-model vocabulary) — is re-exported from the crate root,
+//! so an external adapter compiles against `chainview::` alone. The registration
+//! flow (`ChainViewApp::builder().with_builtins().register(..).run()`), the
+//! reserved-id rule, and the `CHAINVIEW_<ID>_*` config namespacing are documented
+//! in the crate-root docs (`src/lib.rs`) and `docs/03-data-providers.md` §11.
+//!
 //! # `#[non_exhaustive]` + builder = source-compatible extension
 //!
 //! [`ProviderCapabilities`] and every capability enum are `#[non_exhaustive]`,

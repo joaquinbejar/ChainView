@@ -1,12 +1,143 @@
 //! # ChainView
 //!
-//! Terminal UI for option chains, Greeks and volatility — real-time market
-//! data and backtest replay, rendered in your terminal.
+//! A [`ratatui`](https://docs.rs/ratatui) terminal UI for options traders:
+//! real-time option chains, Greeks, and volatility surfaces (**Live** mode) and
+//! IronCondor backtest result-bundle rendering (**Replay** mode). The market-data
+//! clients and all the options math live upstream; this crate is the terminal
+//! around them: provider adapters, normalization, and the render loop.
 //!
-//! **Status:** early development — the crate skeleton is in place. The first
-//! runtime surface to land is the boundary error type [`ChainViewError`]; the
-//! remaining modules are planned surfaces and carry no runtime behavior yet.
-//! Follow progress at <https://github.com/joaquinbejar/ChainView>.
+//! `chainview` ships as **both a binary and a library**. The binary is the stock
+//! terminal (`cargo install chainview`); the library exposes the
+//! **semver-governed provider port**, so any developer can plug their own
+//! market-data venue or broker into ChainView with no fork ([ADR-0006]).
+//!
+//! # The provider port: the external-integration surface
+//!
+//! The port an external adapter compiles against is the [`Provider`] trait, the
+//! [`ProviderCapabilities`] self-declaration (built through its
+//! [`builder`](ProviderCapabilities::builder)) with its dimension enums
+//! ([`ChainCapability`] / [`GreeksCapability`] / [`OptionStreamCapability`] /
+//! [`ChainPollCapability`] / [`AuthKind`]), and every normalized domain type the
+//! trait emits: [`ChainFetch`] (with [`ExpirySource`] / [`AliasCatalog`]),
+//! [`OptionChain`] / [`ExpirationDate`] (`optionstratlib`), [`UnderlyingRef`],
+//! [`QuoteUpdate`], [`GreeksRow`], [`DepthLadder`], [`MarketUpdate`],
+//! [`Instrument`] / [`InstrumentKey`] / [`ContractSpecFingerprint`],
+//! [`SubscriptionRequest`], [`SubscriptionHandle`], [`MarketUpdateSink`],
+//! [`ProviderError`], and [`ProviderId`]. Every one is re-exported from this crate
+//! root — including the scalar field types the emitted values carry
+//! ([`Positive`], [`Decimal`], [`OptionStyle`], [`ExpirationDate`], and the
+//! [`DateTime`]`<`[`Utc`]`>` timestamps) — so an external adapter names each
+//! port type through `chainview::` (`docs/03-data-providers.md` §11.1). Two
+//! companion dependencies remain the adapter's own: `async_trait` (the trait
+//! is `#[async_trait]`, so implementing it needs the macro) and
+//! `optionstratlib` when the adapter *builds* an [`OptionChain`] itself.
+//!
+//! An external developer writes a thin binary that depends on `chainview` and
+//! registers their adapter through the app builder:
+//!
+//! ```no_run
+//! use async_trait::async_trait;
+//! use chainview::{
+//!     ChainFetch, ChainViewApp, ChainViewError, ExpirationDate, MarketUpdateSink,
+//!     Provider, ProviderCapabilities, ProviderError, ProviderId, SubscriptionHandle,
+//!     SubscriptionRequest, UnderlyingRef,
+//! };
+//!
+//! struct MyBroker {
+//!     id: ProviderId,
+//! }
+//!
+//! #[async_trait]
+//! impl Provider for MyBroker {
+//!     fn id(&self) -> ProviderId {
+//!         self.id.clone()
+//!     }
+//!
+//!     fn capabilities(&self) -> ProviderCapabilities {
+//!         // Declare EXACTLY what the upstream backs: the UI gates screens off
+//!         // this, never off the id. Every dimension defaults to its least-capable
+//!         // value, so adding a future optional dimension is a source-compatible
+//!         // minor bump.
+//!         ProviderCapabilities::builder().build()
+//!     }
+//!
+//!     async fn discover(&self) -> Result<Vec<UnderlyingRef>, ProviderError> {
+//!         Ok(vec![UnderlyingRef::new("BTC")])
+//!     }
+//!
+//!     async fn fetch_chain(
+//!         &self,
+//!         _underlying: &str,
+//!         _expiration: &ExpirationDate,
+//!     ) -> Result<ChainFetch, ProviderError> {
+//!         // A chain-producing adapter assembles a normalized `ChainFetch` here;
+//!         // an overlay-only feed returns `Unsupported`.
+//!         Err(ProviderError::Unsupported("overlay-only: no chain discovery"))
+//!     }
+//!
+//!     async fn subscribe(
+//!         &self,
+//!         _req: SubscriptionRequest,
+//!         _sink: MarketUpdateSink,
+//!     ) -> Result<SubscriptionHandle, ProviderError> {
+//!         // Drive an adapter-owned reconnect loop that pushes normalized
+//!         // `MarketUpdate`s into `_sink`; return a handle that cancels it.
+//!         Ok(SubscriptionHandle::new(|| { /* cancel the upstream stream */ }))
+//!     }
+//! }
+//!
+//! fn main() -> Result<(), ChainViewError> {
+//!     let broker = MyBroker { id: ProviderId::new("mybroker")? };
+//!     ChainViewApp::builder()
+//!         .with_builtins()   // the gate-clear bundled venues (Deribit)
+//!         .register(broker)  // your own venue; the id is read from `provider.id()`
+//!         .run() // a reserved/duplicate id is a typed startup error, never a panic
+//! }
+//! ```
+//!
+//! # What is semver-governed
+//!
+//! The port is a **public, semver-governed surface** (`docs/SEMVER.md`): a change
+//! to the [`Provider`] trait signature or any port type is a **major** bump;
+//! adding a new *optional* capability dimension is **minor**. That minor is
+//! source-compatible only because [`ProviderCapabilities`] and its enums are
+//! `#[non_exhaustive]` and an adapter builds them through
+//! [`ProviderCapabilities::builder`], never a struct literal. An external adapter
+//! pins a `chainview` major and compiles against a stable port for that major's
+//! lifetime.
+//!
+//! # Reserved ids and configuration namespacing
+//!
+//! The five built-in ids in [`RESERVED_PROVIDER_IDS`]
+//! (`deribit`/`tastytrade`/`dxlink`/`ig`/`alpaca`) are reserved: an external
+//! registration that reuses one is [`RegistryError::ReservedId`], and a duplicate
+//! id is [`RegistryError::DuplicateId`] — both typed startup errors, never a
+//! panic. Growing the reserved set later is a **major** bump (it can invalidate a
+//! working external id) and is announced one minor ahead. Every provider —
+//! built-in or external — reads its non-secret settings from `providers.<id>.*`
+//! and its credentials from `CHAINVIEW_<ID>_*` (the id transliterated to a
+//! shell-safe segment through a total bijection, `docs/07-configuration.md` §5.1);
+//! the reserved-id rule guarantees an external provider can never shadow a
+//! built-in's namespace.
+//!
+//! # Security boundary and scope
+//!
+//! An externally registered provider is **outside ChainView's credential audit
+//! boundary** — its author owns its credential hygiene ([ADR-0006] §7,
+//! `docs/SECURITY.md` §5). What ChainView still guarantees by construction is that
+//! **its own code never logs what crosses the port**: the port carries only
+//! normalized domain types (no credentials), and [`ProviderError`] is
+//! structurally redaction-safe. Dynamic/plugin loading (`dlopen`) is **out of
+//! scope for v1** — an adapter is a compile-time Rust dependency, not a loaded
+//! object (Rust has no stable ABI).
+//!
+//! # Status
+//!
+//! Pre-1.0 and in active development: the public API — including the provider
+//! port — may change until `v1.0.0`, after which the SemVer rules above are
+//! binding. Follow progress at <https://github.com/joaquinbejar/ChainView>.
+//!
+//! [ADR-0006]: https://github.com/joaquinbejar/ChainView/blob/main/docs/adr/0006-open-provider-extension.md
 
 #![forbid(unsafe_code)]
 
@@ -207,9 +338,24 @@ pub use providers::{
 // intentionally NOT narrowed to `pub(crate)` once `ChainViewApp::builder().run()`
 // (issue #11) owns the guard internally.
 pub use terminal::{TerminalGuard, install_panic_hook};
-// The domain speaks `optionstratlib`'s numeric vocabulary
-// (`docs/01-domain-model.md` §3–§4); re-export the two types that appear on the
-// public identity surface so downstream callers can name them without depending
-// on `optionstratlib` directly.
-pub use optionstratlib::OptionStyle;
-pub use optionstratlib::prelude::Positive;
+// The provider port and the domain speak `optionstratlib`'s chain-model and
+// numeric vocabulary (`docs/01-domain-model.md` §3–§4,
+// `docs/03-data-providers.md` §11.1, ADR-0006 §5): `OptionChain` is the chain a
+// `ChainFetch` wraps, `ExpirationDate` is the `Provider::fetch_chain` /
+// `UnderlyingRef` expiry type, and `Positive` / `Decimal` / `OptionStyle` are the
+// numeric/style types the emitted `QuoteUpdate` / `GreeksRow` / `InstrumentKey`
+// carry. Re-export all five at the crate root so an external adapter can name
+// every type in the port's signatures through `chainview::` alone, without a
+// direct `optionstratlib` dependency (a chain-PRODUCING adapter still depends on
+// it to BUILD an `OptionChain`). These are part of the semver-governed port
+// surface (`docs/SEMVER.md`, provider-port versioning).
+pub use optionstratlib::chains::chain::OptionChain;
+pub use optionstratlib::prelude::{Decimal, Positive};
+pub use optionstratlib::{ExpirationDate, OptionStyle};
+// The timestamp scalar every emitted event/identity value carries
+// (`QuoteUpdate`/`GreeksRow`/`DepthLadder` received/event times,
+// `InstrumentKey::expiration_utc`, `ExpirySource::expiration_utc`). No exported
+// fn produces one, so without this re-export a chain-producing or streaming
+// external adapter would need a direct `chrono` dependency to construct the
+// values the port emits (#43 review).
+pub use chrono::{DateTime, Utc};

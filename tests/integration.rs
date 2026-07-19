@@ -40,11 +40,12 @@ use tokio_util::sync::CancellationToken;
 
 use chainview::{
     AliasCatalog, ChainCapability, ChainFetch, ChainPollCapability, ChainSnapshot, ChainSource,
-    ChainViewApp, Config, ContractSpecFingerprint, EventBridge, ExerciseStyle, ExpirySource,
-    FinalTeardown, GreeksCapability, Instrument, InstrumentKey, LiveScreen, MarketUpdate,
-    MarketUpdateSink, ModeSelect, Provider, ProviderCapabilities, ProviderError, ProviderId,
-    RESERVED_PROVIDER_IDS, SettlementStyle, StreamHealth, SubscriptionHandle, SubscriptionRequest,
-    Supervisor, ThemeChoice, UnderlyingRef, is_screen_reachable, spawn_supervised_subscription,
+    ChainViewApp, ChainViewError, Config, ContractSpecFingerprint, EventBridge, ExerciseStyle,
+    ExpirySource, FinalTeardown, GreeksCapability, Instrument, InstrumentKey, LiveScreen,
+    MarketUpdate, MarketUpdateSink, ModeSelect, Provider, ProviderCapabilities, ProviderError,
+    ProviderId, RESERVED_PROVIDER_IDS, RegistryError, SettlementStyle, StreamHealth,
+    SubscriptionHandle, SubscriptionRequest, Supervisor, ThemeChoice, UnderlyingRef,
+    is_screen_reachable, spawn_supervised_subscription,
 };
 
 // --- Test constructors (no unwrap/expect/indexing per the ruleset) -----------
@@ -393,6 +394,26 @@ fn test_faux_provider_uses_a_valid_non_reserved_id() {
         !faux.id().is_reserved(),
         "an external adapter must use a non-reserved id"
     );
+}
+
+#[test]
+fn test_faux_external_provider_duplicate_registration_is_typed_error() {
+    // Two external registrations under one id are a TYPED `RegistryError::DuplicateId`
+    // through the PUBLIC builder — never a panic or a silent last-writer-wins
+    // (`docs/03-data-providers.md` §11.2). The whole path is exercised with only
+    // re-exported items, proving the external duplicate story compiles + surfaces
+    // typed against the public surface.
+    let result = ChainViewApp::builder()
+        .register(FauxProvider::chainful(pid("faux")))
+        .register(FauxProvider::chainful(pid("faux")))
+        .with_config(live_config("faux"))
+        .run();
+    match result {
+        Err(ChainViewError::Registry(RegistryError::DuplicateId(id))) => {
+            assert_eq!(id.as_str(), "faux");
+        }
+        other => panic!("expected DuplicateId(faux) from the public surface, got {other:?}"),
+    }
 }
 
 // =============================================================================

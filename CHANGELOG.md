@@ -14,6 +14,53 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- **The delivered, documented, semver-governed public provider port**
+  (`src/lib.rs`, `src/providers/mod.rs`, `src/config.rs`, issue #43;
+  `docs/03-data-providers.md` §11, `docs/SEMVER.md`, `docs/07-configuration.md`
+  §5, ADR-0006/ADR-0008). An external crate can now build a broker integration
+  against `chainview` with no fork, naming every port type through `chainview::` (the two accepted companion
+  deps: `async_trait` for the trait macro; `optionstratlib` only when the
+  adapter builds an `OptionChain` itself).
+  - **Complete crate-root re-export.** The port an external `impl Provider`
+    compiles against is re-exported in full: the `Provider` trait, the
+    `ProviderCapabilities` builder + its dimension enums, and every emitted /
+    signature domain type (`ChainFetch`/`ExpirySource`/`AliasCatalog`,
+    `UnderlyingRef`, `QuoteUpdate`/`GreeksRow`/`DepthLadder`/`MarketUpdate`,
+    `Instrument`/`InstrumentKey`/`ContractSpecFingerprint`,
+    `SubscriptionRequest`/`SubscriptionHandle`/`MarketUpdateSink`/`SinkSend`,
+    `ProviderError`/`RegistryError`, `ProviderId`/`RESERVED_PROVIDER_IDS`). The
+    export audit closed the last gap: the `optionstratlib` chain-model types the
+    port names — `OptionChain` (the `ChainFetch.chain`), `ExpirationDate` (the
+    `Provider::fetch_chain` / `UnderlyingRef` expiry type), and `Decimal` (every
+    `GreeksRow` Greek) — are now re-exported at the crate root alongside the
+    existing `Positive`/`OptionStyle`, so an external adapter needs no direct
+    `optionstratlib` dependency to *name* the port (a chain-**producing** adapter
+    still depends on it to *build* an `OptionChain`). The review closed the
+    co-located `chrono` gap the same way: `DateTime`/`Utc` — the timestamp
+    scalar on every emitted event/identity value, which no exported fn
+    produces — are re-exported too, so constructing `QuoteUpdate`/`GreeksRow`/
+    `InstrumentKey`/`ExpirySource` values needs no direct `chrono` dependency.
+  - **External-integration crate docs + compile-tested doctest.** The `src/lib.rs`
+    `//!` docs now document ChainView as a library with a stable provider port:
+    the builder flow
+    (`ChainViewApp::builder().with_builtins().register(MyBroker::new()).run()`),
+    what is semver-governed (trait-signature change = **major**, new optional
+    capability dimension = **minor**), the reserved ids and the reserved-id-growth
+    = major rule, the `CHAINVIEW_<ID>_*` config namespacing, the external-provider
+    security boundary, and dynamic-loading-out-of-scope. A `no_run` doctest
+    compiles a minimal external `Provider` impl end-to-end from the `chainview::`
+    surface plus the accepted `async_trait` companion — the seed for the #45 conformance test.
+  - **Per-provider config namespacing for external ids.** `providers.<id>.*`
+    file keys and `CHAINVIEW_<ID>_*` env keys (endpoint, refresh, credentials)
+    now resolve for a non-reserved external id **identically** to a built-in,
+    through the total id ↔ segment bijection; the per-provider env-var names are
+    built through the single `provider_env_var` helper.
+  - **Doc reconciliation.** `docs/03-data-providers.md` §11.1 (the port list) is
+    reconciled with the shipped surface, the §2/§5 `subscribe` signature is
+    corrected to the ADR-0009 two-class `MarketUpdateSink` (the stale
+    `mpsc::Sender<MarketUpdate>` wording is dropped), §11.2's provider-id grammar
+    is updated to the tightened ADR-0008 form, and `docs/SEMVER.md` records the
+    port as delivered. No behavior change to adapters, the store, or the UI.
 - **The standalone DXLink overlay adapter, behind a DISABLED-by-default feature
   gate** (`src/providers/dxlink.rs`, `src/providers/mod.rs`, `src/app/registry.rs`,
   issue #42; `docs/03-data-providers.md` §7.3, `docs/SECURITY.md` §2.4,
