@@ -385,10 +385,13 @@ impl TimelineCursor {
         bundle.equity.get(..self.equity_ix).unwrap_or(&[])
     }
 
-    /// The per-step P&L attribution rows up to and including the head step — the
-    /// series the attribution screen sums into a cumulative breakdown
-    /// (`docs/04-replay-mode.md` §4). ChainView never recomputes the decomposition;
-    /// it is displayed as authored.
+    /// The per-step P&L attribution rows with `step <= position` — the **as-of
+    /// attribution slice** up to and including the head step
+    /// (`docs/04-replay-mode.md` §4). ChainView never recomputes or **sums** the
+    /// decomposition: the replay screen renders the **head-step row**
+    /// ([`head_greeks`](Self::head_greeks)) as authored, so this full slice is
+    /// **currently unused by the screen** — it is retained for the deferred
+    /// attribution-history / #49 payoff work.
     #[must_use]
     pub fn visible_greeks<'b>(&self, bundle: &'b LoadedBundle) -> &'b [GreeksAttribution] {
         bundle.greeks.get(..self.greeks_ix).unwrap_or(&[])

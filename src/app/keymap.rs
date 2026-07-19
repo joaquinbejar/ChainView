@@ -547,7 +547,7 @@ pub static KEYMAP: &[Binding] = &[
         chords: &[KeyChord::Char(',')],
         keys_label: ",",
         help: "Previous fill",
-        deferred: Some("soon"),
+        deferred: None,
     },
     Binding {
         context: Context::Replay(ReplayScreen::Replay),
@@ -555,7 +555,7 @@ pub static KEYMAP: &[Binding] = &[
         chords: &[KeyChord::Char('.')],
         keys_label: ".",
         help: "Next fill",
-        deferred: Some("soon"),
+        deferred: None,
     },
     Binding {
         context: Context::Replay(ReplayScreen::Replay),
@@ -856,11 +856,10 @@ mod tests {
     }
 
     #[test]
-    fn test_keymap_marks_deferred_replay_keys_not_the_wired_ones() {
-        // #34 wired the scrub, end-jump, play/pause, and speed keys, so none of
-        // them carries a deferred marker; only the fill drill-down (`,` / `.`)
-        // stays deferred (its render lands in #35+) — the same cross-screen
-        // honesty pattern as chain.
+    fn test_keymap_marks_replay_keys_all_wired() {
+        // #34 wired the scrub, end-jump, play/pause, and speed keys; #35 wired the
+        // fill drill-down (`,` / `.`), so no replay key carries a deferred marker any
+        // more — the overlay advertises every replay key as live.
         let deferral = |action: ReplayAction| -> Option<&'static str> {
             KEYMAP
                 .iter()
@@ -874,9 +873,9 @@ mod tests {
         assert_eq!(deferral(ReplayAction::PlayPause), None);
         assert_eq!(deferral(ReplayAction::SpeedFaster), None);
         assert_eq!(deferral(ReplayAction::SpeedSlower), None);
-        // Fill drill-down navigation stays deferred (its render lands in #35+).
-        assert!(deferral(ReplayAction::PrevFill).is_some());
-        assert!(deferral(ReplayAction::NextFill).is_some());
+        // #35 wired the fill drill-down render, so `,` / `.` are live now.
+        assert_eq!(deferral(ReplayAction::PrevFill), None);
+        assert_eq!(deferral(ReplayAction::NextFill), None);
     }
 
     #[test]
