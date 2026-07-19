@@ -1907,7 +1907,7 @@ mod tests {
             r#"{{ "schema": "{schema}", "run_id": "run-abc123",
                  "created_utc": "2026-07-16T00:00:00Z", "code_version": "0.3.0",
                  "lockfile_sha256": "deadbeef", "seed": 42, {extra_field}
-                 "config": {{ "capital_cents": 1000000 }},
+                 "config": {{ "initial_capital": 1000000, "mode": "realistic" }},
                  "strategy": {{ "kind": "iron_condor" }},
                  "data_source": {{ "kind": "parquet", "path": "tape.parquet", "sha256": "cafe" }},
                  "metrics": {{ "sharpe": 1.5 }},

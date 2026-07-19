@@ -132,7 +132,12 @@ where
         let (Some(prev), Some(cur)) = (pair.first(), pair.get(1)) else {
             continue;
         };
-        let row = i.saturating_add(1);
+        // Checked, not saturating (a banned method): `i` is a windows(2) index so
+        // `i + 1` cannot overflow in practice, but an overflow must be a typed
+        // error, never a silently-wrong row number.
+        let row = i
+            .checked_add(1)
+            .ok_or_else(|| invariant(format!("{table}: row index overflowed usize")))?;
         match key(cur).cmp(&key(prev)) {
             Ordering::Less => {
                 return Err(invariant(format!(
@@ -251,17 +256,14 @@ fn check_attribution_identity(
 fn capital_cents(manifest: &BundleManifest) -> Result<i64, BundleError> {
     let capital = manifest.capital_config().map_err(|e| {
         invariant(format!(
-            "config.capital_cents missing or non-integer: {}",
+            "config.initial_capital missing or non-integer: {}",
             clamp_echo(&e.to_string())
         ))
     })?;
-    if capital.capital_cents < 0 {
-        return Err(invariant(format!(
-            "config.capital_cents {} must be >= 0",
-            capital.capital_cents
-        )));
-    }
-    Ok(capital.capital_cents)
+    // The wire field is unsigned (the IronCondor writer shape, #29), so negative
+    // is unrepresentable; the checked narrowing into the signed-cents domain is
+    // the only remaining failure (a typed Invariant beyond i64::MAX).
+    capital.capital_cents()
 }
 
 // --- §5 step 7: contiguous step domain + per-step ts_ns ---------------------
@@ -966,7 +968,7 @@ mod tests {
             code_version: "0.3.0".to_owned(),
             lockfile_sha256: "deadbeef".to_owned(),
             seed: 7,
-            config: serde_json::json!({ "capital_cents": capital }),
+            config: serde_json::json!({ "initial_capital": capital, "mode": "realistic" }),
             strategy: serde_json::json!({ "kind": "iron_condor" }),
             data_source: serde_json::json!({ "kind": "simulator" }),
             metrics: serde_json::json!({ "sharpe": 1.25 }),
@@ -1190,24 +1192,26 @@ mod tests {
     }
 
     #[test]
-    fn test_missing_capital_cents_is_invariant() {
+    fn test_missing_initial_capital_is_invariant() {
         let mut b = valid_bundle(3);
-        b.manifest.config = serde_json::json!({ "execution_mode": "naive" });
-        expect_invariant(run_validation_chain(&b), "capital_cents");
+        b.manifest.config = serde_json::json!({ "mode": "realistic" });
+        expect_invariant(run_validation_chain(&b), "initial_capital");
     }
 
     #[test]
-    fn test_non_integer_capital_cents_is_invariant() {
+    fn test_non_integer_initial_capital_is_invariant() {
         let mut b = valid_bundle(3);
-        b.manifest.config = serde_json::json!({ "capital_cents": "lots" });
-        expect_invariant(run_validation_chain(&b), "capital_cents");
+        b.manifest.config = serde_json::json!({ "initial_capital": "lots" });
+        expect_invariant(run_validation_chain(&b), "initial_capital");
     }
 
     #[test]
-    fn test_negative_capital_cents_is_invariant() {
+    fn test_negative_initial_capital_is_invariant() {
+        // The wire field is unsigned (#29), so a negative value fails DESERIALIZE
+        // by type - surfaced as the same typed missing-or-non-integer Invariant.
         let mut b = valid_bundle(3);
-        b.manifest.config = serde_json::json!({ "capital_cents": -5 });
-        expect_invariant(run_validation_chain(&b), "capital_cents");
+        b.manifest.config = serde_json::json!({ "initial_capital": -5 });
+        expect_invariant(run_validation_chain(&b), "initial_capital");
     }
 
     // --- §5 step 7: step-domain invariants ---------------------------------------
