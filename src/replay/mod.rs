@@ -29,7 +29,8 @@
 //!   raw [`serde_json::Value`] and displayed, never parsed field-by-field,
 //!   computed on, or compared in the equivalence oracle. The **one** narrow
 //!   exception is [`CapitalConfig`], the typed projection of the single
-//!   `config.capital_cents` field.
+//!   `config.initial_capital` field (IronCondor's writer field for opening
+//!   capital — integer cents; there is no `capital_cents` field).
 //!
 //! # Serde posture
 //!
@@ -115,10 +116,11 @@ pub struct BundleManifest {
     pub lockfile_sha256: String,
     /// Engine RNG seed.
     pub seed: u64,
-    /// `BacktestConfig` verbatim (execution mode, slippage, fees,
-    /// `capital_cents`, liquidity profile — money in cents). **Opaque**: read
-    /// [`capital_config`](Self::capital_config) for the one typed projection;
-    /// the rest is displayed, not interpreted.
+    /// `BacktestConfig` verbatim (`mode`, `slippage`, `fees`, `limits`,
+    /// `liquidity_profile`, `initial_capital` — money in cents). **Opaque**:
+    /// read [`capital_config`](Self::capital_config) for the one typed
+    /// projection (`config.initial_capital`); the rest — including the fill
+    /// model in `mode` (not `execution_mode`) — is displayed, not interpreted.
     pub config: Value,
     /// `kind` + params + `ExitPolicy`. **Opaque** to ChainView.
     pub strategy: Value,
@@ -136,37 +138,71 @@ pub struct BundleManifest {
 }
 
 impl BundleManifest {
-    /// Project the single `config.capital_cents` field out of the otherwise
+    /// Project the single `config.initial_capital` field out of the otherwise
     /// **opaque** [`config`](Self::config) blob into the typed [`CapitalConfig`].
     ///
     /// This is the **one** narrow interpretation of `config`; the rest stays
     /// uninterpreted. It performs `serde` deserialization only — the load-time
-    /// validation (present, integer, `>= 0`) and the mapping of an absent field
-    /// to [`BundleError::Invariant`] are the validation chain's (#32) job.
+    /// validation (present, integer), the checked narrowing to the reader's
+    /// internal signed cents ([`CapitalConfig::capital_cents`]), and the mapping
+    /// of an absent field to [`BundleError::Invariant`] are the validation
+    /// chain's (#32) job.
     ///
     /// # Errors
     ///
     /// Returns a [`serde_json::Error`] when `config` is not an object carrying an
-    /// integer `capital_cents` field — the projection never silently defaults to
-    /// `0`.
+    /// unsigned-integer `initial_capital` field — the projection never silently
+    /// defaults to `0`.
     pub fn capital_config(&self) -> Result<CapitalConfig, serde_json::Error> {
         CapitalConfig::deserialize(&self.config)
     }
 }
 
 /// The **one** narrow typed projection over the manifest `config` blob: the
-/// `config.capital_cents` field, read as integer cents
+/// `config.initial_capital` field, read as **unsigned integer cents**
 /// (`docs/04-replay-mode.md` §5).
 ///
-/// It deserializes from a representative `config` object and **ignores every
-/// other field** (execution mode, slippage, fees, liquidity profile, …), which
-/// stay opaque on [`BundleManifest::config`]. `capital_cents` is **required** —
-/// a `config` missing it is a `serde` error, never a silent `0`; the caller
-/// (#32) turns that into [`BundleError::Invariant`].
+/// IronCondor's writer emits opening capital as `config.initial_capital` — an
+/// unsigned integer number of cents (e.g. `10_000_000` = `$100,000.00`); there
+/// is **no** `capital_cents` field. This projection deserializes from a
+/// representative `config` object and **ignores every other field** (`mode`,
+/// `slippage`, `fees`, `limits`, `liquidity_profile`, `data_source`, …), which
+/// stay opaque on [`BundleManifest::config`]. `initial_capital` is
+/// **required** — a `config` missing it is a `serde` error, never a silent `0`;
+/// the caller (#32) turns that into [`BundleError::Invariant`].
+///
+/// Capital is unsigned on the wire; [`capital_cents`](Self::capital_cents)
+/// narrows it to the reader's internal **signed** cents (`i64`) via a
+/// **checked** conversion, so a value beyond the `i64` domain is a typed error,
+/// never an `as` cast.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapitalConfig {
-    /// Opening capital in **integer cents** (`>= 0`, checked at load in #32).
-    pub capital_cents: i64,
+    /// Opening capital in **integer cents**, unsigned — capital is never
+    /// negative in the writer's shape. Read verbatim from `config.initial_capital`.
+    pub initial_capital: u64,
+}
+
+impl CapitalConfig {
+    /// The opening capital as the reader's internal **signed** cents (`i64`),
+    /// via a **checked** `u64 -> i64` narrowing.
+    ///
+    /// Every other money field in the reader is signed `i64` cents; this keeps
+    /// capital in the same domain for the equity/attribution identity checks
+    /// (#32). Capital never *is* negative — the narrowing only guards the
+    /// unrepresentable case `initial_capital > i64::MAX`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BundleError::Invariant`] when `initial_capital` exceeds the
+    /// `i64` cents domain — a checked conversion, never an `as` cast or a panic.
+    pub fn capital_cents(&self) -> Result<i64, BundleError> {
+        i64::try_from(self.initial_capital).map_err(|_| {
+            BundleError::Invariant(format!(
+                "config.initial_capital {} exceeds the i64 cents domain",
+                self.initial_capital
+            ))
+        })
+    }
 }
 
 /// Which direction a leg is held.
@@ -480,13 +516,109 @@ mod tests {
             "code_version": "0.3.0",
             "lockfile_sha256": "deadbeef",
             "seed": 42,
-            "config": { "capital_cents": 1000000, "execution_mode": "realistic" },
+            "config": {
+                "initial_capital": 1000000,
+                "mode": "realistic",
+                "fees": { "per_contract_cents": 65, "per_order_cents": 100 },
+                "slippage": { "model": "none" }
+            },
             "strategy": { "kind": "iron_condor", "params": {} },
             "data_source": { "kind": "parquet", "path": "tape.parquet", "sha256": "cafe" },
             "metrics": { "sharpe": 1.5, "nested": { "total_pnl_cents": 12345 } },
             "row_counts": {
                 "fills": 4, "equity_curve": 10, "positions": 8, "greeks_attribution": 10
             }
+        }"#
+        .to_owned()
+    }
+
+    /// The **real** IronCondor conformance manifest, copied verbatim from
+    /// `IronCondor/tests/fixtures/conformance/manifest.json` — the ground-truth
+    /// writer output ChainView's reader must accept. Note the config shape:
+    /// `config.initial_capital` (unsigned cents) and `config.mode` (not
+    /// `capital_cents`/`execution_mode`), plus `fees`/`limits`/`liquidity_profile`
+    /// that stay opaque. Money in `metrics` is Decimal-as-string and opaque too.
+    fn real_ironcondor_manifest_json() -> String {
+        r#"{
+          "code_version": "0.5.0",
+          "config": {
+            "data_source": {
+              "kind": "parquet",
+              "path": "conformance_condor.parquet",
+              "sha256": ""
+            },
+            "fees": {
+              "per_contract_cents": 65,
+              "per_order_cents": 100
+            },
+            "initial_capital": 10000000,
+            "limits": {
+              "max_contracts_per_snapshot": 50000,
+              "max_decompressed_bytes": 8589934592,
+              "max_file_bytes": 4294967296,
+              "max_manifest_bytes": 16777216,
+              "max_rows_per_table": 100000000,
+              "max_steps": 100000,
+              "max_string_len": 65536,
+              "max_total_bytes": 2147483648
+            },
+            "liquidity_profile": {
+              "decay": "1",
+              "depth_levels": 2,
+              "touch_size": {
+                "contracts": 3,
+                "kind": "flat"
+              }
+            },
+            "marketable_cap_ticks": 10,
+            "mode": "realistic",
+            "output_dir": "conformance-out",
+            "overwrite": false,
+            "seed": 7,
+            "slippage": {
+              "model": "none"
+            }
+          },
+          "created_utc": "1970-01-01T00:00:00+00:00",
+          "data_source": {
+            "kind": "parquet",
+            "path": "conformance_condor.parquet",
+            "sha256": ""
+          },
+          "lockfile_sha256": "7757b4ea1d081633037b2f1795252453baca654186b607bb8c85f14e0009740b",
+          "metrics": {
+            "custom_metrics": {
+              "max_drawdown_cents": "19625",
+              "net_premium_cents": "1136000",
+              "realized_pnl_cents": "-7425"
+            },
+            "general_performance": {
+              "sharpe_ratio": "-0.577350269189625731058868041",
+              "total_return": "-0.0019625"
+            }
+          },
+          "row_counts": {
+            "equity_curve": 5,
+            "fills": 10,
+            "greeks_attribution": 5,
+            "positions": 18
+          },
+          "run_id": "c4cd155fc156f3ed1488661d9cfd448af59b216c962ea4716f76685f92b21459",
+          "schema": "ironcondor.bundle.v1",
+          "seed": 7,
+          "strategy": {
+            "IronCondor": {
+              "close_fee": 65,
+              "long_call_strike": 520000,
+              "long_put_strike": 480000,
+              "open_fee": 65,
+              "quantity": 5,
+              "short_call_strike": 510000,
+              "short_put_strike": 490000,
+              "underlying": "SPX",
+              "underlying_price": 500000
+            }
+          }
         }"#
         .to_owned()
     }
@@ -544,37 +676,83 @@ mod tests {
     // --- CapitalConfig --------------------------------------------------------
 
     #[test]
-    fn test_capital_config_extracts_capital_cents_ignoring_other_fields() {
+    fn test_capital_config_extracts_initial_capital_ignoring_other_fields() {
         let manifest: BundleManifest = from_json(&well_formed_manifest_json());
         let capital = match manifest.capital_config() {
             Ok(c) => c,
-            Err(e) => panic!("capital_config should project capital_cents: {e}"),
+            Err(e) => panic!("capital_config should project initial_capital: {e}"),
         };
-        assert_eq!(capital.capital_cents, 1_000_000);
+        assert_eq!(capital.initial_capital, 1_000_000);
     }
 
     #[test]
-    fn test_capital_config_reports_absent_capital_cents() {
-        // A config blob missing `capital_cents` is an error the caller (#32) turns
-        // into Invariant — it never silently defaults to 0.
-        let config = serde_json::json!({ "execution_mode": "naive", "fees_cents": 5 });
+    fn test_capital_config_reads_real_ironcondor_manifest() {
+        // The REAL IronCondor writer output must parse and project its opening
+        // capital from `config.initial_capital` (10_000_000 cents = $100k).
+        let manifest: BundleManifest = from_json(&real_ironcondor_manifest_json());
+        assert_eq!(manifest.schema, "ironcondor.bundle.v1");
+        assert_eq!(manifest.seed, 7);
+        assert_eq!(manifest.row_counts.get("positions"), Some(&18));
+        let capital = match manifest.capital_config() {
+            Ok(c) => c,
+            Err(e) => panic!("real manifest must project initial_capital: {e}"),
+        };
+        assert_eq!(capital.initial_capital, 10_000_000);
+        // The checked narrowing into the reader's signed cents succeeds.
+        match capital.capital_cents() {
+            Ok(cents) => assert_eq!(cents, 10_000_000),
+            Err(e) => panic!("checked capital narrowing must succeed: {e}"),
+        }
+    }
+
+    #[test]
+    fn test_capital_config_reports_absent_initial_capital() {
+        // A config blob missing `initial_capital` is an error the caller (#32)
+        // turns into Invariant — it never silently defaults to 0.
+        let config = serde_json::json!({ "mode": "naive", "fees": { "per_order_cents": 5 } });
         assert!(
             CapitalConfig::deserialize(&config).is_err(),
-            "an absent capital_cents must not default to 0"
+            "an absent initial_capital must not default to 0"
         );
     }
 
     #[test]
-    fn test_capital_config_capital_cents_is_i64() {
-        let config = serde_json::json!({ "capital_cents": -25 });
+    fn test_capital_config_rejects_legacy_capital_cents_shape() {
+        // The pre-reconcile self-authored shape (`config.capital_cents`, no
+        // `initial_capital`) is now REJECTED: the reader tracks the writer's true
+        // field name, so a bundle carrying only `capital_cents` fails to project.
+        let config = serde_json::json!({ "capital_cents": 1_000_000 });
+        assert!(
+            CapitalConfig::deserialize(&config).is_err(),
+            "the legacy capital_cents-only shape must not project as initial_capital"
+        );
+    }
+
+    #[test]
+    fn test_capital_config_initial_capital_is_unsigned() {
+        // Capital is unsigned on the wire: a negative `initial_capital` cannot
+        // deserialize into u64 — the type rejects it, no `as` coercion.
+        let config = serde_json::json!({ "initial_capital": -25 });
+        assert!(
+            CapitalConfig::deserialize(&config).is_err(),
+            "a negative initial_capital must fail against the unsigned wire type"
+        );
+    }
+
+    #[test]
+    fn test_capital_config_capital_cents_checked_conversion_overflows() {
+        // A capital beyond the i64 cents domain is a typed BundleError::Invariant
+        // from the checked narrowing — never an `as` cast or a panic.
+        let config = serde_json::json!({ "initial_capital": u64::MAX });
         let capital = match CapitalConfig::deserialize(&config) {
             Ok(c) => c,
-            Err(e) => panic!("signed capital_cents should deserialize: {e}"),
+            Err(e) => panic!("u64::MAX initial_capital should deserialize: {e}"),
         };
-        // i64 accepts a negative wire value here; the >= 0 rule is a #32 load
-        // check, not a type constraint.
-        let _typed: i64 = capital.capital_cents;
-        assert_eq!(capital.capital_cents, -25);
+        assert_eq!(capital.initial_capital, u64::MAX);
+        match capital.capital_cents() {
+            Err(BundleError::Invariant(_)) => {}
+            other => panic!("overflowing capital narrowing should be Invariant, got {other:?}"),
+        }
     }
 
     // --- PositionSide / ExecMode / OptionStyle wire strings ------------------
