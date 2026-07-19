@@ -35,9 +35,10 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Flex, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Clear, Paragraph};
+use ratatui::widgets::{Block, Paragraph};
 
 use crate::app::{App, LiveScreen, Mode, ReplayScreen};
+use crate::ui::theme::Theme;
 
 pub mod chain;
 pub mod depth;
@@ -45,6 +46,7 @@ pub mod driver;
 pub mod payoff;
 pub mod replay;
 pub mod surface;
+pub mod theme;
 
 // ---------------------------------------------------------------------------
 // The root layout: status bar (top), screen body (middle), hint line (bottom).
@@ -91,9 +93,20 @@ pub fn layout_root(area: Rect) -> RootLayout {
 /// dispatch is a total match — the mode first, then an exhaustive match over that
 /// mode's screens with **no `_` arm** — so a new screen forces the matching mode
 /// arm to be revisited by the compiler.
+///
+/// The resolved [`Theme`] (auto/dark/light + `NO_COLOR`) is computed once here and
+/// passed to the status bar, keybar, and help overlay. Below the minimum terminal
+/// size ([`theme::is_too_small`]) any screen shows the cross-screen "widen the
+/// terminal" state instead of a corrupt layout (`docs/05-views-and-ux.md` §8).
 pub fn render(app: &App, frame: &mut Frame) {
-    let root = layout_root(frame.area());
-    draw_status(app, frame, root.status);
+    let area = frame.area();
+    let theme = Theme::resolve(app.theme, app.no_color);
+    if theme::is_too_small(area) {
+        theme::draw_too_small(frame, area, theme);
+        return;
+    }
+    let root = layout_root(area);
+    theme::draw_status(app, frame, root.status, theme);
     match &app.mode {
         Mode::Live(state) => match state.screen {
             LiveScreen::Chain => chain::draw(state, frame, root.body),
@@ -106,66 +119,10 @@ pub fn render(app: &App, frame: &mut Frame) {
             ReplayScreen::Payoff => payoff::draw_replay(state, frame, root.body),
         },
     }
-    draw_hint(app, frame, root.hint);
+    theme::draw_hint(app, frame, root.hint, theme);
     if app.help_open {
-        draw_help_overlay(frame, root.body);
+        theme::draw_help_overlay(app, frame, root.body, theme);
     }
-}
-
-// ---------------------------------------------------------------------------
-// Status bar, hint line, and help overlay (placeholders — content is #14).
-// ---------------------------------------------------------------------------
-
-/// Draw a **minimal** status bar (`docs/05-views-and-ux.md` §8). The full,
-/// always-truthful status line — provider health badge, clock, run id — lands with
-/// the theme/status work (#14); this placeholder shows only the mode, never a
-/// fabricated health badge.
-fn draw_status(app: &App, frame: &mut Frame, area: Rect) {
-    let label = match &app.mode {
-        Mode::Live(_) => "chainview  live",
-        Mode::Replay(_) => "chainview  replay",
-    };
-    let line = Line::from(Span::styled(
-        label,
-        Style::new().add_modifier(Modifier::BOLD),
-    ));
-    frame.render_widget(Paragraph::new(line), area);
-}
-
-/// Draw a **minimal** one-line hint/keybar (`docs/05-views-and-ux.md` §8). The
-/// full keybar, generated from the single keybinding map, lands with the keymap
-/// (#14); this placeholder names only the two always-available globals.
-fn draw_hint(app: &App, frame: &mut Frame, area: Rect) {
-    let hint = if app.help_open {
-        "?/Esc  close help"
-    } else {
-        "?  help     q  quit"
-    };
-    let line = Line::from(Span::styled(hint, Style::new().add_modifier(Modifier::DIM)));
-    frame.render_widget(Paragraph::new(line), area);
-}
-
-/// Draw the modal help overlay (`docs/02-tui-architecture.md` §9,
-/// `docs/05-views-and-ux.md` §3) — a placeholder floating over the body. The
-/// overlay **content** (the keybinding table generated from the map) lands with
-/// the keymap (#14); this proves the modal frame and the [`Clear`] behind it.
-fn draw_help_overlay(frame: &mut Frame, area: Rect) {
-    let overlay = centered_rect(area, 44, 7);
-    // Clear the cells behind the overlay so the body does not bleed through.
-    frame.render_widget(Clear, overlay);
-    let block = Block::bordered().title("Help");
-    let text = Text::from(vec![
-        Line::from("Keybinding help lands with the keymap (#14)."),
-        Line::from(""),
-        Line::from(Span::styled(
-            "?/Esc  close",
-            Style::new().add_modifier(Modifier::DIM),
-        )),
-    ]);
-    let paragraph = Paragraph::new(text)
-        .block(block)
-        .alignment(Alignment::Center);
-    frame.render_widget(paragraph, overlay);
 }
 
 // ---------------------------------------------------------------------------
@@ -193,8 +150,9 @@ pub(crate) fn placeholder_body(frame: &mut Frame, area: Rect, title: &str, note:
 
 /// A `width`×`height` rectangle centered in `area`, clamped to `area` so it never
 /// escapes its bounds. Uses [`Flex::Center`] so there is no manual geometry
-/// arithmetic (and no `saturating_*`, per `rules/global_rules.md`).
-fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
+/// arithmetic (and no `saturating_*`, per `rules/global_rules.md`). Shared with the
+/// theme layer's overlays (`docs/05-views-and-ux.md` §8).
+pub(crate) fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
     let [row] = Layout::vertical([Constraint::Length(height)])
         .flex(Flex::Center)
         .areas(area);

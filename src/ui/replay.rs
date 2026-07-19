@@ -13,11 +13,12 @@
 //! the data layer — the widget itself never performs the seek I/O
 //! (`docs/02-tui-architecture.md` §9).
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::KeyEvent;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 
 use crate::app::ReplayState;
+use crate::app::keymap::{KeyChord, ReplayAction, resolve_replay};
 use crate::event::{AppEvent, SeekTo};
 
 /// Draw the replay screen for `state` into `area` — a pure render over the
@@ -36,17 +37,25 @@ pub fn draw(_state: &ReplayState, frame: &mut Frame, area: Rect) {
 /// (`docs/05-views-and-ux.md` §3). Pure — no I/O; a scrub key returns an
 /// [`AppEvent::ReplaySeek`] rather than seeking inline.
 ///
-/// The step-relative scrubs (`←`/`→` step back/forward, `Home` to the start) are
-/// expressed against the one integer replay clock (`docs/04-replay-mode.md` §4).
-/// `End` needs the last step, which the timeline model (v0.3) owns, so it is a
-/// no-op placeholder until then. The remaining replay keys (`Space` play/pause,
-/// `,`/`.` fill drill-down, speed) land with the replay screen (v0.3).
+/// The key is resolved **through the single keybinding map**
+/// ([`resolve_replay`], `src/app/keymap.rs`) so the dispatch and the help overlay
+/// cannot drift. The step-relative scrubs (`←`/`→`/`h`/`l` step back/forward,
+/// `Home` to the start) are expressed against the one integer replay clock
+/// (`docs/04-replay-mode.md` §4). `End` (jump to the last step) needs the timeline
+/// model (v0.3), and playback / speed / fill drill-down land there too, so those
+/// actions are documented in the map but resolve to a no-op placeholder here.
 #[must_use]
-pub fn handle_key(_state: &mut ReplayState, key: KeyEvent) -> Option<AppEvent> {
-    match key.code {
-        KeyCode::Left => Some(AppEvent::ReplaySeek(SeekTo::StepBy(-1))),
-        KeyCode::Right => Some(AppEvent::ReplaySeek(SeekTo::StepBy(1))),
-        KeyCode::Home => Some(AppEvent::ReplaySeek(SeekTo::Step(0))),
-        _ => None,
+pub fn handle_key(state: &mut ReplayState, key: KeyEvent) -> Option<AppEvent> {
+    let chord = KeyChord::from_event(key)?;
+    match resolve_replay(chord, state.screen)? {
+        ReplayAction::StepBack => Some(AppEvent::ReplaySeek(SeekTo::StepBy(-1))),
+        ReplayAction::StepForward => Some(AppEvent::ReplaySeek(SeekTo::StepBy(1))),
+        ReplayAction::JumpStart => Some(AppEvent::ReplaySeek(SeekTo::Step(0))),
+        ReplayAction::JumpEnd
+        | ReplayAction::PlayPause
+        | ReplayAction::SpeedSlower
+        | ReplayAction::SpeedFaster
+        | ReplayAction::PrevFill
+        | ReplayAction::NextFill => None,
     }
 }
