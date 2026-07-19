@@ -14,6 +14,32 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- **The external-provider end-to-end conformance test** (`tests/integration.rs`,
+  issue #45; `docs/TESTING.md` §7, `docs/03-data-providers.md` §11/§5, ADR-0006).
+  Extends the `FauxProvider` conformance suite (a test-only external adapter
+  built from `chainview::` public items alone, non-reserved `ProviderId("faux")`)
+  so the `fetch -> store fold -> stream merge -> render` path is proven at
+  **parity with a built-in through the port alone**:
+  - **Domain store-fold parity.** The faux `fetch_chain` normalizes into an
+    `optionstratlib` `OptionChain` and folds into the public `ChainStore`
+    byte-identically to the same data seeded under a built-in id — the fold
+    reads the normalized chain, never the `ProviderId` — and a streaming
+    `QuoteUpdate` merges `MergeOutcome::Applied`, all through public items.
+  - **Public-`render` end-to-end draw.** The faux source renders through the
+    public `render` entry (the external id in the status bar, both faux strikes
+    in the chain matrix body), with no built-in special-casing.
+  - **Typed collision conformance.** A reserved built-in id used through the
+    external `register(..)` path surfaces the typed `RegistryError::ReservedId`
+    (a new deterministic case, plus the `prop_faux_registration_rejects_every_reserved_id`
+    property strengthened from `is_err()` to the typed variant), companion to the
+    existing `RegistryError::DuplicateId` case.
+  - **Public/in-crate split documented.** The committed-golden render-parity
+    proof stays in-crate (`src/tests_integration.rs`) because it needs the
+    `pub(crate)` `ui::chain::draw` body and golden harness — promoting either
+    would widen the semver-governed API; the external test proves parity through
+    the public surface instead. Tests-only, deterministic, no network, mock
+    transport, well under the 10 s bound; the four non-negotiable commands plus
+    `cargo test --test arch` are clean.
 - **The `capabilities_source_compat` source-compat compile gate**
   (`tests/trybuild.rs` + `tests/ui/*`, issue #44; `docs/TESTING.md` §3,
   `docs/SEMVER.md` provider-port versioning, `docs/03-data-providers.md` §2,
