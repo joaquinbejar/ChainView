@@ -477,22 +477,8 @@ pub fn compute_leg_greeks(
         return Ok(());
     }
 
-    // The absolute expiry keys the sidecar and sets the time-to-expiry. A
-    // relative `Days` (or an unparseable expiry) must never reach the kernel —
-    // the adapter resolves expiry to an absolute instant at the seam (§4).
-    let expiration_utc = match chain.get_expiration() {
-        Some(ExpirationDate::DateTime(dt)) => dt,
-        other => {
-            debug_assert!(
-                !matches!(other, Some(ExpirationDate::Days(_))),
-                "compute_leg_greeks requires an absolute-UTC chain expiry; a relative \
-                 Days offset must be resolved at the adapter seam"
-            );
-            // Defensive skip: mark the generation handled so a malformed chain
-            // degrades to "no local analytics" without a per-event busy loop.
-            sink.computed_generation = Some(ctx.input_generation);
-            return Ok(());
-        }
+    let Some(expiration_utc) = resolve_chain_expiry(chain, ctx, sink) else {
+        return Ok(());
     };
 
     for od in &chain.options {
@@ -503,6 +489,81 @@ pub fn compute_leg_greeks(
 
     sink.computed_generation = Some(ctx.input_generation);
     Ok(())
+}
+
+/// Recompute ONLY the named dirty `(strike, style)` legs into `sink` — the hot-path
+/// counterpart to the full-chain [`compute_leg_greeks`] (`docs/01-domain-model.md`
+/// §7).
+///
+/// An applied stream quote / Greeks row touches a SINGLE leg (one strike, one
+/// style), so the chain store folds it in O(changed legs) by repricing just that
+/// leg rather than every strike on every tick — the full-chain pass is reserved
+/// for the poll path, where a fresh snapshot legitimately invalidates every leg.
+/// Each named leg is priced EXACTLY as the full pass would price it — same
+/// [`PricingInputs`], same per-leg [`QuoteClocks`] freshness gate, same venue
+/// iv/gamma preference and same [`LegStatus`] clearing — so a dirty recompute of a
+/// leg is bit-identical to the full recompute of that leg; the untouched legs are
+/// deliberately left at their prior generation, refreshed by the next full poll.
+///
+/// Unlike [`compute_leg_greeks`] there is NO generation short-circuit: the caller
+/// has bumped `input_generation` for the leg it changed and this pass always
+/// reprices the named legs, then records `input_generation` as the sidecar's
+/// computed generation (so a later full pass at that generation is a cache no-op).
+/// A named leg whose strike is absent from `chain` has nothing to price and is
+/// skipped (defensive — the store only marks a present strike dirty).
+///
+/// # Errors
+///
+/// Mirrors [`compute_leg_greeks`]: every per-leg outcome is recorded in the leg's
+/// status and `Ok(())` is returned; a chain whose expiry is not an absolute UTC
+/// instant degrades to "no local analytics".
+pub fn compute_dirty_legs(
+    chain: &OptionChain,
+    ctx: &PricingInputs,
+    quotes: &QuoteClocks,
+    dirty: &[(Positive, OptionStyle)],
+    sink: &mut GreeksSidecar,
+) -> Result<(), ChainViewError> {
+    let Some(expiration_utc) = resolve_chain_expiry(chain, ctx, sink) else {
+        return Ok(());
+    };
+
+    for &(strike, style) in dirty {
+        if let Some(od) = chain.options.get(&probe_row(strike)) {
+            compute_one_leg(od, style, &chain.symbol, expiration_utc, ctx, quotes, sink);
+        }
+    }
+
+    sink.computed_generation = Some(ctx.input_generation);
+    Ok(())
+}
+
+/// Resolve the chain's absolute-UTC expiry for a pricing pass, or degrade to "no
+/// local analytics" when the chain expiry is not an absolute instant.
+///
+/// The absolute expiry keys the sidecar and sets the time-to-expiry. A relative
+/// `Days` (or an unparseable expiry) must never reach the kernel — the adapter
+/// resolves expiry to an absolute instant at the seam (§4). On the (invariant-
+/// violating) non-absolute path the generation is marked handled so a malformed
+/// chain degrades without a per-event busy loop, and `None` is returned so the
+/// caller returns without pricing.
+fn resolve_chain_expiry(
+    chain: &OptionChain,
+    ctx: &PricingInputs,
+    sink: &mut GreeksSidecar,
+) -> Option<DateTime<Utc>> {
+    match chain.get_expiration() {
+        Some(ExpirationDate::DateTime(dt)) => Some(dt),
+        other => {
+            debug_assert!(
+                !matches!(other, Some(ExpirationDate::Days(_))),
+                "local Greeks require an absolute-UTC chain expiry; a relative \
+                 Days offset must be resolved at the adapter seam"
+            );
+            sink.computed_generation = Some(ctx.input_generation);
+            None
+        }
+    }
 }
 
 /// Compute (or clear) one `(strike, style)` leg and store the result in `sink`.
@@ -779,6 +840,18 @@ fn quote_is_stale(received: DateTime<Utc>, as_of: DateTime<Utc>) -> bool {
         .to_std()
         .unwrap_or(Duration::ZERO);
     age > QUOTE_STALE_AFTER
+}
+
+/// A strike-only probe row for a `BTreeSet<OptionData>` lookup — `OptionData`'s
+/// `Ord` is its `strike_price`, so a probe carrying just the strike locates the
+/// real row (mirrors the chain store's `probe_row`), letting the dirty-leg pass
+/// find one strike's row without scanning the whole chain.
+#[must_use]
+fn probe_row(strike: Positive) -> OptionData {
+    OptionData {
+        strike_price: strike,
+        ..Default::default()
+    }
 }
 
 /// True when a bid/ask pair is crossed: `ask < bid`, or a zero ask on a non-zero
@@ -1361,6 +1434,108 @@ mod tests {
         assert_eq!(sink.computed_generation(), None);
         compute(&atm_chain(), &inputs(AS_OF_BEFORE, 7), &mut sink);
         assert_eq!(sink.computed_generation(), Some(7));
+    }
+
+    // --- Dirty-leg recompute (the O(changed legs) hot path) ------------------
+
+    /// A two-strike chain — the fixture for the dirty-leg scoping tests.
+    fn two_strike_chain() -> OptionChain {
+        chain_of(&[
+            od(
+                60_000.0,
+                Some(3_000.0),
+                Some(3_100.0),
+                Some(2_000.0),
+                Some(2_100.0),
+            ),
+            od(
+                61_000.0,
+                Some(2_600.0),
+                Some(2_700.0),
+                Some(2_400.0),
+                Some(2_500.0),
+            ),
+        ])
+    }
+
+    /// Recompute exactly the named dirty legs with no per-leg freshness signal.
+    #[track_caller]
+    fn compute_dirty(
+        chain: &OptionChain,
+        ctx: &PricingInputs,
+        dirty: &[(Positive, OptionStyle)],
+        sink: &mut GreeksSidecar,
+    ) {
+        match compute_dirty_legs(chain, ctx, &QuoteClocks::new(), dirty, sink) {
+            Ok(()) => {}
+            Err(e) => panic!("compute_dirty_legs failed: {e}"),
+        }
+    }
+
+    #[test]
+    fn test_compute_dirty_legs_reprices_only_the_named_legs() {
+        let chain = two_strike_chain();
+        // Seed every leg with a full pass at generation 1.
+        let mut sink = GreeksSidecar::new();
+        compute(&chain, &inputs(AS_OF_BEFORE, 1), &mut sink);
+        let k1_call_before = leg(&sink, 60_000.0, OptionStyle::Call);
+        let k1_put_before = leg(&sink, 60_000.0, OptionStyle::Put);
+        let k2_call_before = leg(&sink, 61_000.0, OptionStyle::Call);
+
+        // A dirty pass at a DIFFERENT as-of (longer time to expiry) for one leg only.
+        // The named leg must change; the others must be byte-identical.
+        compute_dirty(
+            &chain,
+            &inputs(AS_OF_BEFORE - 10_000_000, 2),
+            &[(pos(60_000.0), OptionStyle::Call)],
+            &mut sink,
+        );
+        assert_ne!(leg(&sink, 60_000.0, OptionStyle::Call), k1_call_before);
+        assert_eq!(leg(&sink, 60_000.0, OptionStyle::Put), k1_put_before);
+        assert_eq!(leg(&sink, 61_000.0, OptionStyle::Call), k2_call_before);
+        // The generation is recorded so a later full pass at it is a cache no-op.
+        assert_eq!(sink.computed_generation(), Some(2));
+    }
+
+    #[test]
+    fn test_compute_dirty_legs_matches_full_pass_for_the_named_leg() {
+        let chain = two_strike_chain();
+        let ctx = inputs(AS_OF_BEFORE, 1);
+        // The full pass prices every leg.
+        let mut full = GreeksSidecar::new();
+        compute(&chain, &ctx, &mut full);
+        // A dirty pass on a FRESH sink prices only the named leg — and must produce
+        // a bit-identical entry to the full pass for that leg.
+        let mut dirty = GreeksSidecar::new();
+        compute_dirty(
+            &chain,
+            &ctx,
+            &[(pos(60_000.0), OptionStyle::Call)],
+            &mut dirty,
+        );
+        assert_eq!(
+            dirty.get(&key(60_000.0, OptionStyle::Call)),
+            full.get(&key(60_000.0, OptionStyle::Call))
+        );
+        // The unnamed leg was never priced on the dirty sink.
+        assert_eq!(dirty.get(&key(61_000.0, OptionStyle::Call)), None);
+    }
+
+    #[test]
+    fn test_compute_dirty_legs_absent_strike_is_skipped() {
+        let chain = two_strike_chain();
+        let mut sink = GreeksSidecar::new();
+        // A dirty key whose strike is not in the chain prices nothing and does not
+        // panic, but still records the handled generation.
+        compute_dirty(
+            &chain,
+            &inputs(AS_OF_BEFORE, 3),
+            &[(pos(99_999.0), OptionStyle::Call)],
+            &mut sink,
+        );
+        assert_eq!(sink.get(&key(99_999.0, OptionStyle::Call)), None);
+        assert!(sink.is_empty());
+        assert_eq!(sink.computed_generation(), Some(3));
     }
 
     // --- Determinism ---------------------------------------------------------

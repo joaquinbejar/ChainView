@@ -14,6 +14,61 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- Per-leg Greeks precedence wired through the chain matrix (`src/chain/store.rs`,
+  `src/ui/chain.rs`, issue #25; docs 01 §7, §8) — the projection+wiring layer on
+  the #24 engine. `ChainStore` now **owns** the style-keyed `GreeksSidecar` and
+  fills it on the market/tick event (never in `draw`): `apply_greeks` folds venue
+  iv/gamma per style via `apply_venue_greeks`, and `apply_poll`/`apply_quote`/
+  `apply_greeks`/`seed` run `compute_leg_greeks` to fill local theta/vega/rho (and
+  the local iv/gamma/delta fallback), cached by a store `input_generation` that
+  bumps only on an applied option-data change (a dropped/crossed update is a cache
+  no-op). The reference instant is a store timestamp (`last_full_poll` / the
+  update's `received_time`), **never** `Utc::now()`, so the fill stays
+  deterministic. A new read-only `ChainStore::leg_greeks(&InstrumentKey)` exposes
+  the cached analytics to the draw path — no `&mut` reaches draw. The chain-matrix
+  projection (`project_call`/`project_put`/`resolve_leg`) now resolves each
+  `LegView` field by the §7 per-field precedence: **delta** prefers the venue
+  per-leg value (`delta_call`/`delta_put`) and falls back to the local sidecar;
+  **gamma** comes from the style-keyed `LegGreeks` (venue-or-local per its origin,
+  so unequal call/put gamma both survive — the shared-`OptionData`-field loss is
+  fixed); **iv** follows a three-level precedence (`resolve_iv`) — a per-style
+  **venue** sidecar IV → the **call-only** shared `OptionData.implied_volatility`
+  (§7 documents that shared field as the call-side value, so the **put gets no
+  shared fallback**, avoiding a call/put IV collision) → a **locally computed**
+  sidecar IV; **theta**/**vega** are always locally computed. A **sub-plausibility
+  local-IV honesty floor** (`MIN_PLAUSIBLE_LOCAL_IV` = 0.5%, IV stored as a
+  fraction) clears a `ComputedLocally`-origin IV below the floor to `—` (the same
+  economic-implausibility reasoning as the exact-zero venue sentinel), so a
+  mispriced near-zero local inversion — e.g. a Deribit inverse (BTC-settled)
+  contract priced as USD by the #24 engine — degrades to `—` rather than painting a
+  fake percentage; a **venue** (`Provider`) IV is trusted and **never** floored, so
+  a legitimate provider-computed IV (IG equities, always ≫ 0.5%) still shows. On the
+  zero-config Deribit **seed frame** the call IV now shows the honest venue value
+  (e.g. `49.22%` from the shared call-side field, `Provider` origin) and the put IV
+  shows `—` (no per-style venue IV at seed; the near-zero local floored out), rather
+  than the fabricated `0.00%`/`0.20%` a prior revision rendered. `LegView.greeks_origin`
+  still rolls up to `ComputedLocally` when **any** resolved present field is local,
+  but the `~` origin glyph now badges the **actual computed cell** (an
+  iv/gamma/theta/vega/delta value whose resolved origin is `ComputedLocally`), never
+  the trustworthy venue field beside it — so a mixed-origin row (venue delta + local
+  theta) badges the local theta, and a leg with a local field but a `None` delta is
+  still badged (glyph present iff a present resolved field is local; legible under
+  `NO_COLOR`). A `None` field renders `—`, never a fabricated `0`. The matrix now
+  carries the full **delta/gamma/theta/vega** columns, dropped responsively in the
+  documented `Γ → ν → Θ` order (Θ retained first, Γ last). The projection is a
+  **pure** read of the cached sidecar — no recompute and no pricing in `draw`.
+  Populated-matrix render goldens (`deribit_btc_atm`, `stale`, `escape_hygiene`)
+  regenerated for the honest per-leg IV + relocated origin glyph (the authoritative
+  golden + tolerance fixtures land with #28). New unit/property/store tests:
+  per-field precedence branches, the sub-plausibility local-IV floor (below → `—`,
+  above → shown, venue never floored), the call-only shared-IV fallback and the
+  put's non-collision, the per-cell origin glyph (including the `None`-delta-with-
+  local-theta case), unequal call/put gamma survival in both arrival permutations,
+  `—`-not-`0`, responsive column drop order, a draw-purity/no-pricing assertion, and
+  store-side sidecar population + generation-cache no-op. No new dependency. The
+  deeper honest-per-leg-IV-at-seed restoration (unit-aware inverse-contract IV
+  inversion + per-style venue-IV seeding, so the local inversion itself is correct
+  rather than floored) is deferred to a follow-up.
 - The local Greeks/IV fill-in engine (`src/chain/greeks.rs`, issue #24; docs 01
   §7) — the analytics sidecar that fills the Greeks/IV `optionstratlib`'s
   `OptionData` cannot hold (it persists only iv/delta/shared-gamma, no
