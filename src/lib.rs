@@ -162,13 +162,26 @@ pub use error::{
 // match IronCondor's copy exactly (`docs/04-replay-mode.md` §5). The validation
 // checks and the `contract_id` parser stay module-private — only the oracle is
 // public, for the cross-repo agreement check.
+//
+// Issue #33 adds the timeline scrub model (`src/replay/timeline.rs`,
+// `docs/04-replay-mode.md` §4, `docs/01-domain-model.md` §10): `TimelineCursor`
+// (O(1) `StepBy` / O(log n) `Step` seeks over the integer `step` clock, the
+// post-fill open-position set, and the as-of slices), plus the domain `Playback` /
+// `PlaybackSpeed` playback model and `TimelineCursor::advance_playback`. The cursor
+// consumes `event::SeekTo`. The domain `Playback` shares a name with the
+// `app::Playback` stub re-exported above, so it is re-exported here under the
+// TRANSITIONAL alias `ReplayPlayback` — a bare `Playback` at the crate root would
+// collide. Issue #34 (the app-state wiring) reconciles the app stub with the domain
+// type into a single `Playback`; in-crate consumers already reach the domain type
+// as `crate::replay::Playback`.
+pub use replay::Playback as ReplayPlayback;
 pub use replay::{
     BundleDivergence, BundleManifest, BundleReader, CONTRACT_ID_FORMAT,
     CONTRACT_ID_UNDERLYING_PATTERN, CONTRACT_ID_VERSION_PREFIX, CapitalConfig,
     DECODED_OVERHEAD_PERMILLE, EquityPoint, ExecMode, Fill, GreeksAttribution, LoadedBundle,
     MAX_BATCH_BYTES, MAX_BATCH_ROWS, MAX_EXPANSION_RATIO, MAX_MANIFEST_BYTES, MAX_TABLE_BYTES,
-    MAX_TABLE_ROWS, MAX_WORKING_SET, ORACLE_ABS_TOL, ORACLE_REL_TOL, PositionRow, PositionSide,
-    ResourceCeilings, SUPPORTED_SCHEMA, compare_bundles,
+    MAX_TABLE_ROWS, MAX_WORKING_SET, ORACLE_ABS_TOL, ORACLE_REL_TOL, PlaybackSpeed, PositionRow,
+    PositionSide, ResourceCeilings, SUPPORTED_SCHEMA, TimelineCursor, compare_bundles,
 };
 // The PUBLIC, semver-governed provider port surface (`docs/03-data-providers.md`
 // §2, §11.1): the trait, the capability self-declaration + its builder + every
