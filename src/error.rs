@@ -171,6 +171,18 @@ pub enum OverlayError {
         /// The overlay feed's value for that dimension.
         overlay: String,
     },
+    /// The equivalence gate could **not** be checked: a feed's alias for the
+    /// leg is absent, so there is no fingerprint pair to compare. The gate fails
+    /// **CLOSED** — an unverified overlay is refused, never admitted — so the
+    /// store never merges an unchecked leg. Names the contract and the feed
+    /// whose alias was missing (a non-secret provider id), never a payload.
+    MissingAlias {
+        /// The normalized contract label (non-secret).
+        contract: String,
+        /// The feed whose alias for the leg was absent — its public,
+        /// non-secret id.
+        provider: ProviderId,
+    },
 }
 
 impl fmt::Display for OverlayError {
@@ -185,6 +197,11 @@ impl fmt::Display for OverlayError {
                 f,
                 "overlay spec mismatch on {field} for {contract}: \
                  source `{source}` vs overlay `{overlay}`"
+            ),
+            Self::MissingAlias { contract, provider } => write!(
+                f,
+                "overlay gate unchecked for {contract}: \
+                 feed `{provider}` has no alias for the leg"
             ),
         }
     }
@@ -544,7 +561,21 @@ mod tests {
         // never occupy it.
         let field: &'static str = match err {
             OverlayError::SpecMismatch { field, .. } => field,
+            OverlayError::MissingAlias { .. } => panic!("constructed a SpecMismatch"),
         };
         assert_eq!(field, "contract_multiplier");
+    }
+
+    #[test]
+    fn test_overlay_error_missing_alias_display_names_contract_and_feed() {
+        let err = OverlayError::MissingAlias {
+            contract: "BTC-27JUN25-60000-C".to_owned(),
+            provider: provider_id("dxlink"),
+        };
+        assert_eq!(
+            err.to_string(),
+            "overlay gate unchecked for BTC-27JUN25-60000-C: \
+             feed `dxlink` has no alias for the leg"
+        );
     }
 }

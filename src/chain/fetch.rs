@@ -130,11 +130,20 @@ impl AliasCatalog {
 
     /// Register a feed's view of a leg. Multiple feeds can register the same
     /// [`InstrumentKey`] — each becomes a distinct alias entry under that key.
+    ///
+    /// Re-inserting the same `(key, provider)` **replaces** the prior entry in
+    /// place rather than appending a duplicate, so the catalog stays a function
+    /// of `(key, provider)` and [`instrument`](Self::instrument) returns the
+    /// current view, never a stale first match.
     pub fn insert(&mut self, instrument: Instrument) {
-        self.by_key
-            .entry(instrument.key.clone())
-            .or_default()
-            .push(instrument);
+        let entries = self.by_key.entry(instrument.key.clone()).or_default();
+        match entries
+            .iter_mut()
+            .find(|existing| existing.provider == instrument.provider)
+        {
+            Some(existing) => *existing = instrument,
+            None => entries.push(instrument),
+        }
     }
 
     /// True when no leg has been registered.
@@ -193,20 +202,30 @@ impl AliasCatalog {
     ///
     /// [`OverlayError::SpecMismatch`] naming the first fingerprint dimension that
     /// disagrees (multiplier / settlement / exercise / quote currency / venue
-    /// product code) — never a raw payload or credential. When either feed does
-    /// not know the leg there is no fingerprint pair to compare and the result is
-    /// `Ok(())`: presence is the caller's precondition, and this gate only
-    /// refuses a genuine spec disagreement.
+    /// product code) — never a raw payload or credential.
+    ///
+    /// [`OverlayError::MissingAlias`] when either feed does not know the leg:
+    /// there is no fingerprint pair to compare, so the gate fails **CLOSED**
+    /// (naming the absent feed) rather than admitting an unverified overlay. The
+    /// caller (`gate_overlay`) treats only `Ok(())` as permission to merge, so a
+    /// missing alias refuses the merge instead of resurrecting an unchecked leg.
     pub fn overlay_compatible(
         &self,
         key: &InstrumentKey,
         source: &ProviderId,
         overlay: &ProviderId,
     ) -> Result<(), OverlayError> {
-        let (Some(source_leg), Some(overlay_leg)) =
-            (self.instrument(key, source), self.instrument(key, overlay))
-        else {
-            return Ok(());
+        let Some(source_leg) = self.instrument(key, source) else {
+            return Err(OverlayError::MissingAlias {
+                contract: contract_label(key),
+                provider: source.clone(),
+            });
+        };
+        let Some(overlay_leg) = self.instrument(key, overlay) else {
+            return Err(OverlayError::MissingAlias {
+                contract: contract_label(key),
+                provider: overlay.clone(),
+            });
         };
         compare_fingerprints(&contract_label(key), &source_leg.spec, &overlay_leg.spec)
     }
@@ -420,6 +439,33 @@ mod tests {
         assert!(catalog.instrument(&key, &pid("alpaca")).is_none());
     }
 
+    #[test]
+    fn test_alias_catalog_reinsert_same_key_provider_replaces_not_duplicates() {
+        let mut catalog = AliasCatalog::new();
+        catalog.insert(instrument("deribit", "OLD-SYMBOL", None));
+        catalog.insert(instrument("deribit", "NEW-SYMBOL", Some("new-stream")));
+        // The re-insert of the same (key, provider) updated in place: still one
+        // distinct key, and `instrument()` returns the CURRENT view, not the
+        // stale first match.
+        assert_eq!(catalog.len(), 1);
+        match catalog.instrument(&sample_key(), &pid("deribit")) {
+            Some(found) => {
+                assert_eq!(found.native_symbol, "NEW-SYMBOL");
+                assert_eq!(found.stream_symbol.as_deref(), Some("new-stream"));
+            }
+            None => panic!("expected the deribit alias after re-insert"),
+        }
+        // The stale symbol no longer resolves; the current one does — proving no
+        // duplicate lingered under the key.
+        assert!(catalog.resolve_symbol("OLD-SYMBOL").is_none());
+        assert_eq!(catalog.resolve_symbol("NEW-SYMBOL"), Some(&sample_key()));
+        // A different feed under the same key stays a distinct alias.
+        catalog.insert(instrument("dxlink", "DX-SYMBOL", Some("dx-stream")));
+        assert_eq!(catalog.len(), 1);
+        assert!(catalog.instrument(&sample_key(), &pid("dxlink")).is_some());
+        assert!(catalog.instrument(&sample_key(), &pid("deribit")).is_some());
+    }
+
     // --- ChainFetch carries the catalog forward unchanged --------------------
 
     #[test]
@@ -523,16 +569,32 @@ mod tests {
     }
 
     #[test]
-    fn test_overlay_compatible_missing_leg_is_ok() {
+    fn test_overlay_compatible_missing_overlay_leg_is_refused() {
         let mut catalog = AliasCatalog::new();
         catalog.insert(instrument("deribit", "native", None));
-        // The overlay feed never registered the leg — no fingerprint pair to
-        // compare, so the gate is vacuously satisfied.
-        assert!(
-            catalog
-                .overlay_compatible(&sample_key(), &pid("deribit"), &pid("dxlink"))
-                .is_ok()
-        );
+        // The overlay feed never registered the leg — there is no fingerprint
+        // pair to compare, so the gate must fail CLOSED (name the absent feed)
+        // rather than admit an unverified overlay.
+        match catalog.overlay_compatible(&sample_key(), &pid("deribit"), &pid("dxlink")) {
+            Err(OverlayError::MissingAlias { provider, .. }) => {
+                assert_eq!(provider.as_str(), "dxlink");
+            }
+            other => panic!("expected a MissingAlias refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_overlay_compatible_missing_source_leg_is_refused() {
+        let mut catalog = AliasCatalog::new();
+        catalog.insert(instrument("dxlink", "native", Some("stream")));
+        // The source feed never registered the leg — same fail-CLOSED outcome,
+        // naming the source feed this time.
+        match catalog.overlay_compatible(&sample_key(), &pid("deribit"), &pid("dxlink")) {
+            Err(OverlayError::MissingAlias { provider, .. }) => {
+                assert_eq!(provider.as_str(), "deribit");
+            }
+            other => panic!("expected a MissingAlias refusal, got {other:?}"),
+        }
     }
 
     // --- ExpirySource --------------------------------------------------------
