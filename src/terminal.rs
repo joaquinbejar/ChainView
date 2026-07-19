@@ -162,19 +162,22 @@ impl<O: TerminalOps> Guard<O> {
         if self.restored {
             return;
         }
-        self.restored = true;
-        if self.cursor_hidden {
-            let _ = self.ops.show_cursor();
+        // Continue through every step even if one fails, but clear a state flag
+        // ONLY when its inverse actually returned `Ok` — a failed step leaves its
+        // flag set so the recorded state stays truthful (never "forgets" that raw
+        // mode / the alternate screen is still applied). `restored` is latched
+        // LAST, after the work, so the flags drive the teardown, not a flag set
+        // before the ops ran.
+        if self.cursor_hidden && self.ops.show_cursor().is_ok() {
             self.cursor_hidden = false;
         }
-        if self.alt_screen {
-            let _ = self.ops.leave_alternate_screen();
+        if self.alt_screen && self.ops.leave_alternate_screen().is_ok() {
             self.alt_screen = false;
         }
-        if self.raw_enabled {
-            let _ = self.ops.disable_raw_mode();
+        if self.raw_enabled && self.ops.disable_raw_mode().is_ok() {
             self.raw_enabled = false;
         }
+        self.restored = true;
     }
 }
 
@@ -373,6 +376,39 @@ mod tests {
                 Op::DisableRaw,
             ]
         );
+    }
+
+    #[test]
+    fn test_guard_restore_continues_past_a_failed_step_and_keeps_the_flag_truthful() {
+        // Inject a failure on the FIRST teardown step (show_cursor). The remaining
+        // steps must still run, and the failed step's flag must stay set so the
+        // recorded state never "forgets" that the cursor is still hidden.
+        let log = new_log();
+        let mut guard = match Guard::new(FakeOps::failing(Rc::clone(&log), Op::ShowCursor)) {
+            Ok(g) => g,
+            Err(e) => panic!("expected setup to succeed, got: {e}"),
+        };
+        guard.restore();
+        // show_cursor failed (not recorded), but leave_alt + disable_raw still ran.
+        assert_eq!(
+            *log.borrow(),
+            vec![
+                Op::EnableRaw,
+                Op::EnterAlt,
+                Op::HideCursor,
+                Op::LeaveAlt,
+                Op::DisableRaw,
+            ]
+        );
+        // The failed step's flag stays TRUE (state truthful); the succeeded ones
+        // are cleared; restore is latched.
+        assert!(
+            guard.cursor_hidden,
+            "a failed show_cursor must not clear the flag"
+        );
+        assert!(!guard.alt_screen);
+        assert!(!guard.raw_enabled);
+        assert!(guard.restored);
     }
 
     #[test]
