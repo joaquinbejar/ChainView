@@ -58,7 +58,9 @@ use super::events::{
     QUOTE_STALE_AFTER, QuoteUpdate, StreamHealth, chain_stale_after,
 };
 use super::fetch::{AliasCatalog, ChainFetch};
-use super::greeks::{GreeksSidecar, LegGreeks, PricingInputs, compute_leg_greeks};
+use super::greeks::{
+    GreeksSidecar, LegGreeks, PricingInputs, QuoteClocks, compute_dirty_legs, compute_leg_greeks,
+};
 use super::identity::{InstrumentKey, ProviderId};
 
 // --- Bounded-merge tuning constants (`docs/03-data-providers.md` §4) ----------
@@ -397,8 +399,9 @@ impl ChainStore {
         if self.contains_strike(strike) {
             if self.apply_quote_to_row(update) {
                 let _ = self.overlay_refused.remove(key);
-                // A new premium re-drives the local IV inversion / Greeks.
-                self.on_option_data_changed(update.received_time);
+                // A new premium re-drives the local IV inversion / Greeks for THIS
+                // leg only — never the whole chain (issue #25).
+                self.on_leg_data_changed(update.received_time, key);
                 MergeOutcome::Applied
             } else {
                 MergeOutcome::DroppedCrossed
@@ -439,8 +442,9 @@ impl ChainStore {
         if self.contains_strike(strike) {
             self.apply_greeks_to_row(update);
             let _ = self.overlay_refused.remove(key);
-            // New venue iv/gamma + a refreshed local theta/vega/rho fill.
-            self.on_option_data_changed(update.received_time);
+            // New venue iv/gamma + a refreshed local theta/vega/rho fill for THIS
+            // leg only — never the whole chain (issue #25).
+            self.on_leg_data_changed(update.received_time, key);
             MergeOutcome::Applied
         } else if self.tombstones.contains(&strike) {
             MergeOutcome::DroppedTombstoned
@@ -846,11 +850,18 @@ impl ChainStore {
         }
     }
 
-    /// Mark that an applied fold changed the option data (spot/premium/venue
-    /// Greeks): advance the analytics reference instant to the fold's timestamp,
-    /// bump the pricing-input cache key, and refresh the local analytics once. The
-    /// timestamp is a store instant (a poll or update's own time), never the wall
-    /// clock, so the fill stays deterministic (`docs/01` §7).
+    /// Mark that a WHOLE-CHAIN fold changed the option data — the poll/seed path,
+    /// where a fresh snapshot (new spot, re-listed strikes, drained venue Greeks)
+    /// legitimately invalidates every leg. Advance the analytics reference instant
+    /// to the fold's timestamp, bump the pricing-input cache key, and refresh the
+    /// local analytics for the whole chain once. The timestamp is a store instant
+    /// (the poll's own time), never the wall clock, so the fill stays deterministic
+    /// (`docs/01` §7).
+    ///
+    /// A single applied stream update takes the O(1) [`on_leg_data_changed`] path
+    /// instead — repricing the whole chain on every quote would put a full-chain
+    /// Black-Scholes pass on the event fan-in and defeat the bounded-lag discipline
+    /// the coalescing channel exists for (issue #25).
     fn on_option_data_changed(&mut self, as_of: DateTime<Utc>) {
         self.analytics_as_of = as_of;
         // Checked increment with a self fallback (not `u64::MAX`), so it is a checked
@@ -860,6 +871,55 @@ impl ChainStore {
             .checked_add(1)
             .unwrap_or(self.input_generation);
         self.recompute_sidecar();
+    }
+
+    /// Mark that an applied stream fold changed exactly ONE leg's option data (a
+    /// quote's premium or a Greeks row's venue iv/gamma): advance the analytics
+    /// reference instant, bump the pricing-input cache key, and reprice ONLY that
+    /// `(strike, style)` leg — never the whole chain (issue #25). The fold path is
+    /// therefore O(changed legs), not O(chain), so a busy stream cannot block the
+    /// event fan-in with a full-chain repricing per quote.
+    ///
+    /// The dirty leg is priced against the same inputs the full-chain pass would
+    /// use (same spot, same `as_of`, same per-leg quote clock), so its analytics
+    /// are bit-identical to a full recompute of that leg; the untouched legs keep
+    /// their prior generation until the next poll legitimately reprices the chain.
+    /// The timestamp is a store instant (the update's own `received_time`), never
+    /// the wall clock, so the fill stays deterministic (`docs/01` §7).
+    fn on_leg_data_changed(&mut self, as_of: DateTime<Utc>, key: &InstrumentKey) {
+        self.analytics_as_of = as_of;
+        self.input_generation = self
+            .input_generation
+            .checked_add(1)
+            .unwrap_or(self.input_generation);
+        self.recompute_leg(key);
+    }
+
+    /// Reprice the single dirty `(strike, style)` leg via the #24 engine, cached by
+    /// the pricing `input_generation`. Hands the engine a one-entry
+    /// [`QuoteClocks`] — only the dirty leg's own stream-quote receipt clock gates
+    /// its local IV inversion, so building the snapshot stays O(1) rather than
+    /// O(instruments) (the same per-leg [`StaleQuote`] semantics as the full pass,
+    /// scoped to one leg). The fallible engine result is deliberately discarded for
+    /// the same reason as [`recompute_sidecar`]: every per-leg outcome is recorded
+    /// in the leg's status and there is no error to surface.
+    ///
+    /// [`StaleQuote`]: super::greeks::LegStatus::StaleQuote
+    fn recompute_leg(&mut self, key: &InstrumentKey) {
+        let ctx = PricingInputs::new(
+            self.chain.underlying_price,
+            self.analytics_as_of,
+            self.input_generation,
+        );
+        // Only the dirty leg's own quote clock can gate its inversion, so snapshot
+        // just that one clock (keyed exactly as the full pass keys it — by the
+        // instrument's own key), never the whole `instruments` map.
+        let mut clocks = QuoteClocks::new();
+        if let Some(received) = self.instruments.get(key).and_then(|s| s.quote_received) {
+            clocks.insert(key.clone(), received);
+        }
+        let dirty = [(key.strike, key.style)];
+        let _ = compute_dirty_legs(&self.chain, &ctx, &clocks, &dirty, &mut self.sidecar);
     }
 
     /// Recompute the style-keyed local analytics for the whole chain via the #24
@@ -874,7 +934,18 @@ impl ChainStore {
             self.analytics_as_of,
             self.input_generation,
         );
-        let _ = compute_leg_greeks(&self.chain, &ctx, &mut self.sidecar);
+        // Hand the engine a read-only snapshot of the per-instrument stream-quote
+        // receipt clocks (#24): a leg whose quote went stale beyond the documented
+        // threshold is NOT locally inverted (it becomes the honest `StaleQuote`
+        // status), while a leg with no stream clock (poll-seeded) computes as
+        // before. Freshness reaches the kernel as pure data, never a wall clock.
+        let mut clocks = QuoteClocks::new();
+        for (key, state) in &self.instruments {
+            if let Some(received) = state.quote_received {
+                clocks.insert(key.clone(), received);
+            }
+        }
+        let _ = compute_leg_greeks(&self.chain, &ctx, &clocks, &mut self.sidecar);
     }
 
     /// Buffer an unknown-strike update, dropping the oldest entry (counted) when
@@ -1071,6 +1142,7 @@ mod tests {
     use super::{ChainStore, Freshness, MAX_PENDING, MergeOutcome, TickDir, pending_ttl};
     use crate::chain::events::{ChainSource, GreeksOrigin, GreeksRow, QuoteUpdate, StreamHealth};
     use crate::chain::fetch::{AliasCatalog, ChainFetch, ExpirySource};
+    use crate::chain::greeks::{LegGreeks, LegStatus};
     use crate::chain::identity::{
         ContractSpecFingerprint, ExerciseStyle, Instrument, InstrumentKey, ProviderId,
         SettlementStyle,
@@ -1299,6 +1371,32 @@ mod tests {
             refresh(),
             utc(EXP),
         )
+    }
+
+    /// A two-strike seed (60000 + 61000, both two-sided call/put) — the fixture for
+    /// the dirty-recompute proofs, where one leg is streamed and the untouched legs
+    /// are checked for identity.
+    fn seed_two() -> ChainStore {
+        let chain = chain_with(&[
+            row(60_000.0, Some(1.0), Some(1.2), Some(2.0), Some(2.4)),
+            row(61_000.0, Some(1.5), Some(1.8), Some(2.5), Some(2.9)),
+        ]);
+        ChainStore::seed(
+            fetch_for(chain, "deribit", AliasCatalog::new()),
+            ChainSource::Merged,
+            refresh(),
+            utc(EXP),
+        )
+    }
+
+    /// The sidecar analytics for one `(strike, style)` leg at the store's resolved
+    /// expiry, or a panic naming the missing leg.
+    #[track_caller]
+    fn leg_of(store: &ChainStore, strike: f64, style: OptionStyle) -> LegGreeks {
+        match store.leg_greeks(&leg_key(store, strike, style)) {
+            Some(g) => *g,
+            None => panic!("expected a sidecar entry for strike {strike} {style:?}"),
+        }
     }
 
     #[track_caller]
@@ -1692,6 +1790,134 @@ mod tests {
         assert_eq!(
             store.sidecar.computed_generation(),
             Some(store.input_generation)
+        );
+    }
+
+    // --- Dirty recompute: an applied quote reprices only the affected leg -----
+
+    #[test]
+    fn test_applied_quote_recomputes_only_the_dirty_leg() {
+        let mut store = seed_two();
+        // Snapshot every seeded leg BEFORE the stream update.
+        let k1_call_before = leg_of(&store, 60_000.0, OptionStyle::Call);
+        let k1_put_before = leg_of(&store, 60_000.0, OptionStyle::Put);
+        let k2_call_before = leg_of(&store, 61_000.0, OptionStyle::Call);
+        let k2_put_before = leg_of(&store, 61_000.0, OptionStyle::Put);
+        let gen_before = store.input_generation;
+
+        // A stream quote for ONE leg (60000 Call) with a far-future receipt, so the
+        // analytics reference instant jumps ~460 days: a FULL recompute at this
+        // as-of would visibly shrink EVERY other leg's time-to-expiry (its
+        // theta/vega/rho). Only the dirty leg may change.
+        let outcome = store.apply_quote(&quote(
+            "deribit",
+            60_000.0,
+            OptionStyle::Call,
+            Some(1.4),
+            Some(1.6),
+            None,
+            EXP + 40_000_000,
+        ));
+        assert_eq!(outcome, MergeOutcome::Applied);
+
+        // The pricing generation advanced and the sidecar records it — a full
+        // recompute at this generation WOULD have refreshed every leg.
+        assert!(store.input_generation > gen_before);
+        assert_eq!(
+            store.sidecar.computed_generation(),
+            Some(store.input_generation)
+        );
+
+        // The dirty leg was repriced (new premium + new as-of).
+        assert_ne!(leg_of(&store, 60_000.0, OptionStyle::Call), k1_call_before);
+        // Its opposite style and every other strike are byte-identical: the scoped
+        // recompute never touched them despite the large as-of jump. This is the
+        // O(changed legs), not O(chain), proof — under the old full recompute all
+        // three would have changed with the advanced reference instant.
+        assert_eq!(leg_of(&store, 60_000.0, OptionStyle::Put), k1_put_before);
+        assert_eq!(leg_of(&store, 61_000.0, OptionStyle::Call), k2_call_before);
+        assert_eq!(leg_of(&store, 61_000.0, OptionStyle::Put), k2_put_before);
+    }
+
+    #[test]
+    fn test_poll_still_recomputes_every_leg() {
+        let mut store = seed_two();
+        let k2_call_before = leg_of(&store, 61_000.0, OptionStyle::Call);
+        let k2_put_before = leg_of(&store, 61_000.0, OptionStyle::Put);
+
+        // A fresh poll legitimately invalidates every leg: the full-chain recompute
+        // reprices ALL strikes at the new poll instant, so even a leg that received
+        // no stream update changes (its time-to-expiry shrank ~460 days). The
+        // dirty-recompute optimization is confined to the stream path.
+        store.apply_poll(
+            fetch_for(
+                chain_with(&[
+                    row(60_000.0, Some(1.0), Some(1.2), Some(2.0), Some(2.4)),
+                    row(61_000.0, Some(1.5), Some(1.8), Some(2.5), Some(2.9)),
+                ]),
+                "deribit",
+                AliasCatalog::new(),
+            ),
+            utc(EXP + 40_000_000),
+        );
+
+        assert_ne!(leg_of(&store, 61_000.0, OptionStyle::Call), k2_call_before);
+        assert_ne!(leg_of(&store, 61_000.0, OptionStyle::Put), k2_put_before);
+    }
+
+    #[test]
+    fn test_scoped_recompute_matches_full_recompute_for_dirty_leg() {
+        // Faithfulness + correct rendering: the dirty leg's analytics after a scoped
+        // recompute must equal what a full-chain recompute would produce for the
+        // same premium and as-of, and every other leg must keep valid Greeks.
+        let received = EXP + 1_000;
+        let mut scoped = seed_two();
+        assert_eq!(
+            scoped.apply_quote(&quote(
+                "deribit",
+                60_000.0,
+                OptionStyle::Call,
+                Some(1.4),
+                Some(1.6),
+                None,
+                received,
+            )),
+            MergeOutcome::Applied
+        );
+        let scoped_leg = leg_of(&scoped, 60_000.0, OptionStyle::Call);
+        // The dirty leg is a complete, valid computed leg (nothing cleared).
+        assert_eq!(scoped_leg.status, LegStatus::Computed);
+        assert!(scoped_leg.iv.is_some());
+        assert!(scoped_leg.delta.is_some());
+        assert!(scoped_leg.theta.is_some());
+        assert!(scoped_leg.vega.is_some());
+        assert!(scoped_leg.rho.is_some());
+
+        // Force a FULL recompute of the same post-quote chain at the same as-of via
+        // a poll carrying the patched premium; the dirty leg must match bit-for-bit.
+        let mut full = seed_two();
+        full.apply_poll(
+            fetch_for(
+                chain_with(&[
+                    row(60_000.0, Some(1.4), Some(1.6), Some(2.0), Some(2.4)),
+                    row(61_000.0, Some(1.5), Some(1.8), Some(2.5), Some(2.9)),
+                ]),
+                "deribit",
+                AliasCatalog::new(),
+            ),
+            utc(received),
+        );
+        assert_eq!(scoped_leg, leg_of(&full, 60_000.0, OptionStyle::Call));
+
+        // The matrix still renders valid Greeks for every OTHER leg after the
+        // partial recompute — touching one leg cleared nothing.
+        assert_eq!(
+            leg_of(&scoped, 61_000.0, OptionStyle::Call).status,
+            LegStatus::Computed
+        );
+        assert_eq!(
+            leg_of(&scoped, 60_000.0, OptionStyle::Put).status,
+            LegStatus::Computed
         );
     }
 
