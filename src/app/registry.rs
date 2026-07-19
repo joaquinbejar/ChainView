@@ -71,6 +71,8 @@ use tokio_util::sync::CancellationToken;
 use crate::chain::{Instrument, ProviderId, StreamHealth};
 use crate::config::{CliOverrides, Config, ModeSelect};
 use crate::error::{ChainViewError, ConfigError, ProviderError, RegistryError};
+#[cfg(feature = "alpaca")]
+use crate::providers::alpaca::AlpacaAdapter;
 use crate::providers::deribit::DeribitAdapter;
 #[cfg(feature = "tastytrade")]
 use crate::providers::tastytrade::TastytradeAdapter;
@@ -260,7 +262,7 @@ impl ChainViewAppBuilder {
         // adapter's factory (never invoked here) purely so the deliberately
         // unregistered adapter stays compiled + linted in a plain
         // `--features <gated>` library build.
-        #[cfg(feature = "tastytrade")]
+        #[cfg(any(feature = "tastytrade", feature = "alpaca"))]
         note_gated_builtins();
         self.record(RegistryError::Gated(id).into());
         self
@@ -439,15 +441,24 @@ impl ChainViewAppBuilder {
 /// environment and yields a registry-ready `Arc<dyn Provider>`. Invoked only once
 /// the adapter's security gate lifts; while the gate holds it is merely *named*
 /// (see [`note_gated_builtins`]).
-#[cfg(feature = "tastytrade")]
+#[cfg(any(feature = "tastytrade", feature = "alpaca"))]
 type GatedBuiltinFactory =
     fn(&dyn crate::config::EnvSource) -> Result<Arc<dyn Provider>, ConfigError>;
 
-#[cfg(feature = "tastytrade")]
+#[cfg(any(feature = "tastytrade", feature = "alpaca"))]
 fn note_gated_builtins() {
-    let _tastytrade: GatedBuiltinFactory =
-        |env| Ok(Arc::new(TastytradeAdapter::from_env(env)?) as Arc<dyn Provider>);
-    let _ = _tastytrade;
+    #[cfg(feature = "tastytrade")]
+    {
+        let _tastytrade: GatedBuiltinFactory =
+            |env| Ok(Arc::new(TastytradeAdapter::from_env(env)?) as Arc<dyn Provider>);
+        let _ = _tastytrade;
+    }
+    #[cfg(feature = "alpaca")]
+    {
+        let _alpaca: GatedBuiltinFactory =
+            |env| Ok(Arc::new(AlpacaAdapter::from_env(env)?) as Arc<dyn Provider>);
+        let _ = _alpaca;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -918,6 +929,41 @@ mod tests {
                 assert_eq!(id.as_str(), "tastytrade");
             }
             other => panic!("expected Gated(tastytrade), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_with_gated_builtin_alpaca_fails_while_gate_holds() {
+        // The Alpaca adapter (issue #41) is reachable only through the gated opt-in,
+        // which fails with a typed startup error while its gate holds — a stock
+        // binary can never enable it (docs/SECURITY.md §2.4).
+        let result = ChainViewApp::builder()
+            .with_gated_builtin(pid("alpaca"))
+            .register(FakeProvider::chainful(pid("mybroker")))
+            .with_config(live_config("mybroker"))
+            .run();
+        match result {
+            Err(ChainViewError::Registry(RegistryError::Gated(id))) => {
+                assert_eq!(id.as_str(), "alpaca");
+            }
+            other => panic!("expected Gated(alpaca), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_with_builtins_never_enables_alpaca() {
+        // The stock builder registers only the gate-clear built-ins (Deribit), so
+        // selecting the gated `alpaca` id resolves to UnknownProvider — proving the
+        // gated adapter is never enabled by `with_builtins` (docs/SECURITY.md §2.4).
+        let result = ChainViewApp::builder()
+            .with_builtins()
+            .with_config(live_config("alpaca"))
+            .run();
+        match result {
+            Err(ChainViewError::Config(ConfigError::UnknownProvider(id))) => {
+                assert_eq!(id, "alpaca");
+            }
+            other => panic!("expected UnknownProvider(alpaca), got {other:?}"),
         }
     }
 

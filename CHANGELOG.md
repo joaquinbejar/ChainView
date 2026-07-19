@@ -14,6 +14,66 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- **The Alpaca adapter, behind a DISABLED-by-default feature gate**
+  (`src/providers/alpaca.rs`, `src/providers/mod.rs`, `src/app/registry.rs`,
+  issue #41; `docs/03-data-providers.md` §7.5, `docs/SECURITY.md` §2.4,
+  `CLAUDE.md`). The `Provider` for Alpaca: the composed, **completeness-provable**
+  option-chain path — `get_option_contracts` discovery (paginated, looping
+  `next_page_token` until absent) -> `get_option_snapshots` hydration in bounded
+  batches -> an **atomic** publish once every discovered contract is hydrated, so
+  the UI never sees a half-filled chain as authoritative (the bare
+  `get_option_chain`, which carries no next-page token or expiry filter, is not
+  used). Snapshots carry venue Greeks/IV: `delta`/`gamma`/`iv` fold into the chain
+  row, and the subscribe/backfill overlay replays per-leg `GreeksRow`s tagged
+  `GreeksOrigin::Provider` (the #24/#25 seam) — ChainView never hand-rolls
+  Black-Scholes for Alpaca.
+  - **Gated by construction, not discipline.** Historically `alpaca-websocket`
+    logged the API key and secret in its auth `debug!` (`docs/SECURITY.md` §2.4),
+    so the whole adapter sits behind the disabled `alpaca` Cargo feature and is
+    **excluded from `with_builtins()`**; it is reachable only via the explicit
+    `with_gated_builtin`, which returns `RegistryError::Gated` while the gate
+    holds. A stock binary can never enable it — a default `cargo build` does not
+    even compile the adapter or pull the crates. Lifting the gate (the redaction
+    release + a captured-log test + the matrix flip) is tracked in SECURITY.md and
+    is out of scope here. Provenance for the lifter is cited in-module: the pinned
+    `alpaca-websocket 0.6.0` already masks the key (`redact_key`) and never logs
+    the secret, but this issue does not lift the gate unilaterally.
+  - **Auth injected programmatically (no dotenv, no foreign namespace).** Both
+    clients construct from `alpaca_base::Credentials::new(key, secret)` +
+    `Environment::{Paper,Live}`, so the adapter reads ChainView-namespaced
+    `CHAINVIEW_ALPACA_*` env vars and builds them directly — it never calls the
+    crates' `from_env` (which would read the foreign `ALPACA_*` namespace and load
+    a `.env` via `dotenv`) and installs no global tracing subscriber on
+    construction (`init_logger` is opt-in and untouched), verified against the
+    0.21.2 / 0.6.0 checkout. Credentials are read once via `Secret`, never logged
+    or echoed in a `ProviderError` (which stays redaction-safe: category-only
+    transport detail plus a non-secret HTTP status).
+  - **Honest three-dimensional capabilities.** `chain: Native`, `depth: false`
+    for options (crypto order books only, outside the v1 product),
+    `greeks: Provided`, **`option_stream: None`** (the WS carries no option
+    stream), **`underlying_stream: true`**, **`chain_poll: Poll`**,
+    `auth: KeySecret` — so Alpaca's polled option chain can never be mis-badged as
+    a real-time stream.
+  - **Underlying stream over a ChainView-owned bounded bridge.** The upstream
+    `MarketDataStream` (Trade/Quote/Bar for the underlying only) is drained into
+    the two-class `MarketUpdateSink` — never handed raw to the app — the adapter
+    re-runs `subscribe_market_data` on reconnect, and an upstream `Lagged` signal
+    re-syncs by re-polling. A burst beyond capacity coalesces last-value-wins per
+    instrument without unbounded growth (asserted). US-equity expiry resolves via
+    `16:00 America/New_York` -> UTC, DST-aware.
+  - **New dependencies (feature-gated): `alpaca-http = 0.21.2`,
+    `alpaca-websocket = 0.6.0`, `futures-util = 0.3`** — all optional, behind the
+    disabled `alpaca` feature (a default build pulls none of them). **Audit note
+    (ADR-0007):** with the feature on, `cargo deny check` (deny.toml pins `all-features = true`)
+    (advisories, bans, licenses, sources) and `cargo audit` are **clean** — the
+    only advisories are the three already-ignored, transitive-only
+    unmaintained/unsound warnings (RUSTSEC-2021-0141 `dotenv`, RUSTSEC-2024-0436
+    `paste`, RUSTSEC-2026-0002 `lru`); the alpaca tree adds **no new** advisory.
+    RUSTSEC-2021-0141's `deny.toml` reason now also names `alpaca-base` (the
+    adapter never calls `Credentials::from_env`, so no `.env` load runs). The
+    duplicate-version policy (`bans.multiple-versions = "warn"`) fires for the
+    expected TLS-stack duplicates the alpaca tree pulls (e.g. two `webpki-roots`
+    lines) — a warning, not a failure.
 - **The tastytrade adapter, behind a DISABLED-by-default feature gate**
   (`src/providers/tastytrade.rs`, `src/providers/mod.rs`, `src/app/registry.rs`,
   issue #40; `docs/03-data-providers.md` §7.2, `docs/SECURITY.md` §2,
@@ -72,7 +132,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
     `clamp_symbol` and the views' opaque `symbol` field keep a per-item allow with
     a note (their only reader is the deferred tracing symbol-echo).
   - **New dependency `tastytrade = "0.3"` (optional, `tastytrade` feature) —
-    ADR-0007 audit note.** `cargo audit` + `cargo deny check --all-features` (the
+    ADR-0007 audit note.** `cargo audit` + `cargo deny check` (deny.toml pins `all-features = true`) (the
     `deny.toml` graph runs `all-features = true`) were run with the feature
     enabled: **advisories/bans/licenses/sources all pass**, no NEW advisory. The
     tastytrade tree adds a third source of the already-ignored **RUSTSEC-2021-0141**

@@ -1,0 +1,37 @@
+{
+  "option_contracts": [
+    {
+      "id": "55555555-5555-4555-8555-555555555555",
+      "symbol": "SPY260320C00520000",
+      "name": "SPY Mar 20 2026 520 Call",
+      "status": "active",
+      "tradable": true,
+      "expiration_date": "2026-03-20",
+      "strike_price": "520",
+      "type": "call",
+      "style": "american",
+      "underlying_symbol": "SPY",
+      "underlying_asset_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      "root_symbol": "SPY",
+      "open_interest": "430",
+      "size": "100"
+    },
+    {
+      "id": "66666666-6666-4666-8666-666666666666",
+      "symbol": "SPY260320P00520000",
+      "name": "SPY Mar 20 2026 520 Put",
+      "status": "active",
+      "tradable": true,
+      "expiration_date": "2026-03-20",
+      "strike_price": "520",
+      "type": "put",
+      "style": "american",
+      "underlying_symbol": "SPY",
+      "underlying_asset_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      "root_symbol": "SPY",
+      "open_interest": "380",
+      "size": "100"
+    }
+  ],
+  "next_page_token": null
+}
