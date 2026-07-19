@@ -368,20 +368,25 @@ impl Provider for DeribitAdapter {
         // loop runs behind the returned handle; dropping (or aborting) the handle
         // cancels the token — a clean cooperative stop — and aborts the task as a
         // hard backstop, so there is no fire-and-forget spawn.
+        //
+        // The loop is generic over the [`DeribitTransport`] seam (issue #17): the
+        // production [`LiveTransport`] wraps the upstream WebSocket client plus the
+        // REST backfill, while tests inject a mock so the reconnect lifecycle runs
+        // with no socket and no wall clock. Cold-path config assembly (venue URL
+        // from env or the production default); no credential is read or required —
+        // public data only.
         let cancel = CancellationToken::new();
         let loop_cancel = cancel.clone();
-        let adapter = self.clone();
-        // Cold-path config assembly (venue URL from env or the production
-        // default); no credential is read or required — public data only.
-        let ws_config = WebSocketConfig::default();
+        let transport = LiveTransport::new(self.clone(), WebSocketConfig::default());
+        let id = self.id.clone();
         let SubscriptionRequest {
             underlying,
             expiration_utc,
             instruments,
         } = req;
         let handle = tokio::spawn(run_reconnect_loop(
-            adapter,
-            ws_config,
+            transport,
+            id,
             underlying,
             expiration_utc,
             instruments,
@@ -1414,6 +1419,106 @@ impl ProducerStaging {
 }
 
 // ---------------------------------------------------------------------------
+// The transport seam (issue #17): the venue I/O the reconnect loop drives.
+// ---------------------------------------------------------------------------
+
+/// The transport is gone — a connect/subscribe step failed or the socket
+/// dropped/errored mid-stream. The reconnect loop maps it to
+/// [`StreamExit::Reconnect`]. A zero-size marker: it carries no upstream text,
+/// so no venue string can ride along.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TransportGone;
+
+/// The venue-I/O seam the reconnect loop drives so the loop is deterministically
+/// testable against a **mock** transport — no real socket, no wall clock (issue
+/// #17, `docs/TESTING.md` §5). `deribit-websocket` (0.3.1) ships no
+/// auto-reconnect and connects through a concrete client, so #16's loop reached
+/// straight for that client; this trait lifts the three impure operations the
+/// loop performs (connect+subscribe, receive a frame, re-fetch the chain for the
+/// backfill) behind one seam. The production [`LiveTransport`] wraps the upstream
+/// WebSocket client plus the adapter's REST `fetch_chain`; a test mock yields
+/// scripted frames/errors. The public [`Provider`] surface is unchanged — this
+/// seam is a crate-internal implementation detail and no raw upstream DTO crosses
+/// it.
+#[async_trait]
+trait DeribitTransport: Send {
+    /// Open one connection and (re)subscribe `channels`. `Ok(())` means the
+    /// stream is live and ready to [`receive`](Self::receive); `Err(_)` is a
+    /// recoverable connect/subscribe failure — the loop backs off and retries.
+    async fn connect_and_subscribe(&mut self, channels: Vec<String>) -> Result<(), TransportGone>;
+
+    /// Await the next raw notification frame. `Err(_)` means the socket dropped
+    /// or errored — the loop surfaces `Reconnecting` and reconnects.
+    async fn receive(&mut self) -> Result<String, TransportGone>;
+
+    /// Re-fetch the chain to reconcile drift on reconnect (backfill = current
+    /// state, `docs/03-data-providers.md` §5). `None` on a failed/cancelled fetch
+    /// — the caller keeps the prior aliases.
+    async fn refetch(
+        &mut self,
+        underlying: &str,
+        expiration: &ExpirationDate,
+    ) -> Option<ChainFetch>;
+}
+
+/// The production [`DeribitTransport`]: the upstream `deribit-websocket` client
+/// for live frames and the adapter's REST `fetch_chain` for the reconnect
+/// backfill — the #16 behaviour, now behind the #17 seam. Raw upstream types stay
+/// inside it: the `DeribitWebSocketClient` session is private and never escapes.
+struct LiveTransport {
+    /// The REST adapter, cloned in for the reconnect backfill (`refetch`).
+    adapter: DeribitAdapter,
+    /// The WebSocket config (venue URL); no credential — public data only.
+    ws_config: WebSocketConfig,
+    /// The current live session, replaced on each (re)connect. `None` before the
+    /// first connect and between attempts.
+    session: Option<DeribitWebSocketClient>,
+}
+
+impl LiveTransport {
+    /// Build the live transport from the REST adapter and the WS config.
+    fn new(adapter: DeribitAdapter, ws_config: WebSocketConfig) -> Self {
+        Self {
+            adapter,
+            ws_config,
+            session: None,
+        }
+    }
+}
+
+#[async_trait]
+impl DeribitTransport for LiveTransport {
+    async fn connect_and_subscribe(&mut self, channels: Vec<String>) -> Result<(), TransportGone> {
+        // The rustls crypto provider must be installed before the TLS handshake;
+        // it is process-global and idempotent (a repeat call is `AlreadyInstalled`).
+        let _ = install_default_crypto_provider();
+        let client = DeribitWebSocketClient::new(&self.ws_config).map_err(|_| TransportGone)?;
+        client.connect().await.map_err(|_| TransportGone)?;
+        client
+            .subscribe(channels)
+            .await
+            .map_err(|_| TransportGone)?;
+        self.session = Some(client);
+        Ok(())
+    }
+
+    async fn receive(&mut self) -> Result<String, TransportGone> {
+        match self.session.as_ref() {
+            Some(client) => client.receive_message().await.map_err(|_| TransportGone),
+            None => Err(TransportGone),
+        }
+    }
+
+    async fn refetch(
+        &mut self,
+        underlying: &str,
+        expiration: &ExpirationDate,
+    ) -> Option<ChainFetch> {
+        self.adapter.fetch_chain(underlying, expiration).await.ok()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The adapter-owned reconnect / resubscribe loop.
 // ---------------------------------------------------------------------------
 
@@ -1433,9 +1538,9 @@ enum StreamExit {
 /// resets to 0 on a successful (re)subscribe. Cancellation (handle drop) is
 /// observed at every `.await` via a `biased` `select!`, so the loop never opens
 /// a socket after cancellation and never hot-loops.
-async fn run_reconnect_loop(
-    adapter: DeribitAdapter,
-    ws_config: WebSocketConfig,
+async fn run_reconnect_loop<T: DeribitTransport>(
+    mut transport: T,
+    id: ProviderId,
     underlying: String,
     expiration_utc: DateTime<Utc>,
     mut instruments: Vec<Instrument>,
@@ -1453,7 +1558,7 @@ async fn run_reconnect_loop(
         let exit = tokio::select! {
             biased;
             () = cancel.cancelled() => return,
-            exit = connect_stream_once(&adapter, &ws_config, &instruments, &tx, &cancel, &mut attempt) => exit,
+            exit = connect_stream_once(&mut transport, &id, &instruments, &tx, &cancel, &mut attempt) => exit,
         };
         if matches!(exit, StreamExit::Shutdown) || cancel.is_cancelled() {
             return;
@@ -1462,8 +1567,7 @@ async fn run_reconnect_loop(
         // `attempt` is 1-based here and MUST NOT wrap back to 0 (that would reset
         // the ramp), so it is held at the ceiling rather than saturated.
         attempt = attempt.checked_add(1).unwrap_or(attempt);
-        let health =
-            MarketUpdate::Health(adapter.id.clone(), StreamHealth::Reconnecting { attempt });
+        let health = MarketUpdate::Health(id.clone(), StreamHealth::Reconnecting { attempt });
         // Cancel-wrapped await-send: on a full shared channel this must still
         // observe cancellation promptly (and stop cleanly if the consumer is gone).
         let health_sent = tokio::select! {
@@ -1482,7 +1586,16 @@ async fn run_reconnect_loop(
         }
         // Backfill = CURRENT STATE: re-fetch the chain to reconcile any drift
         // during the outage, then resubscribe off the fresh aliases next loop.
-        if let Some(fresh) = refetch(&adapter, &underlying, expiration_utc, &tx, &cancel).await {
+        if let Some(fresh) = refetch(
+            &mut transport,
+            &id,
+            &underlying,
+            expiration_utc,
+            &tx,
+            &cancel,
+        )
+        .await
+        {
             if !fresh.is_empty() {
                 instruments = fresh;
             }
@@ -1490,42 +1603,28 @@ async fn run_reconnect_loop(
     }
 }
 
-/// One connection attempt: install the crypto provider, connect, resubscribe the
-/// `ticker.`/`book.` channels, and drain updates until the socket drops or the
-/// subscription is cancelled. `attempt` is reset to 0 on a successful
-/// (re)subscribe. Returns [`StreamExit::Reconnect`] on a recoverable drop and
-/// [`StreamExit::Shutdown`] on cancellation or a closed consumer channel.
-async fn connect_stream_once(
-    adapter: &DeribitAdapter,
-    ws_config: &WebSocketConfig,
+/// One connection attempt over the [`DeribitTransport`] seam: connect + subscribe
+/// the `ticker.`/`book.` channels, then drain updates until the socket drops or
+/// the subscription is cancelled. `attempt` is reset to 0 on a successful
+/// (re)subscribe (the loop-level reset-on-success guarantee, asserted through the
+/// mock transport in #17). Returns [`StreamExit::Reconnect`] on a recoverable
+/// drop and [`StreamExit::Shutdown`] on cancellation or a closed consumer channel.
+async fn connect_stream_once<T: DeribitTransport>(
+    transport: &mut T,
+    id: &ProviderId,
     instruments: &[Instrument],
     tx: &mpsc::Sender<MarketUpdate>,
     cancel: &CancellationToken,
     attempt: &mut u32,
 ) -> StreamExit {
-    // The rustls crypto provider must be installed before the TLS handshake;
-    // it is process-global and idempotent (a repeat call is `AlreadyInstalled`).
-    let _ = install_default_crypto_provider();
-
-    let client = match DeribitWebSocketClient::new(ws_config) {
-        Ok(client) => client,
-        Err(_) => return StreamExit::Reconnect,
-    };
-
-    let connected = tokio::select! {
-        biased;
-        () = cancel.cancelled() => return StreamExit::Shutdown,
-        result = client.connect() => result,
-    };
-    if connected.is_err() {
-        return StreamExit::Reconnect;
-    }
-
+    // Resubscribe the exact `ticker.`/`book.` set for these legs. Cancellation is
+    // observed by racing the connect+subscribe against the token, so the loop
+    // never opens a socket after cancellation.
     let channels = subscription_channels(instruments);
     let subscribed = tokio::select! {
         biased;
         () = cancel.cancelled() => return StreamExit::Shutdown,
-        result = client.subscribe(channels) => result,
+        result = transport.connect_and_subscribe(channels) => result,
     };
     if subscribed.is_err() {
         return StreamExit::Reconnect;
@@ -1533,7 +1632,7 @@ async fn connect_stream_once(
 
     // A successful (re)subscribe resets the backoff ramp and surfaces `Live`.
     *attempt = 0;
-    let live = MarketUpdate::Health(adapter.id.clone(), StreamHealth::Live);
+    let live = MarketUpdate::Health(id.clone(), StreamHealth::Live);
     if tx.send(live).await.is_err() {
         return StreamExit::Shutdown;
     }
@@ -1552,13 +1651,18 @@ async fn connect_stream_once(
         let message = tokio::select! {
             biased;
             () = cancel.cancelled() => return StreamExit::Shutdown,
+            // The bounded staging flush (#16) fires through the same loop, gated
+            // on `has_pending`, so the freshest coalesced value is delivered after
+            // a burst subsides even when no further message arrives.
             _ = flush_tick.tick(), if staging.has_pending() => {
                 if staging.flush(tx) == SendState::Closed {
                     return StreamExit::Shutdown; // consumer gone
                 }
                 continue;
             }
-            message = client.receive_message() => message,
+            // The message source is the `DeribitTransport` seam (#17) so the
+            // stream lifecycle is exercised under a mock with no real socket.
+            message = transport.receive() => message,
         };
         let text = match message {
             Ok(text) => text,
@@ -1573,9 +1677,12 @@ async fn connect_stream_once(
 /// Re-fetch the chain to reconcile drift and emit the fresh `Chain` snapshot,
 /// returning the fresh Deribit legs for the next resubscribe (backfill = current
 /// state, `docs/03-data-providers.md` §5). Cancellation short-circuits to `None`;
-/// a failed fetch keeps the prior aliases (the caller does not overwrite).
-async fn refetch(
-    adapter: &DeribitAdapter,
+/// a failed fetch keeps the prior aliases (the caller does not overwrite). The
+/// fetch itself goes through the [`DeribitTransport`] seam, so the reconnect
+/// backfill is exercised with no REST call under a mock transport (#17).
+async fn refetch<T: DeribitTransport>(
+    transport: &mut T,
+    id: &ProviderId,
     underlying: &str,
     expiration_utc: DateTime<Utc>,
     tx: &mpsc::Sender<MarketUpdate>,
@@ -1585,9 +1692,9 @@ async fn refetch(
     let fetched = tokio::select! {
         biased;
         () = cancel.cancelled() => return None,
-        result = adapter.fetch_chain(underlying, &expiration) => result,
+        result = transport.refetch(underlying, &expiration) => result,
     };
-    let fetch = fetched.ok()?;
+    let fetch = fetched?;
 
     // Emit the reconciled structure as a control-class `Chain` (await-send,
     // never coalesced/dropped) so the store reconciles drift. Cancel-wrapped so a
@@ -1605,7 +1712,7 @@ async fn refetch(
     let instruments: Vec<Instrument> = fetch
         .aliases
         .instruments()
-        .filter(|instrument| instrument.provider == adapter.id)
+        .filter(|instrument| instrument.provider == *id)
         .cloned()
         .collect();
     Some(instruments)
@@ -1735,9 +1842,12 @@ fn route_message(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex as StdMutex};
+
     use deribit_http::model::instrument::InstrumentKind;
     use deribit_http::model::other::Greeks;
     use deribit_http::model::ticker::{TickerData, TickerStats};
+    use deribit_websocket::prelude::Value;
     use proptest::prelude::*;
 
     use super::*;
@@ -3316,5 +3426,801 @@ mod tests {
                 prop_assert!(level.size >= Positive::ZERO);
             }
         }
+    }
+
+    // =====================================================================
+    // Recorded fixtures (issue #17): constructed-to-wire-shape at the pinned
+    // deribit-http 0.7.1 / deribit-websocket 0.3.1 DTOs. `include_str!` bakes
+    // the bytes into the test binary, so the fixtures are byte-stable across
+    // machines (docs/TESTING.md §5).
+    // =====================================================================
+
+    const FIXTURE_INSTRUMENTS_BTC: &str =
+        include_str!("../../tests/fixtures/deribit/instruments/instruments_btc.json");
+    const FIXTURE_INSTRUMENTS_MISSING_STRIKE: &str =
+        include_str!("../../tests/fixtures/deribit/instruments/instruments_missing_strike.json");
+    const FIXTURE_TICKER_NORMAL: &str =
+        include_str!("../../tests/fixtures/deribit/ticker/ticker_normal.json");
+    const FIXTURE_TICKER_ZERO_BID: &str =
+        include_str!("../../tests/fixtures/deribit/ticker/ticker_zero_bid.json");
+    const FIXTURE_TICKER_CROSSED: &str =
+        include_str!("../../tests/fixtures/deribit/ticker/ticker_crossed.json");
+    const FIXTURE_TICKER_NEGATIVE: &str =
+        include_str!("../../tests/fixtures/deribit/ticker/ticker_negative.json");
+    const FIXTURE_TICKER_NON_FINITE: &str =
+        include_str!("../../tests/fixtures/deribit/ticker/ticker_non_finite.json");
+    const FIXTURE_BOOK_SNAPSHOT: &str =
+        include_str!("../../tests/fixtures/deribit/book/book_snapshot.json");
+    const FIXTURE_BOOK_DELTA: &str =
+        include_str!("../../tests/fixtures/deribit/book/book_delta.json");
+
+    /// Parse a fixture string into a `serde_json::Value` (reached through the
+    /// upstream prelude re-export, so no new dependency). Every downstream DTO is
+    /// deserialized from this `Value`.
+    #[track_caller]
+    fn fixture_value(json: &str) -> Value {
+        match json.parse::<Value>() {
+            Ok(value) => value,
+            Err(e) => panic!("fixture JSON should parse: {e}"),
+        }
+    }
+
+    /// Deserialize a `get_instruments` fixture into the upstream instrument list.
+    #[track_caller]
+    fn instruments_fixture(json: &str) -> Vec<DeribitInstrument> {
+        let value = fixture_value(json);
+        match Vec::<DeribitInstrument>::deserialize(&value) {
+            Ok(instruments) => instruments,
+            Err(e) => panic!("instruments fixture should deserialize: {e}"),
+        }
+    }
+
+    /// Deserialize a ticker fixture into the REST `TickerData` (the poll leg).
+    #[track_caller]
+    fn ticker_data_fixture(json: &str) -> TickerData {
+        let value = fixture_value(json);
+        match TickerData::deserialize(&value) {
+            Ok(ticker) => ticker,
+            Err(e) => panic!("ticker fixture should deserialize as TickerData: {e}"),
+        }
+    }
+
+    /// Deserialize a ticker fixture into the WS `TickerPayload` (the overlay leg).
+    #[track_caller]
+    fn ticker_payload_fixture(json: &str) -> TickerPayload {
+        let value = fixture_value(json);
+        match TickerPayload::deserialize(&value) {
+            Ok(payload) => payload,
+            Err(e) => panic!("ticker fixture should deserialize as TickerPayload: {e}"),
+        }
+    }
+
+    /// Deserialize a book fixture into the WS `BookPayload`.
+    #[track_caller]
+    fn book_payload_fixture(json: &str) -> BookPayload {
+        let value = fixture_value(json);
+        match BookPayload::deserialize(&value) {
+            Ok(payload) => payload,
+            Err(e) => panic!("book fixture should deserialize as BookPayload: {e}"),
+        }
+    }
+
+    /// Wrap a raw `data` JSON in a `ticker.{symbol}` subscription envelope — the
+    /// exact frame `route_message` (and the reconnect loop) decode.
+    fn ticker_frame(symbol: &str, data_json: &str) -> String {
+        subscription_frame(&format!("ticker.{symbol}"), data_json)
+    }
+
+    /// Wrap a raw `data` JSON in a JSON-RPC subscription notification for
+    /// `channel`.
+    fn subscription_frame(channel: &str, data_json: &str) -> String {
+        format!(
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"subscription\",\
+             \"params\":{{\"channel\":\"{channel}\",\"data\":{data_json}}}}}"
+        )
+    }
+
+    // --- Fixture -> OptionChain (the REST assembly path) ---------------------
+
+    #[test]
+    fn test_deribit_fixture_instruments_assemble_to_option_chain() {
+        let instruments = instruments_fixture(FIXTURE_INSTRUMENTS_BTC);
+        // The perpetual future is filtered out; only the three options remain.
+        let options: Vec<DeribitInstrument> = instruments
+            .iter()
+            .filter(|i| i.is_option())
+            .cloned()
+            .collect();
+        assert_eq!(options.len(), 3, "the perpetual future is filtered out");
+
+        // Pair each option with the recorded ticker and normalize into legs.
+        let ticker = ticker_data_fixture(FIXTURE_TICKER_NORMAL);
+        let legs: Vec<NormalizedLeg> = options
+            .into_iter()
+            .filter_map(|instrument| {
+                normalize_leg(&OptionInstrument {
+                    instrument,
+                    ticker: ticker.clone(),
+                })
+                .ok()
+            })
+            .collect();
+        assert_eq!(legs.len(), 3, "every option leg normalizes");
+
+        let fetch = assemble_chain(
+            "BTC",
+            pos(60_500.0),
+            utc_millis(1_751_011_200_000),
+            &legs,
+            &deribit_provider_id(),
+        );
+
+        // Two strikes: 60000 (call + put collapse into one row) and 61000 (call).
+        assert_eq!(fetch.chain.symbol, "BTC");
+        assert_eq!(fetch.chain.options.len(), 2);
+        assert_eq!(
+            fetch.aliases.len(),
+            3,
+            "three native aliases, one per option"
+        );
+        assert!(
+            fetch
+                .aliases
+                .resolve_symbol("BTC-27JUN25-60000-P")
+                .is_some()
+        );
+
+        match fetch
+            .chain
+            .options
+            .iter()
+            .find(|row| row.strike_price == pos(60_000.0))
+        {
+            Some(row) => {
+                assert_eq!(row.call_bid, Some(pos(0.05)));
+                assert_eq!(row.call_ask, Some(pos(0.06)));
+                assert_eq!(row.put_bid, Some(pos(0.05)));
+                assert_eq!(row.put_ask, Some(pos(0.06)));
+            }
+            None => panic!("expected the 60000 strike row"),
+        }
+
+        // The percentage-form IV reached the leg as a decimal fraction (49.22 %).
+        match legs.iter().find(|leg| leg.style == OptionStyle::Call) {
+            Some(leg) => {
+                assert_eq!(leg.iv, Some(pos(0.4922)));
+                assert_eq!(leg.delta, Some(Decimal::new(55, 2)));
+                assert_eq!(leg.underlying_price, Some(pos(60_500.0)));
+            }
+            None => panic!("expected a normalized call leg"),
+        }
+    }
+
+    #[test]
+    fn test_deribit_fixture_missing_strike_and_style_reject_rows() {
+        // A degraded instruments fixture: one name with no strike segment, one
+        // with an unknown style. Each rejects the ROW as a typed Normalize error
+        // — never a fabricated strike/style.
+        let instruments = instruments_fixture(FIXTURE_INSTRUMENTS_MISSING_STRIKE);
+        let ticker = ticker_data_fixture(FIXTURE_TICKER_NORMAL);
+        let mut kinds = Vec::new();
+        for instrument in instruments {
+            let option = OptionInstrument {
+                instrument,
+                ticker: ticker.clone(),
+            };
+            match normalize_leg(&option) {
+                Err(kind) => kinds.push(kind),
+                Ok(_) => panic!("a missing-strike / unknown-style row must be rejected"),
+            }
+        }
+        assert!(
+            kinds.contains(&NormalizeKind::MissingField("strike")),
+            "the empty strike segment is a missing-field reject"
+        );
+        assert!(
+            kinds.contains(&NormalizeKind::UnknownStyle),
+            "the `-X` style is an unknown-style reject"
+        );
+    }
+
+    // --- Fixture -> QuoteUpdate + GreeksRow (the WS overlay path) -------------
+
+    #[test]
+    fn test_deribit_fixture_ticker_normal_normalizes_quote_and_greeks() {
+        let payload = ticker_payload_fixture(FIXTURE_TICKER_NORMAL);
+        let (quote, greeks) = normalize_ticker(
+            &sample_instrument(),
+            &payload,
+            utc_millis(1_751_011_200_000),
+        );
+        assert_eq!(quote.bid, Some(pos(0.05)));
+        assert_eq!(quote.ask, Some(pos(0.06)));
+        assert_eq!(quote.last, Some(pos(0.055)));
+        assert_eq!(quote.bid_size, Some(pos(5.0)));
+        assert_eq!(quote.ask_size, Some(pos(4.0)));
+        assert_eq!(quote.event_time, Some(utc_millis(1_751_011_200_000)));
+        // IV is percentage-form -> decimal fraction; venue delta/gamma forwarded.
+        assert_eq!(greeks.iv, Some(pos(0.4922)));
+        assert_eq!(greeks.delta, Some(Decimal::new(55, 2)));
+        assert!(greeks.gamma.is_some());
+        // The fixture carries theta/vega/rho; they are deliberately discarded.
+        assert!(greeks.theta.is_none());
+        assert!(greeks.vega.is_none());
+        assert!(greeks.rho.is_none());
+    }
+
+    #[test]
+    fn test_deribit_fixture_ticker_zero_bid_keeps_quote() {
+        // A zero bid is valid — the midpoint is still derivable, so it is kept.
+        let payload = ticker_payload_fixture(FIXTURE_TICKER_ZERO_BID);
+        let (quote, _greeks) = normalize_ticker(&sample_instrument(), &payload, utc_millis(0));
+        assert_eq!(quote.bid, Some(Positive::ZERO));
+        assert_eq!(quote.ask, Some(pos(0.06)));
+    }
+
+    #[test]
+    fn test_deribit_fixture_ticker_crossed_drops_bid_ask() {
+        // ask (0.03) < bid (0.06): crossed -> bid/ask dropped (store keeps prior),
+        // non-quote fields survive.
+        let payload = ticker_payload_fixture(FIXTURE_TICKER_CROSSED);
+        let (quote, _greeks) = normalize_ticker(&sample_instrument(), &payload, utc_millis(0));
+        assert_eq!(quote.bid, None);
+        assert_eq!(quote.ask, None);
+        assert_eq!(
+            quote.last,
+            Some(pos(0.055)),
+            "last survives a crossed quote"
+        );
+    }
+
+    #[test]
+    fn test_deribit_fixture_ticker_negative_drops_bid_keeps_ask() {
+        // A negative bid drops ONLY that field; the ask survives.
+        let payload = ticker_payload_fixture(FIXTURE_TICKER_NEGATIVE);
+        let (quote, _greeks) = normalize_ticker(&sample_instrument(), &payload, utc_millis(0));
+        assert_eq!(quote.bid, None);
+        assert_eq!(quote.ask, Some(pos(0.06)));
+    }
+
+    #[test]
+    fn test_deribit_fixture_ticker_non_finite_refuses_frame() {
+        // JSON has no NaN/Inf literal, so a real degraded frame delivers a
+        // non-finite price as a non-numeric field. That fails the whole
+        // `TickerPayload` deserialize, so the router drops the frame — no
+        // fabricated value reaches the chain (the adapter reports the gap).
+        let value = fixture_value(FIXTURE_TICKER_NON_FINITE);
+        assert!(
+            TickerPayload::deserialize(&value).is_err(),
+            "a non-numeric price field refuses the whole frame"
+        );
+        let (tx, mut rx) = mpsc::channel::<MarketUpdate>(4);
+        let lookup = instrument_lookup(&[sample_instrument()]);
+        let mut staging = ProducerStaging::new();
+        let frame = ticker_frame("BTC-27JUN25-60000-C", FIXTURE_TICKER_NON_FINITE);
+        assert_eq!(
+            route_message(&frame, &lookup, &mut staging, &tx),
+            SendState::Open,
+            "a degraded frame is skipped, never a panic"
+        );
+        assert!(
+            drain_channel(&mut rx).is_empty(),
+            "the degraded frame produces no update, never a fabricated value"
+        );
+    }
+
+    // --- Fixture -> DepthLadder (the WS book path) ---------------------------
+
+    #[test]
+    fn test_deribit_fixture_book_snapshot_normalizes_ladder() {
+        let payload = book_payload_fixture(FIXTURE_BOOK_SNAPSHOT);
+        let ladder = normalize_book(&sample_instrument(), &payload, utc_millis(0));
+        assert_eq!(ladder.change_id, Some(1_419_600_001));
+        assert_eq!(ladder.event_time, Some(utc_millis(1_751_011_200_000)));
+        assert_eq!(
+            ladder.bids.len(),
+            3,
+            "raw-book `new` bids decode best-first"
+        );
+        assert_eq!(ladder.asks.len(), 2);
+        match ladder.bids.first() {
+            Some(level) => {
+                assert_eq!(level.price, pos(0.05));
+                assert_eq!(level.size, pos(5.0));
+            }
+            None => panic!("expected the best bid at index 0"),
+        }
+    }
+
+    #[test]
+    fn test_deribit_fixture_book_delta_captures_change_and_delete() {
+        let payload = book_payload_fixture(FIXTURE_BOOK_DELTA);
+        let ladder = normalize_book(&sample_instrument(), &payload, utc_millis(0));
+        assert_eq!(ladder.change_id, Some(1_419_600_002));
+        assert_eq!(ladder.bids.len(), 2, "both change and delete levels decode");
+        // The delete level keeps its price with size 0 (delta application is v0.5).
+        match ladder.bids.iter().find(|level| level.price == pos(0.049)) {
+            Some(level) => assert_eq!(level.size, Positive::ZERO),
+            None => panic!("the delete level should decode with size 0"),
+        }
+        assert_eq!(ladder.asks.len(), 1);
+    }
+
+    #[test]
+    fn test_deribit_fixture_corpus_normalizes_without_panic() {
+        // Every committed fixture is a normalize_total / normalize_rejects_unknown
+        // corpus seed (docs/TESTING.md §3): each drives its normalizer to a valid
+        // update or a typed reject, never a panic. This complements the property
+        // tests above by pinning the recorded shapes as concrete inputs.
+        for json in [
+            FIXTURE_TICKER_NORMAL,
+            FIXTURE_TICKER_ZERO_BID,
+            FIXTURE_TICKER_CROSSED,
+            FIXTURE_TICKER_NEGATIVE,
+            FIXTURE_TICKER_NON_FINITE,
+        ] {
+            let value = fixture_value(json);
+            // The non-finite fixture fails deserialization (by design); every
+            // other normalizes without panic.
+            if let Ok(payload) = TickerPayload::deserialize(&value) {
+                let _ = normalize_ticker(&sample_instrument(), &payload, utc_millis(0));
+            }
+        }
+        for json in [FIXTURE_BOOK_SNAPSHOT, FIXTURE_BOOK_DELTA] {
+            let payload = book_payload_fixture(json);
+            let _ = normalize_book(&sample_instrument(), &payload, utc_millis(0));
+        }
+    }
+
+    // =====================================================================
+    // Mock-transport lifecycle tests (issue #17): the reconnect loop driven
+    // through the `DeribitTransport` seam with NO real socket and NO wall
+    // clock. `start_paused` auto-advances the virtual timer whenever the
+    // runtime is otherwise idle, so a jittered backoff `sleep` completes
+    // instantly and every drain is bounded by a virtual `timeout`
+    // (docs/TESTING.md §5, §7, §9).
+    // =====================================================================
+
+    /// A scripted frame the mock transport yields from [`DeribitTransport::receive`].
+    enum MockFrame {
+        /// A raw notification frame to route.
+        Text(String),
+        /// `receive` returns `Err(TransportGone)` — a socket close / stream error.
+        Drop,
+    }
+
+    /// Test-observable state of the mock transport. The test holds an `Arc` clone
+    /// to inspect the reconnect behaviour after the loop runs.
+    #[derive(Default)]
+    struct MockState {
+        connect_calls: usize,
+        refetch_calls: usize,
+        channel_sets: Vec<Vec<String>>,
+    }
+
+    /// A mock [`DeribitTransport`]: `receive` yields scripted frames (or a drop)
+    /// from a channel the test feeds, `connect_and_subscribe`/`refetch` record
+    /// their calls so a resubscribe/backfill is observable, and `refetch` returns
+    /// a fixed [`ChainFetch`] so the reconnect backfill runs with no REST. No
+    /// socket, no clock.
+    struct MockTransport {
+        state: Arc<StdMutex<MockState>>,
+        frames: mpsc::UnboundedReceiver<MockFrame>,
+        canned_fetch: ChainFetch,
+    }
+
+    #[async_trait]
+    impl DeribitTransport for MockTransport {
+        async fn connect_and_subscribe(
+            &mut self,
+            channels: Vec<String>,
+        ) -> Result<(), TransportGone> {
+            if let Ok(mut state) = self.state.lock() {
+                state.connect_calls += 1;
+                state.channel_sets.push(channels);
+            }
+            Ok(())
+        }
+
+        async fn receive(&mut self) -> Result<String, TransportGone> {
+            match self.frames.recv().await {
+                Some(MockFrame::Text(text)) => Ok(text),
+                Some(MockFrame::Drop) => Err(TransportGone),
+                // The script is exhausted: park so the loop waits on cancellation
+                // (a quiet-but-open stream), never busy-loops.
+                None => std::future::pending().await,
+            }
+        }
+
+        async fn refetch(
+            &mut self,
+            _underlying: &str,
+            _expiration: &ExpirationDate,
+        ) -> Option<ChainFetch> {
+            if let Ok(mut state) = self.state.lock() {
+                state.refetch_calls += 1;
+            }
+            Some(self.canned_fetch.clone())
+        }
+    }
+
+    /// The canned reconnect backfill: a two-leg chain (60000-C + 61000-C) so a
+    /// resubscribe off the FRESH aliases is observable (the initial subscription
+    /// is only 60000-C).
+    fn canned_reconnect_fetch() -> ChainFetch {
+        let call_60k = match normalize_leg(&sample_option()) {
+            Ok(leg) => leg,
+            Err(e) => panic!("the 60000 call should normalize: {e}"),
+        };
+        let option_61k = OptionInstrument {
+            instrument: deribit_instrument(
+                "BTC-27JUN25-61000-C",
+                Some(61_000.0),
+                Some(DeribitOptionType::Call),
+                Some(1_751_011_200_000),
+            ),
+            ticker: ticker(
+                "BTC-27JUN25-61000-C",
+                Some(0.03),
+                Some(0.04),
+                Some(45.0),
+                Some(greeks(Some(0.4), Some(0.0001))),
+            ),
+        };
+        let call_61k = match normalize_leg(&option_61k) {
+            Ok(leg) => leg,
+            Err(e) => panic!("the 61000 call should normalize: {e}"),
+        };
+        assemble_chain(
+            "BTC",
+            pos(60_500.0),
+            utc_millis(1_751_011_200_000),
+            &[call_60k, call_61k],
+            &deribit_provider_id(),
+        )
+    }
+
+    /// Build a mock transport and return it with a shared handle onto its state.
+    fn mock_transport() -> (
+        MockTransport,
+        mpsc::UnboundedSender<MockFrame>,
+        Arc<StdMutex<MockState>>,
+    ) {
+        let (script_tx, script_rx) = mpsc::unbounded_channel::<MockFrame>();
+        let state = Arc::new(StdMutex::new(MockState::default()));
+        let transport = MockTransport {
+            state: Arc::clone(&state),
+            frames: script_rx,
+            canned_fetch: canned_reconnect_fetch(),
+        };
+        (transport, script_tx, state)
+    }
+
+    /// Spawn the reconnect loop over a mock transport, scoped to the single
+    /// 60000-C leg. Returns the join handle and the loop's cancel token.
+    fn spawn_loop(
+        transport: MockTransport,
+        tx: mpsc::Sender<MarketUpdate>,
+    ) -> (tokio::task::JoinHandle<()>, CancellationToken) {
+        let cancel = CancellationToken::new();
+        let join = tokio::spawn(run_reconnect_loop(
+            transport,
+            deribit_provider_id(),
+            "BTC".to_owned(),
+            utc_millis(1_751_011_200_000),
+            vec![sample_instrument()],
+            tx,
+            cancel.clone(),
+        ));
+        (join, cancel)
+    }
+
+    /// Drain updates until `stop` returns true or nothing more arrives within a
+    /// virtual 5 s window. Under `start_paused` the window is instant unless a
+    /// real update is pending, so a genuinely-absent update never hangs the test.
+    async fn drain_until<F>(rx: &mut mpsc::Receiver<MarketUpdate>, mut stop: F) -> Vec<MarketUpdate>
+    where
+        F: FnMut(&MarketUpdate) -> bool,
+    {
+        let mut collected = Vec::new();
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+                Ok(Some(update)) => {
+                    let done = stop(&update);
+                    collected.push(update);
+                    if done {
+                        return collected;
+                    }
+                }
+                Ok(None) | Err(_) => return collected,
+            }
+        }
+    }
+
+    /// Await a loop's clean stop within a virtual window (never a wall-clock wait).
+    async fn loop_stopped(join: tokio::task::JoinHandle<()>) -> bool {
+        matches!(
+            tokio::time::timeout(Duration::from_secs(5), join).await,
+            Ok(Ok(()))
+        )
+    }
+
+    fn is_live(update: &MarketUpdate) -> bool {
+        matches!(update, MarketUpdate::Health(_, StreamHealth::Live))
+    }
+
+    fn is_reconnecting(update: &MarketUpdate) -> bool {
+        matches!(
+            update,
+            MarketUpdate::Health(_, StreamHealth::Reconnecting { .. })
+        )
+    }
+
+    fn is_chain(update: &MarketUpdate) -> bool {
+        matches!(update, MarketUpdate::Chain(_))
+    }
+
+    fn reconnect_attempt(update: &MarketUpdate) -> Option<u32> {
+        match update {
+            MarketUpdate::Health(_, StreamHealth::Reconnecting { attempt }) => Some(*attempt),
+            MarketUpdate::Quote(_)
+            | MarketUpdate::Greeks(_)
+            | MarketUpdate::Depth(_)
+            | MarketUpdate::Chain(_)
+            | MarketUpdate::Health(_, StreamHealth::Live | StreamHealth::Stale { .. }) => None,
+        }
+    }
+
+    /// A varying ticker `data` JSON for a saturation/lag burst (a fresh bid each
+    /// round), shaped as a `ticker.` `TickerPayload`.
+    fn burst_ticker_json(round: u32) -> String {
+        let bid = 0.01 + f64::from(round) * 0.001;
+        let ask = bid + 0.01;
+        format!(
+            "{{\"best_bid_price\":{bid},\"best_ask_price\":{ask},\
+             \"best_bid_amount\":5.0,\"best_ask_amount\":4.0,\"mark_iv\":50.0}}"
+        )
+    }
+
+    // --- (a) socket close -> Health(Reconnecting) + backoff ------------------
+
+    #[tokio::test(start_paused = true)]
+    async fn test_deribit_lifecycle_socket_close_emits_reconnecting() {
+        let (transport, script_tx, _state) = mock_transport();
+        let (tx, mut rx) = mpsc::channel::<MarketUpdate>(16);
+        let (join, cancel) = spawn_loop(transport, tx);
+
+        // A live frame, then the socket closes.
+        let _ = script_tx.send(MockFrame::Text(ticker_frame(
+            "BTC-27JUN25-60000-C",
+            FIXTURE_TICKER_NORMAL,
+        )));
+        let _ = script_tx.send(MockFrame::Drop);
+
+        let updates = drain_until(&mut rx, is_reconnecting).await;
+        assert!(
+            updates.iter().any(is_live),
+            "the stream first surfaced Live"
+        );
+        assert!(
+            updates.iter().any(|u| matches!(u, MarketUpdate::Quote(_))),
+            "the live frame produced a quote before the drop"
+        );
+        match updates.last().and_then(reconnect_attempt) {
+            Some(attempt) => assert_eq!(attempt, 1, "the first drop surfaces Reconnecting{{1}}"),
+            None => panic!("a socket close must surface Health(Reconnecting)"),
+        }
+
+        cancel.cancel();
+        assert!(loop_stopped(join).await, "the cancelled loop stops");
+    }
+
+    // --- (b) stream error -> reconnects without panic ------------------------
+
+    #[tokio::test(start_paused = true)]
+    async fn test_deribit_lifecycle_stream_error_reconnects_without_panic() {
+        let (transport, script_tx, state) = mock_transport();
+        let (tx, mut rx) = mpsc::channel::<MarketUpdate>(16);
+        let (join, cancel) = spawn_loop(transport, tx);
+
+        // A stream error immediately after connect (no data flowed).
+        let _ = script_tx.send(MockFrame::Drop);
+
+        // Drain to the SECOND Live — proving the loop recovered after the error.
+        let mut lives = 0;
+        let updates = drain_until(&mut rx, |u| {
+            if is_live(u) {
+                lives += 1;
+            }
+            lives >= 2
+        })
+        .await;
+        assert!(
+            updates.iter().any(is_reconnecting),
+            "the stream error surfaced Reconnecting, no panic"
+        );
+        assert_eq!(
+            updates.iter().filter(|u| is_live(u)).count(),
+            2,
+            "the loop reconnected to Live after the error"
+        );
+        let refetches = state.lock().map(|s| s.refetch_calls).unwrap_or(0);
+        assert!(
+            refetches >= 1,
+            "the reconnect re-fetched the chain (backfill)"
+        );
+
+        cancel.cancel();
+        assert!(loop_stopped(join).await);
+    }
+
+    // --- (c) resubscribe -> re-fetch + fresh subscription set + reset --------
+
+    #[tokio::test(start_paused = true)]
+    async fn test_deribit_lifecycle_reconnect_refetches_and_resubscribes_fresh() {
+        let (transport, script_tx, state) = mock_transport();
+        let (tx, mut rx) = mpsc::channel::<MarketUpdate>(32);
+        let (join, cancel) = spawn_loop(transport, tx);
+
+        // Two drops (each after a Live), so we observe two reconnects.
+        let _ = script_tx.send(MockFrame::Drop);
+        let _ = script_tx.send(MockFrame::Drop);
+
+        let mut reconnects = 0;
+        let updates = drain_until(&mut rx, |u| {
+            if is_reconnecting(u) {
+                reconnects += 1;
+            }
+            reconnects >= 2
+        })
+        .await;
+
+        // Both reconnects surface attempt == 1: the backoff ramp resets on each
+        // successful resubscribe (the loop-level reset #16 deferred to #17).
+        let attempts: Vec<u32> = updates.iter().filter_map(reconnect_attempt).collect();
+        assert_eq!(
+            attempts,
+            vec![1, 1],
+            "attempt resets to 1 after each successful resubscribe"
+        );
+        assert!(
+            updates.iter().any(is_chain),
+            "the reconnect backfill emitted a Chain snapshot"
+        );
+
+        let (connects, refetches, sets) = match state.lock() {
+            Ok(guard) => (
+                guard.connect_calls,
+                guard.refetch_calls,
+                guard.channel_sets.clone(),
+            ),
+            Err(_) => panic!("mock state lock poisoned"),
+        };
+        assert!(connects >= 2, "the loop reconnected");
+        assert!(refetches >= 1, "the reconnect re-issued fetch_chain");
+
+        // The first subscribe is the single initial leg (ticker + book); after the
+        // re-fetch, a resubscribe picks up the FRESH 61000-C leg from the aliases.
+        match sets.first() {
+            Some(first) => assert_eq!(first.len(), 2, "initial subscribe = ticker + book"),
+            None => panic!("expected an initial subscribe set"),
+        }
+        assert!(
+            sets.iter()
+                .skip(1)
+                .any(|set| set.iter().any(|c| c == "ticker.BTC-27JUN25-61000-C")),
+            "a resubscribe used the fresh 61000-C alias from the re-fetch"
+        );
+
+        cancel.cancel();
+        assert!(loop_stopped(join).await);
+    }
+
+    // --- (d) bounded-bridge saturation -> flat memory ------------------------
+
+    #[test]
+    fn test_deribit_lifecycle_saturation_coalesces_with_flat_memory() {
+        // The bounded bridge the reconnect loop runs per frame (route_message ->
+        // ProducerStaging). A burst far beyond the cap-1 channel capacity, over
+        // three instruments, with the consumer NEVER draining, keeps the staging
+        // map O(N = 3 instruments) — never O(burst): last-value-wins per
+        // instrument without unbounded growth (docs/02 §5, NFR-15).
+        let (tx, _rx) = mpsc::channel::<MarketUpdate>(1);
+        let instruments = [
+            instrument_at(60_000.0),
+            instrument_at(61_000.0),
+            instrument_at(62_000.0),
+        ];
+        let lookup = instrument_lookup(&instruments);
+        let mut staging = ProducerStaging::new();
+        for round in 0..500u32 {
+            for strike in [60_000.0, 61_000.0, 62_000.0] {
+                let symbol = format!("BTC-27JUN25-{strike}-C");
+                let frame = ticker_frame(&symbol, &burst_ticker_json(round));
+                assert_eq!(
+                    route_message(&frame, &lookup, &mut staging, &tx),
+                    SendState::Open,
+                    "a saturated bridge never drops the loop"
+                );
+            }
+            assert!(
+                staging.slots.len() <= 3,
+                "staging stays O(N = 3 instruments), not O(burst): round {round}"
+            );
+        }
+        // `_rx` stayed alive so the channel remained full throughout the burst.
+        drop(_rx);
+    }
+
+    // --- (e) lag -> control (Chain/Health) not stalled -----------------------
+
+    #[tokio::test(start_paused = true)]
+    async fn test_deribit_lifecycle_lag_does_not_stall_control_updates() {
+        // A slow consumer on a cap-1 channel saturated by coalesced quotes must
+        // still receive the control-class Health/Chain (await-sent) in order.
+        let (transport, script_tx, _state) = mock_transport();
+        let (tx, mut rx) = mpsc::channel::<MarketUpdate>(1);
+        let (join, cancel) = spawn_loop(transport, tx);
+
+        // A burst of coalesced-class quote frames, then a socket drop forcing a
+        // control-class Reconnecting + Chain backfill.
+        for round in 0..50u32 {
+            let _ = script_tx.send(MockFrame::Text(ticker_frame(
+                "BTC-27JUN25-60000-C",
+                &burst_ticker_json(round),
+            )));
+        }
+        let _ = script_tx.send(MockFrame::Drop);
+
+        // The slow consumer must still see the control updates: Live, then
+        // Reconnecting, then the Chain backfill — never stalled by the quotes.
+        let updates = drain_until(&mut rx, is_chain).await;
+        assert!(
+            updates.iter().any(is_live),
+            "Health(Live) delivered despite the lagging consumer"
+        );
+        assert!(
+            updates.iter().any(is_reconnecting),
+            "Health(Reconnecting) not stalled by the quote backlog"
+        );
+        assert!(
+            updates.iter().any(is_chain),
+            "the Chain backfill reached the lagging consumer"
+        );
+
+        cancel.cancel();
+        assert!(loop_stopped(join).await);
+    }
+
+    // --- (f) shutdown -> dropping the SubscriptionHandle stops the loop -------
+
+    #[tokio::test(start_paused = true)]
+    async fn test_deribit_lifecycle_shutdown_on_handle_drop_stops_loop() {
+        let (transport, script_tx, _state) = mock_transport();
+        let (tx, mut rx) = mpsc::channel::<MarketUpdate>(16);
+        let (join, cancel) = spawn_loop(transport, tx);
+
+        // Wrap the loop's cancel token in a real `SubscriptionHandle`, exactly as
+        // `subscribe` does, so dropping the handle is what stops the loop.
+        let handle = SubscriptionHandle::new(move || cancel.cancel());
+
+        // Reach a live stream, then park on `receive` (the script stays open).
+        let _ = script_tx.send(MockFrame::Text(ticker_frame(
+            "BTC-27JUN25-60000-C",
+            FIXTURE_TICKER_NORMAL,
+        )));
+        let updates = drain_until(&mut rx, is_live).await;
+        assert!(
+            updates.iter().any(is_live),
+            "the stream is live before shutdown"
+        );
+
+        // Dropping the handle cancels the token; the parked loop stops promptly.
+        drop(handle);
+        assert!(
+            loop_stopped(join).await,
+            "dropping the SubscriptionHandle stops the reconnect loop"
+        );
+        drop(script_tx);
     }
 }

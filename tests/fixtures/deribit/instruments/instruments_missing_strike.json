@@ -1,0 +1,26 @@
+[
+  {
+    "instrument_name": "BTC-27JUN25--C",
+    "kind": "option",
+    "currency": "BTC",
+    "is_active": true,
+    "expiration_timestamp": 1751011200000,
+    "contract_size": 1.0,
+    "quote_currency": "USD",
+    "settlement_currency": "BTC",
+    "base_currency": "BTC",
+    "counter_currency": "USD"
+  },
+  {
+    "instrument_name": "BTC-27JUN25-60000-X",
+    "kind": "option",
+    "currency": "BTC",
+    "is_active": true,
+    "expiration_timestamp": 1751011200000,
+    "contract_size": 1.0,
+    "quote_currency": "USD",
+    "settlement_currency": "BTC",
+    "base_currency": "BTC",
+    "counter_currency": "USD"
+  }
+]

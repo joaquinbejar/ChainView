@@ -1,0 +1,13 @@
+{
+  "best_bid_price": "Infinity",
+  "best_ask_price": 0.06,
+  "best_bid_amount": 5.0,
+  "best_ask_amount": 4.0,
+  "last_price": 0.055,
+  "mark_iv": 49.22,
+  "timestamp": 1751011200000,
+  "greeks": {
+    "delta": 0.55,
+    "gamma": 0.0001
+  }
+}

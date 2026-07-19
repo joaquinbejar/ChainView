@@ -86,6 +86,52 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
     lifecycle (socket close/error/resubscribe/saturation/lag/shutdown) lands in
     #17. 27 new deribit tests plus the `AliasCatalog::instruments()` test in
     `src/chain/fetch.rs`.
+- Deribit normalization fixtures and mock-transport lifecycle tests
+  (`src/providers/deribit.rs`, `tests/fixtures/deribit/`, issue #17;
+  `docs/TESTING.md` §5, §9, `docs/03-data-providers.md` §5, §3). Adds the
+  recorded fixture corpus and the deterministic reconnect-lifecycle coverage #16
+  deferred — **no real socket, no wall clock**. Key pieces:
+  - **A minimal transport seam so the loop is testable.** The #16 reconnect loop
+    reached straight for `DeribitWebSocketClient`, so a crate-internal
+    `DeribitTransport` trait (private — the public `Provider` API is unchanged)
+    now lifts the three impure loop operations (connect + subscribe, receive a
+    frame, re-`fetch_chain` for the backfill) behind one seam. The production
+    `LiveTransport` wraps the upstream WebSocket client plus the REST backfill,
+    exactly as before; a test `MockTransport` yields scripted frames/errors and
+    records connects/refetches/subscription-sets. No raw upstream DTO crosses the
+    seam, and #16's tests stay green.
+  - **Constructed-to-wire-shape fixtures** under `tests/fixtures/deribit/`
+    (`include_str!`-baked, so byte-stable across machines): `instruments_btc`,
+    `ticker_normal`, `book_snapshot`, `book_delta`, plus degraded shapes —
+    zero-bid, crossed (`ask < bid`), negative, non-finite, and a
+    missing-strike/unknown-style payload. Each is pinned to `deribit-http` 0.7.1 /
+    `deribit-websocket` 0.3.1 (recorded in `docs/specs/providers.md` §0). JSON
+    carries no `NaN`/`Inf` literal, so the non-finite fixture uses a non-numeric
+    string field the adapter refuses at deserialization (the frame is dropped, no
+    fabricated value); the `f64` `NaN`/`Inf` guards themselves stay covered by the
+    property tests.
+  - **Fixture → `OptionChain` / update assertions.** Each fixture normalizes to
+    its recorded chain/update: the instrument list assembles a two-strike chain
+    (perpetual filtered, IV / 100 reaches the leg), the ticker normalizes to a
+    `QuoteUpdate` + `GreeksRow` (theta/vega/rho discarded), the book to a
+    `DepthLadder` with `change_id`; the degraded fixtures prove a
+    crossed/zero/negative field outcome and a row-fatal `Normalize` reject with no
+    panic and no fabricated value.
+  - **Mock-transport lifecycle tests (a)–(f):** socket close and stream error →
+    `Health(Reconnecting)` + no panic; resubscribe → the reconnect re-issues
+    `fetch_chain` **and** resubscribes off the fresh aliases (the new 61000-C leg
+    appears), with the backoff **attempt reset-on-success** asserted at the loop
+    level (both reconnects surface `attempt: 1`) — the assertion #16 deferred;
+    saturation → a burst far beyond a cap-1 channel keeps the producer staging
+    O(N instruments) (flat memory); lag → a slow consumer still receives the
+    await-sent `Health`/`Chain`; shutdown → dropping the real `SubscriptionHandle`
+    stops the loop. All run under `#[tokio::test(start_paused = true)]` with
+    scripted frames and virtual-clock drains, deterministic and well under 10 s.
+  - **Fixture corpus as a property seed.** The committed fixtures also feed a
+    totality test (each normalizes to a valid update or a typed reject, never a
+    panic), complementing #16's `normalize_total` property tests.
+  - 16 new deribit tests (10 fixture-normalization + 6 lifecycle); the transport
+    seam refactor keeps all 65 existing #16 deribit tests green.
 - **`deribit-websocket` `0.3.1`** (`[dependencies]`, issue #16) — the upstream
   Deribit WebSocket client ChainView wraps for the streaming overlay; the
   JSON-RPC 2.0 over WebSocket protocol lives upstream and is never reimplemented
