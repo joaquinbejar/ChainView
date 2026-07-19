@@ -35,10 +35,10 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Paragraph};
 
+use crate::app::atm_index_of;
 use crate::app::keymap::{KeyChord, PayoffAction, resolve_payoff};
 use crate::app::{BuilderLeg, LegFocus, LiveState, ReplayState, Side};
 use crate::event::AppEvent;
-use crate::ui::chain::atm_index_of;
 use crate::ui::theme::Theme;
 
 // ===========================================================================
@@ -315,7 +315,13 @@ fn commit(state: &mut LiveState) {
         payoff_builder,
         ..
     } = state;
-    let _ = payoff_builder.commit(store.chain());
+    // Freshness reaches the validation as data (#26): the store's stream-quote
+    // receipt clocks + the analytics reference instant, so a leg whose feed died
+    // is rejected with StaleMark instead of committing a cached midpoint. Still a
+    // pure read - no I/O, no wall clock in the draw path.
+    let clocks = store.quote_clocks();
+    let as_of = store.analytics_as_of();
+    let _ = payoff_builder.commit(store.chain(), &clocks, as_of);
 }
 
 /// The [`OptionStyle`] of a focused leg, exhaustive with no wildcard.
@@ -631,6 +637,52 @@ mod tests {
         assert!(
             state.payoff_builder.errors().is_empty(),
             "no errors on commit"
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_a_stale_stream_mark_with_stale_mark() {
+        use crate::chain::{InstrumentKey, QuoteClocks};
+        let mut state = live_state();
+        focus(&mut state, 0);
+        press(&mut state, KeyCode::Char('a')); // FULL_A, has a mark
+        let chain = state.store.chain();
+        let (strike, style) = match state.payoff_builder.legs().first() {
+            Some(leg) => (leg.strike, leg.style),
+            None => panic!("a leg was appended"),
+        };
+        // The leg's stream quote was received 120s before as_of - far past
+        // QUOTE_STALE_AFTER (5s) - so validation must reject it with StaleMark
+        // rather than committing a cached midpoint from a dead feed.
+        let as_of = utc(EXP);
+        let mut clocks = QuoteClocks::new();
+        clocks.insert(
+            InstrumentKey {
+                underlying: chain.symbol.clone(),
+                expiration_utc: match chain.get_expiration() {
+                    Some(optionstratlib::ExpirationDate::DateTime(dt)) => dt,
+                    other => panic!("fixture chain must carry an absolute expiry, got {other:?}"),
+                },
+                strike,
+                style,
+            },
+            as_of - chrono::Duration::seconds(120),
+        );
+        match state.payoff_builder.validate(chain, &clocks, as_of) {
+            Err(errors) => assert!(
+                errors
+                    .iter()
+                    .any(|e| matches!(e, LegError::StaleMark { idx: 0 })),
+                "the stale leg reports StaleMark, got {errors:?}"
+            ),
+            Ok(_) => panic!("a stale-marked leg must not validate"),
+        }
+        // The SAME leg with no recorded clock (poll-seeded) still validates - the
+        // #24 ungated convention.
+        let empty = QuoteClocks::new();
+        assert!(
+            state.payoff_builder.validate(chain, &empty, as_of).is_ok(),
+            "a leg with no stream clock is not gated"
         );
     }
 

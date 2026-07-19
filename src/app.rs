@@ -44,15 +44,16 @@ use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use optionstratlib::OptionStyle;
 use optionstratlib::chains::chain::OptionChain;
 use optionstratlib::prelude::{Decimal, Positive};
+use optionstratlib::{ExpirationDate, OptionStyle};
 use tokio::sync::mpsc;
 
 use crate::app::keymap::{GlobalCommand, KeyChord, resolve_global};
+use crate::chain::quote_is_stale;
 use crate::chain::{
-    ChainFetch, ChainSnapshot, ChainStore, ExpirySource, MarketUpdate, MergeOutcome, ProviderId,
-    StreamHealth,
+    ChainFetch, ChainSnapshot, ChainStore, ExpirySource, InstrumentKey, MarketUpdate, MergeOutcome,
+    ProviderId, QuoteClocks, StreamHealth,
 };
 use crate::config::ThemeChoice;
 use crate::event::{AppEvent, Command, SeekTo};
@@ -1069,6 +1070,15 @@ pub enum LegError {
         /// The zero-based index of the offending leg.
         idx: usize,
     },
+    /// The leg at zero-based index `idx` has a mark, but its stream quote went
+    /// stale beyond the documented threshold (`QUOTE_STALE_AFTER`) — a cached
+    /// midpoint from a feed that stopped updating must not be committed as an
+    /// entry price. Mirrors the #24 kernel gate: a leg with no stream clock
+    /// (poll-seeded) is not gated.
+    StaleMark {
+        /// The zero-based index of the offending leg.
+        idx: usize,
+    },
 }
 
 impl std::fmt::Display for LegError {
@@ -1077,6 +1087,7 @@ impl std::fmt::Display for LegError {
             Self::Empty => write!(f, "add a leg with `a`"),
             Self::ZeroQty { idx } => write!(f, "leg {}: zero quantity", idx + 1),
             Self::NoMark { idx } => write!(f, "leg {}: no mark", idx + 1),
+            Self::StaleMark { idx } => write!(f, "leg {}: mark is stale", idx + 1),
         }
     }
 }
@@ -1295,8 +1306,13 @@ impl PayoffBuilder {
     /// The chain is borrowed immutably while `self` is borrowed mutably — the caller
     /// passes disjoint field borrows (`store.chain()` vs `payoff_builder`), so the
     /// draw path stays free of any pricing or I/O; validation is a pure read.
-    pub(crate) fn commit(&mut self, chain: &OptionChain) -> bool {
-        match self.validate(chain) {
+    pub(crate) fn commit(
+        &mut self,
+        chain: &OptionChain,
+        clocks: &QuoteClocks,
+        as_of: DateTime<Utc>,
+    ) -> bool {
+        match self.validate(chain, clocks, as_of) {
             Ok(strategy) => {
                 self.committed = Some(strategy);
                 self.errors.clear();
@@ -1323,11 +1339,31 @@ impl PayoffBuilder {
     ///
     /// Returns a [`Vec`] of [`LegError`] describing every failure: a lone
     /// [`LegError::Empty`] when there are no legs, else a [`LegError::ZeroQty`] /
-    /// [`LegError::NoMark`] per offending leg (a leg can report both).
-    pub fn validate(&self, chain: &OptionChain) -> Result<CommittedStrategy, Vec<LegError>> {
+    /// [`LegError::NoMark`] / [`LegError::StaleMark`] per offending leg (a leg
+    /// can report more than one). Freshness arrives as **data** (`clocks`,
+    /// `as_of` — the store's per-instrument stream-quote receipt snapshots and
+    /// the pricing reference instant), so validation stays a pure read: a leg
+    /// whose recorded clock is stale beyond `QUOTE_STALE_AFTER` is rejected with
+    /// `StaleMark` rather than committing a cached midpoint from a dead feed; a
+    /// leg with no recorded clock (poll-seeded) is not gated, mirroring the #24
+    /// kernel convention.
+    pub fn validate(
+        &self,
+        chain: &OptionChain,
+        clocks: &QuoteClocks,
+        as_of: DateTime<Utc>,
+    ) -> Result<CommittedStrategy, Vec<LegError>> {
         if self.legs.is_empty() {
             return Err(vec![LegError::Empty]);
         }
+        // The clock lookup keys on the chain's absolute-UTC expiry; a chain whose
+        // expiry is not absolute (an adapter-seam invariant violation) simply
+        // yields no key match, so freshness degrades to ungated rather than
+        // panicking or blocking the commit.
+        let expiration_utc = match chain.get_expiration() {
+            Some(ExpirationDate::DateTime(dt)) => Some(dt),
+            _ => None,
+        };
         let mut errors = Vec::new();
         for (idx, leg) in self.legs.iter().enumerate() {
             if leg.qty == 0 {
@@ -1335,6 +1371,18 @@ impl PayoffBuilder {
             }
             if leg.mark_in(chain).is_none() {
                 errors.push(LegError::NoMark { idx });
+            } else if let Some(expiration_utc) = expiration_utc {
+                let key = InstrumentKey {
+                    underlying: chain.symbol.clone(),
+                    expiration_utc,
+                    strike: leg.strike,
+                    style: leg.style,
+                };
+                if let Some(received) = clocks.received(&key)
+                    && quote_is_stale(received, as_of)
+                {
+                    errors.push(LegError::StaleMark { idx });
+                }
             }
         }
         if errors.is_empty() {
@@ -1681,7 +1729,7 @@ fn now_utc() -> DateTime<Utc> {
 /// empty chain. Uses only `optionstratlib` chain types, so it is a domain-facing
 /// projection the application layer may compute (no dependency on `src/ui`).
 #[must_use]
-fn atm_index_of(chain: &OptionChain) -> Option<usize> {
+pub(crate) fn atm_index_of(chain: &OptionChain) -> Option<usize> {
     let spot = chain.underlying_price.to_dec();
     let mut best: Option<(usize, Decimal)> = None;
     for (idx, od) in chain.options.iter().enumerate() {

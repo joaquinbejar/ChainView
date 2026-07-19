@@ -922,6 +922,30 @@ impl ChainStore {
         let _ = compute_dirty_legs(&self.chain, &ctx, &clocks, &dirty, &mut self.sidecar);
     }
 
+    /// A read-only snapshot of the per-instrument stream-quote receipt clocks —
+    /// freshness as **data** for a caller-side gate (the payoff builder's
+    /// commit-time `StaleMark` validation, #26), keyed exactly as the engine
+    /// keys them. Only instruments with a recorded stream quote appear, so a
+    /// poll-seeded leg is absent (ungated), mirroring the #24 convention.
+    #[must_use]
+    pub(crate) fn quote_clocks(&self) -> QuoteClocks {
+        let mut clocks = QuoteClocks::new();
+        for (key, state) in &self.instruments {
+            if let Some(received) = state.quote_received {
+                clocks.insert(key.clone(), received);
+            }
+        }
+        clocks
+    }
+
+    /// The pricing reference instant of the latest analytics pass — the same
+    /// `as_of` the #24 kernel gates freshness against, exposed so a caller-side
+    /// staleness check (#26 commit validation) uses the identical clock domain.
+    #[must_use]
+    pub(crate) fn analytics_as_of(&self) -> DateTime<Utc> {
+        self.analytics_as_of
+    }
+
     /// Recompute the style-keyed local analytics for the whole chain via the #24
     /// engine, cached by the pricing `input_generation`. `compute_leg_greeks` records every
     /// per-leg outcome in the leg's status and returns `Ok(())` (a malformed,
