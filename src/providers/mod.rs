@@ -98,10 +98,6 @@ pub(crate) mod dxfeed_decode;
 #[cfg(feature = "tastytrade")]
 pub(crate) mod tastytrade;
 
-mod sink;
-
-pub use sink::{MarketUpdateSink, SinkSend};
-
 /// The seam every adapter implements: one trait, one adapter per provider id
 /// (`docs/03-data-providers.md` §2).
 ///

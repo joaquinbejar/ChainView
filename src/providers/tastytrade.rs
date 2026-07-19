@@ -110,7 +110,7 @@ use tastytrade::prelude::{
 use super::dxfeed_decode::{DxGreeksEvent, DxQuoteEvent, decode_greeks, decode_quote};
 use super::{
     AuthKind, ChainCapability, ChainPollCapability, GreeksCapability, MarketUpdateSink,
-    OptionStreamCapability, Provider, ProviderCapabilities, SinkSend, SubscriptionHandle,
+    OptionStreamCapability, Provider, ProviderCapabilities, SendState, SubscriptionHandle,
     SubscriptionRequest, UnderlyingRef,
 };
 use crate::chain::{
@@ -356,8 +356,13 @@ fn tastytrade_provider_id() -> ProviderId {
 
 /// tastytrade's honest capability self-declaration — the
 /// `docs/03-data-providers.md` §8 row: a native REST chain, no depth,
-/// venue-provided Greeks, an (unverified) contract quote stream, an underlying
-/// stream, REST chain polling, no trades tape, and `UserPass` auth.
+/// venue-provided Greeks, an (unverified) contract quote stream, **no underlying
+/// stream** (capability honesty: the dxfeed subscription contains only option
+/// aliases and nothing folds `OptionChain::underlying_price`, so advertising an
+/// underlying stream would leave the median-strike placeholder posing as a live
+/// spot — declared unavailable until a real underlying quote is subscribed AND
+/// folded, the same honesty resolution as the Deribit ADR-0009 row), REST chain
+/// polling, no trades tape, and `UserPass` auth.
 #[must_use]
 pub(crate) fn tastytrade_capabilities() -> ProviderCapabilities {
     ProviderCapabilities::builder()
@@ -365,7 +370,7 @@ pub(crate) fn tastytrade_capabilities() -> ProviderCapabilities {
         .depth(false)
         .greeks(GreeksCapability::Provided)
         .option_stream(OptionStreamCapability::ChainQuotes { verified: false })
-        .underlying_stream(true)
+        .underlying_stream(false)
         .chain_poll(ChainPollCapability::Poll {
             interval_hint_secs: REFRESH_HINT_SECS,
         })
@@ -880,7 +885,7 @@ async fn run_reconnect_loop<T: TastyTransport>(
             () = cancel.cancelled() => return,
             outcome = sink.send(health) => outcome,
         };
-        if health_sent == SinkSend::Closed {
+        if health_sent == SendState::Closed {
             return;
         }
         let delay = backoff_delay(attempt, sample_jitter());
@@ -930,7 +935,7 @@ async fn connect_stream_once<T: TastyTransport>(
 
     *attempt = 0;
     let live = MarketUpdate::Health(id.clone(), StreamHealth::Live);
-    if sink.send(live).await == SinkSend::Closed {
+    if sink.send(live).await == SendState::Closed {
         return StreamExit::Shutdown;
     }
 
@@ -945,7 +950,7 @@ async fn connect_stream_once<T: TastyTransport>(
             Ok(event) => event,
             Err(_) => return StreamExit::Reconnect,
         };
-        if route_event(&event, &lookup, sink).await == SinkSend::Closed {
+        if route_event(&event, &lookup, sink).await == SendState::Closed {
             return StreamExit::Shutdown;
         }
     }
@@ -976,7 +981,7 @@ async fn refetch<T: TastyTransport>(
         () = cancel.cancelled() => return None,
         outcome = sink.send(snapshot) => outcome,
     };
-    if snapshot_sent == SinkSend::Closed {
+    if snapshot_sent == SendState::Closed {
         return None;
     }
 
@@ -1040,12 +1045,12 @@ fn stream_lookup(instruments: &[Instrument]) -> HashMap<String, Instrument> {
 /// is a **benign drop**
 /// (trace, keep prior), and a **crossed** quote is likewise a benign per-tick drop
 /// (trace, keep prior) — neither feeds reconnect/health/error-rate logic. Returns
-/// [`SinkSend::Closed`] once the consumer is gone.
+/// [`SendState::Closed`] once the consumer is gone.
 async fn route_event(
     event: &RawDxEvent,
     lookup: &HashMap<String, Instrument>,
     sink: &mut MarketUpdateSink,
-) -> SinkSend {
+) -> SendState {
     let received = now_utc();
     match event {
         RawDxEvent::Quote {
@@ -1061,14 +1066,22 @@ async fn route_event(
                 // set is dropped (never resurrects a strike). Once the tracing sink
                 // lands (governance deviation 3) a bounded `clamp_symbol(symbol)`
                 // echo goes here at TRACE — the deribit-adapter house pattern.
-                return SinkSend::Delivered;
+                return SendState::Open;
+            };
+            // A size beyond the 2^53 exact-f64 envelope is REJECTED per tick (the
+            // same benign-drop contract as a crossed tick: keep the prior quote,
+            // never a silently-rounded magnitude) - in release builds too, not
+            // just under debug_assert.
+            let (Some(bid_size), Some(ask_size)) = (size_to_f64(*bid_size), size_to_f64(*ask_size))
+            else {
+                return SendState::Open;
             };
             let view = DxQuoteEvent {
                 symbol: symbol.clone(),
                 bid: *bid,
                 ask: *ask,
-                bid_size: size_to_f64(*bid_size),
-                ask_size: size_to_f64(*ask_size),
+                bid_size,
+                ask_size,
                 // A dxfeed Quote event carries no last (it rides a Trade event).
                 last: None,
                 event_time: ms_to_event_time(*time_ms),
@@ -1079,7 +1092,7 @@ async fn route_event(
                 // A momentarily-crossed tick is a benign microstructure event on a
                 // fast feed: keep the prior quote, do NOT feed reconnect/health/error
                 // rate. Once the tracing sink lands a `clamp_symbol` TRACE goes here.
-                Err(_) => SinkSend::Delivered,
+                Err(_) => SendState::Open,
             }
         }
         RawDxEvent::Greeks {
@@ -1096,7 +1109,7 @@ async fn route_event(
                 // Unknown-symbol guard (see the quote arm): dropped, prior kept. A
                 // bounded `clamp_symbol(symbol)` TRACE goes here once the tracing
                 // sink lands (governance deviation 3).
-                return SinkSend::Delivered;
+                return SendState::Open;
             };
             let view = DxGreeksEvent {
                 symbol: symbol.clone(),
@@ -1116,24 +1129,27 @@ async fn route_event(
                 // `GreeksOrigin::Provider` with its venue IV intact.
                 Ok(greeks) => sink.send(MarketUpdate::Greeks(greeks)).await,
                 // decode_greeks is total for a well-formed event; a defensive drop.
-                Err(_) => SinkSend::Delivered,
+                Err(_) => SendState::Open,
             }
         }
-        RawDxEvent::Ignored => SinkSend::Delivered,
+        RawDxEvent::Ignored => SendState::Open,
     }
 }
 
 /// Convert an upstream `i64` size to the `f64` the neutral [`DxQuoteEvent`] size
-/// fields carry. The conversion is exact up to `2^53` (~9x10^15) — the precision
-/// envelope documented on [`DxQuoteEvent::bid_size`](super::dxfeed_decode) — a
-/// bound no real contract quantity approaches, so no real size loses precision.
+/// fields carry, or `None` when the magnitude exceeds `2^53` (~9x10^15) — the
+/// exact-f64 precision envelope documented on
+/// [`DxQuoteEvent::bid_size`](super::dxfeed_decode). No real contract quantity
+/// approaches the bound, but an out-of-envelope external value is now REJECTED
+/// (a typed per-tick drop at the caller) in every build profile, never silently
+/// rounded - the debug_assert-only guard held no line in release.
 #[allow(clippy::cast_precision_loss)]
-fn size_to_f64(size: i64) -> f64 {
-    debug_assert!(
-        size.unsigned_abs() < (1u64 << 53),
-        "size magnitude exceeds the documented 2^53 exact-f64 envelope"
-    );
-    size as f64
+fn size_to_f64(size: i64) -> Option<f64> {
+    if size.unsigned_abs() < (1u64 << 53) {
+        Some(size as f64)
+    } else {
+        None
+    }
 }
 
 /// Resolve a venue `time` in ms to an optional exchange `event_time` — a `0` `time`
@@ -1322,7 +1338,10 @@ mod tests {
             caps.option_stream,
             OptionStreamCapability::ChainQuotes { verified: false }
         );
-        assert!(caps.underlying_stream);
+        assert!(
+            !caps.underlying_stream,
+            "declared FALSE until a real underlying quote is subscribed AND folded"
+        );
         assert_eq!(
             caps.chain_poll,
             ChainPollCapability::Poll {
@@ -1716,7 +1735,7 @@ mod tests {
             time_ms: 0,
         };
         let outcome = block(route_event(&event, &lookup, &mut sink));
-        assert_eq!(outcome, SinkSend::Delivered, "a benign drop is not Closed");
+        assert_eq!(outcome, SendState::Open, "a benign drop is not Closed");
         assert!(
             rx_coalesced.try_recv().is_err(),
             "a crossed quote publishes nothing"
@@ -1736,7 +1755,7 @@ mod tests {
             time_ms: 0,
         };
         let outcome = block(route_event(&event, &lookup, &mut sink));
-        assert_eq!(outcome, SinkSend::Delivered);
+        assert_eq!(outcome, SendState::Open);
         assert!(rx_coalesced.try_recv().is_err());
     }
 
@@ -1745,7 +1764,7 @@ mod tests {
         let lookup: HashMap<String, Instrument> = HashMap::new();
         let (mut sink, _rx_control, mut rx_coalesced) = test_sink(8);
         let outcome = block(route_event(&RawDxEvent::Ignored, &lookup, &mut sink));
-        assert_eq!(outcome, SinkSend::Delivered);
+        assert_eq!(outcome, SendState::Open);
         assert!(rx_coalesced.try_recv().is_err());
     }
 
