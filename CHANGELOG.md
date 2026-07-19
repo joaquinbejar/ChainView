@@ -14,6 +14,42 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- **Surface / depth render goldens + the IG option-epic depth fixture** (issue #50;
+  `docs/TESTING.md` §4/§5, `docs/03-data-providers.md` §8, v0.5). Locks the populated
+  **and** degraded states of the three screens this milestone adds, all rendered
+  through the REAL full-frame path (state -> `ViewState::sync` off the draw path ->
+  `render` into a 120x40 `TestBackend`), and resolves the last `unverified` cell in
+  the capability matrix.
+  - **Seven 120x40 render goldens.** The vol surface (#47) in all three views —
+    `surface/deribit_btc_smile` (IV smile), `surface/deribit_btc_curve` (the Greek
+    curve), `surface/deribit_btc_surface` (the single-expiry surface heat map) — plus
+    its `surface/surface_empty` insufficient-IV state; the Deribit depth ladder (#48)
+    `depth/deribit_btc_ladder`, assembled from the committed grouped-book fixture
+    through the REAL `normalize_book`, plus the first-class `depth/depth_unavailable`
+    capability state for a depth-less venue; and the replay `replay/payoff_head` (#49
+    reconciled scope) — an OPEN position's **expiration** curve with the mark-based MTM
+    reference and the honest "not a bit-exact reprice" caveat, money rendered from
+    integer cents. The companion "flat at this step" empty render is exercised in the
+    same module. A `#[cfg(test)]` `fixture_btc_depth_ladder` helper (`src/providers/deribit.rs`)
+    drives the grouped fixture bytes through the adapter's real normalize path.
+  - **The IG option-epic depth cell resolved to `no` (evidence-on-file).** The
+    `unverified` IG depth cell (`docs/03-data-providers.md` §8) is resolved: the
+    committed `tests/fixtures/ig/depth/option_epic_price_snapshot.json` records the
+    `ig-client` wire shape for a dated-option epic — a market-details top-of-book plus
+    a Lightstreamer `PRICE` five-level DOM subscription whose depth fields arrive
+    **empty** — so IG populates no order book and depth is **`no`**. Because the IG
+    built-in adapter is **deferred** (#39) there is no adapter to drive it through, so
+    the fixture is committed as a DATA artifact (evidence-on-file with a README); the
+    shape test (`src/tests_capability_matrix.rs`) is the meaningful check without the
+    adapter (the payload parses as the documented DOM shape, the five-level fields are
+    unpopulated), and the on-file fixture drives the real depth path to confirm the
+    `no` when #39 unblocks.
+  - Tests/goldens/fixtures only — **no production change**. Noted for follow-up: the
+    depth ladder's fixed 2-decimal price format under-resolves Deribit sub-unit option
+    prices (the grouped fixture's `0.049`/`0.048` levels render as `0.04`); the golden
+    pins this delivered behaviour so a future `src/ui/depth.rs` precision fix lands as
+    a visible diff.
+
 - **The replay payoff-at-head panel** (issue #49; `docs/04-replay-mode.md` §6,
   `docs/05-views-and-ux.md` §5, §2.1, v0.5). The Replay `Payoff` screen becomes the
   **second reachable replay screen**: it renders the payoff of the **open position at

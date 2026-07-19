@@ -190,3 +190,140 @@ fn test_every_reserved_id_is_either_reconciled_or_deferred() {
         );
     }
 }
+
+// --- IG option-epic depth fixture: the evidence-on-file disposition (#50) -----
+//
+// The `ig` §8 depth cell was `unverified` — the client models a five-level ladder,
+// but whether a DATED-OPTION epic populates it was unproven. Issue #50 lands the
+// option-epic depth fixture that answers it. Because the IG built-in adapter is
+// DEFERRED (#39) there is no adapter to drive it through, so the fixture is committed
+// as a DATA artifact (`tests/fixtures/ig/depth/`, see its README) and this shape test
+// is the meaningful check available WITHOUT the adapter: it parses as the documented
+// `ig-client` wire shape and confirms the five-level DOM fields are UNPOPULATED for a
+// dated-option epic — the evidence pointing the depth cell at `no`, on file for when
+// #39 unblocks (`docs/03-data-providers.md` §8, §7.4; `docs/TESTING.md` §5).
+
+/// The committed IG option-epic depth fixture, baked in with `include_str!` so the
+/// shape check is byte-stable and needs no I/O.
+const IG_OPTION_DEPTH_FIXTURE: &str =
+    include_str!("../tests/fixtures/ig/depth/option_epic_price_snapshot.json");
+
+/// The IG Lightstreamer five-level depth-of-market field names, exactly as
+/// `ig_client::model::streaming::StreamingPriceField` names them on the wire.
+const IG_DOM_FIELDS: [&str; 20] = [
+    "BIDPRICE1",
+    "BIDPRICE2",
+    "BIDPRICE3",
+    "BIDPRICE4",
+    "BIDPRICE5",
+    "ASKPRICE1",
+    "ASKPRICE2",
+    "ASKPRICE3",
+    "ASKPRICE4",
+    "ASKPRICE5",
+    "BIDSIZE1",
+    "BIDSIZE2",
+    "BIDSIZE3",
+    "BIDSIZE4",
+    "BIDSIZE5",
+    "ASKSIZE1",
+    "ASKSIZE2",
+    "ASKSIZE3",
+    "ASKSIZE4",
+    "ASKSIZE5",
+];
+
+/// The documented IG option-epic depth payload: a market-details snapshot (top of
+/// book) plus a Lightstreamer PRICE subscription whose fields are the five-level DOM.
+#[derive(serde::Deserialize)]
+struct IgOptionDepthFixture {
+    epic: String,
+    instrument_type: String,
+    market_details_snapshot: IgMarketDetailsSnapshot,
+    price_subscription: IgPriceSubscription,
+}
+
+/// The `MarketService::get_market_details` snapshot top-of-book — the option's real
+/// quote (present), distinct from a depth ladder (absent).
+#[derive(serde::Deserialize)]
+struct IgMarketDetailsSnapshot {
+    bid: f64,
+    offer: f64,
+}
+
+/// The Lightstreamer `PRICE:{epic}` update — the five-level DOM fields as a raw
+/// name -> optional-string map (Lightstreamer sends an unavailable field as null).
+#[derive(serde::Deserialize)]
+struct IgPriceSubscription {
+    fields: std::collections::BTreeMap<String, Option<String>>,
+}
+
+#[test]
+fn test_ig_option_epic_depth_fixture_shape_proves_no_populated_ladder() {
+    // The fixture parses as the documented IG wire shape.
+    let fixture: IgOptionDepthFixture = match serde_json::from_str(IG_OPTION_DEPTH_FIXTURE) {
+        Ok(fixture) => fixture,
+        Err(e) => {
+            panic!("the IG option-epic depth fixture must parse as the documented shape: {e}")
+        }
+    };
+    assert!(
+        fixture.epic.starts_with("OP."),
+        "a dated-option epic (OP.*): {}",
+        fixture.epic,
+    );
+    assert!(
+        fixture.instrument_type.starts_with("OPT"),
+        "an option instrument type: {}",
+        fixture.instrument_type,
+    );
+
+    // The option IS quoted: the market-details snapshot carries a real top-of-book
+    // bid/offer — but a single top-of-book quote is NOT a five-level ladder.
+    let snapshot = &fixture.market_details_snapshot;
+    assert!(
+        snapshot.bid > 0.0 && snapshot.offer > snapshot.bid,
+        "the option carries a top-of-book bid/offer (it is quoted): bid {} offer {}",
+        snapshot.bid,
+        snapshot.offer,
+    );
+
+    // The finding: every five-level DOM field is present in the documented schema but
+    // UNPOPULATED (null) for a dated-option epic — IG has no option order book to
+    // render, so depth is `no` (the depth screen stays unavailable, never fabricated).
+    let fields = &fixture.price_subscription.fields;
+    for name in IG_DOM_FIELDS {
+        match fields.get(name) {
+            Some(value) => assert!(
+                value.is_none(),
+                "DOM field {name} must be unpopulated (null) for a dated-option epic, got {value:?}",
+            ),
+            None => panic!("the fixture must carry the documented DOM field {name}"),
+        }
+    }
+    // The quote-ids are likewise absent (no book); the venue timestamp is present.
+    for name in ["BIDQUOTEID", "ASKQUOTEID"] {
+        assert!(
+            matches!(fields.get(name), Some(None)),
+            "{name} must be unpopulated (no ladder)",
+        );
+    }
+    assert!(
+        matches!(fields.get("TIMESTAMP"), Some(Some(_))),
+        "the venue timestamp is present",
+    );
+}
+
+#[test]
+fn test_ig_depth_disposition_is_evidence_on_file_pending_39() {
+    // The disposition: `ig` stays a RESERVED id with its built-in adapter DEFERRED
+    // (#39). The option-epic depth fixture is SHAPE-ONLY (hand-authored to the
+    // documented wire shape, not a recorded live payload - it cannot establish
+    // what a live venue populates), so the matrix depth cell stays UNVERIFIED
+    // until a recorded payload or authoritative provider documentation exists;
+    // the definitive flip - either way - lands with the #39 unblock.
+    assert!(
+        RESERVED_PROVIDER_IDS.contains(&"ig"),
+        "ig stays reserved while the built-in is deferred (#39)",
+    );
+}

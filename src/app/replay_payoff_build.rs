@@ -84,7 +84,10 @@ const GRID_MARGIN_TENTHS: i64 = 3;
 /// The name given to the replay expiration series, carrying the honest **per-contract**
 /// caveat: the bundle carries no contract-multiplier column, so this curve's y-axis is
 /// per-contract-notional dollars, never portfolio dollars (see the module docs).
-const REPLAY_SERIES_NAME: &str = "payoff @ expiration (per contract)";
+// Short enough for ratatui's legend-width constraint (a longer label makes the
+// whole legend vanish); the ALWAYS-VISIBLE per-contract disclosure lives on the
+// panel caveat line (src/ui/payoff.rs), which cannot be elided.
+const REPLAY_SERIES_NAME: &str = "payoff @ expiration";
 
 /// Nanoseconds per calendar day — the deterministic `Days` day-count divisor for the
 /// head DTE (integer ns → `Decimal` days, so no `f64` enters the day-count).

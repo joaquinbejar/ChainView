@@ -1,0 +1,44 @@
+{
+  "epic": "OP.D.SPX2.7500C.IP",
+  "instrument_type": "OPT_COMMODITIES",
+  "expiry": "18-JUL-26",
+  "captured_utc": "2026-07-18T13:45:22Z",
+  "source": "ig-client 0.12.1 wire shape (StreamingPriceField / MarketService::get_market_details); see README.md",
+  "market_details_snapshot": {
+    "bid": 12.5,
+    "offer": 13.5,
+    "high": 15.0,
+    "low": 11.0,
+    "update_time": "13:45:22",
+    "market_status": "TRADEABLE"
+  },
+  "price_subscription": {
+    "subscription": "PRICE:OP.D.SPX2.7500C.IP",
+    "mode": "MERGE",
+    "fields": {
+      "BIDPRICE1": null,
+      "BIDPRICE2": null,
+      "BIDPRICE3": null,
+      "BIDPRICE4": null,
+      "BIDPRICE5": null,
+      "ASKPRICE1": null,
+      "ASKPRICE2": null,
+      "ASKPRICE3": null,
+      "ASKPRICE4": null,
+      "ASKPRICE5": null,
+      "BIDSIZE1": null,
+      "BIDSIZE2": null,
+      "BIDSIZE3": null,
+      "BIDSIZE4": null,
+      "BIDSIZE5": null,
+      "ASKSIZE1": null,
+      "ASKSIZE2": null,
+      "ASKSIZE3": null,
+      "ASKSIZE4": null,
+      "ASKSIZE5": null,
+      "BIDQUOTEID": null,
+      "ASKQUOTEID": null,
+      "TIMESTAMP": "1752846322000"
+    }
+  }
+}

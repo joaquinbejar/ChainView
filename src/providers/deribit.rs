@@ -1112,6 +1112,52 @@ pub(crate) fn fixture_btc_stream_updates(received: DateTime<Utc>) -> Vec<MarketU
     out
 }
 
+/// Assemble the recorded BTC option-book depth ladder from the committed grouped
+/// snapshot fixture (`book_grouped_snapshot.json`, the #48 grouped-channel shape)
+/// through the **real** streaming-normalization seam ([`normalize_book`]), re-keyed
+/// to `key` so it matches the depth screen's selected contract — the source for the
+/// `depth/deribit_btc_ladder` render golden (#50, `docs/TESTING.md` §4).
+///
+/// Driving the golden through the actual normalize path (not a hand-built ladder)
+/// proves the rendered ladder reflects the adapter's output: the fixture's
+/// aggregated `[price, amount]` levels and its upstream `change_id` flow through
+/// [`normalize_book`] verbatim. The `native_symbol` mirrors the fixture's
+/// `instrument_name` (`BookPayload` drops it) so the ladder title reads the same
+/// venue instrument. `#[cfg(test)]`, so it never rides in the release binary; the
+/// fixture bytes are baked in with `include_str!`, so the golden is byte-stable
+/// across machines (no I/O, no socket).
+#[cfg(test)]
+pub(crate) fn fixture_btc_depth_ladder(key: InstrumentKey, received: DateTime<Utc>) -> DepthLadder {
+    use deribit_websocket::prelude::Value;
+
+    const BOOK_GROUPED_JSON: &str =
+        include_str!("../../tests/fixtures/deribit/book/book_grouped_snapshot.json");
+
+    let value: Value = match BOOK_GROUPED_JSON.parse() {
+        Ok(value) => value,
+        Err(e) => panic!("grouped book fixture must parse: {e}"),
+    };
+    let payload = match BookPayload::deserialize(&value) {
+        Ok(payload) => payload,
+        Err(e) => panic!("grouped book fixture must deserialize as BookPayload: {e}"),
+    };
+    let instrument = Instrument {
+        key,
+        provider: deribit_provider_id(),
+        // Mirrors the fixture's `instrument_name` (BookPayload does not carry it).
+        native_symbol: "BTC-27JUN25-60000-C".to_owned(),
+        stream_symbol: None,
+        spec: ContractSpecFingerprint {
+            contract_multiplier: 1,
+            settlement: SettlementStyle::Cash,
+            exercise: ExerciseStyle::European,
+            quote_currency: "USD".to_owned(),
+            venue_product_code: "BTC".to_owned(),
+        },
+    };
+    normalize_book(&instrument, &payload, received)
+}
+
 // ---------------------------------------------------------------------------
 // Bench-only streaming-normalization burst (#21) — the HP-3 seam.
 // ---------------------------------------------------------------------------
