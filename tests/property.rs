@@ -1,19 +1,21 @@
-//! Property tests for the configuration surface (`docs/TESTING.md` §3).
+//! Property tests for the provider-id surface and the configuration ranges
+//! (`docs/TESTING.md` §3).
 //!
-//! Two invariants:
+//! Invariants:
 //!
-//! - the provider-id ↔ environment-segment map is **shell-safe for every valid
-//!   id** and **round-trips (`decode ∘ encode == id`) over the collision-free id
-//!   space** — ids whose separators are not adjacent (`docs/07-configuration.md`
-//!   §5.1). The documented per-character scheme is not a total bijection over
-//!   the full grammar (adjacent hyphens collide: `encode("a--") ==
-//!   encode("a_")`); that defect is owned by issue #4, which owns the
-//!   `ProviderId` grammar (see `encode_segment`'s reversibility note). These
-//!   tests assert what the scheme actually guarantees, not the impossible total
-//!   bijection.
-//! - the `humantime` duration parse is gated by the documented range —
-//!   `refresh_interval`/`tick_interval` are accepted iff they land within their
-//!   ranges.
+//! - **`provider_id_grammar`** — [`ProviderId::new`] accepts **exactly** the
+//!   tightened grammar `^[a-z][a-z0-9]*(?:[_-][a-z0-9]+)*$` (2–32 chars, isolated
+//!   separators; issue #4, `docs/adr/0008-provider-id-grammar-and-env-bijection.md`)
+//!   and rejects everything else as a typed `ConfigError`. `serde` round-trips
+//!   only valid ids and re-validates on the way in.
+//! - **Env-segment bijection** — with the tightened grammar the provider-id ↔
+//!   environment-segment map (`docs/07-configuration.md` §5.1) is a **total
+//!   bijection over the full valid-id space**: `decode ∘ encode == id` and
+//!   distinct ids never collide, for every valid id (the earlier
+//!   isolated-separator scoping is gone). Every encoded segment is a legal POSIX
+//!   variable segment.
+//! - **Range gate** — the `humantime` duration parse is accepted iff within the
+//!   documented `refresh_interval` / `tick_interval` ranges.
 //!
 //! Failing cases are recorded under `proptest-regressions/` — commit that
 //! directory as the first line of defence against a regression of the same
@@ -21,9 +23,10 @@
 
 use std::time::Duration;
 
-use chainview::ConfigError;
 use chainview::config::{CliOverrides, Config, EnvSource, decode_segment, encode_segment};
+use chainview::{ConfigError, ProviderId};
 use proptest::prelude::*;
+use serde::{Deserialize, Serialize};
 
 /// An empty environment — the loader reads nothing from the process env.
 struct EmptyEnv;
@@ -34,33 +37,93 @@ impl EnvSource for EmptyEnv {
     }
 }
 
+/// A wrapper so a bare `ProviderId` can be round-tripped through a
+/// self-describing serde format (TOML needs a top-level table).
+#[derive(Serialize, Deserialize)]
+struct Wrap {
+    id: ProviderId,
+}
+
+/// An independent, split-based oracle for the tightened `ProviderId` grammar —
+/// deliberately implemented differently from the production scanner so a
+/// divergence in either is caught: a valid id has length 2–32, only
+/// `[a-z0-9_-]`, a lowercase-letter first char, and no leading/trailing/adjacent
+/// separator (equivalently, every group between separators is non-empty).
+fn grammar_oracle(s: &str) -> bool {
+    let len = s.chars().count();
+    if !(2..=32).contains(&len) {
+        return false;
+    }
+    if !s
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+    {
+        return false;
+    }
+    if !matches!(s.chars().next(), Some(c) if c.is_ascii_lowercase()) {
+        return false;
+    }
+    if s.starts_with(['-', '_']) || s.ends_with(['-', '_']) {
+        return false;
+    }
+    !s.split(['-', '_']).any(|group| group.is_empty())
+}
+
+/// A proptest strategy over the tightened valid-id grammar, generating both `-`
+/// and `_` separators isolated between alphanumeric groups. Lengths land in
+/// `[2, 32]`.
+const VALID_ID: &str = "[a-z][a-z0-9]{1,7}(?:[_-][a-z0-9]{1,7}){0,3}";
+
 proptest! {
     #![proptest_config(ProptestConfig { cases: 1024, max_shrink_iters: 50_000, ..ProptestConfig::default() })]
 
-    /// `decode(encode(id)) == id` for underscore/alphanumeric ids (underscores
-    /// double consistently, so they always round-trip — including runs).
+    /// `ProviderId::new` accepts every id the grammar admits and preserves its
+    /// string form.
     #[test]
-    fn prop_provider_segment_roundtrips_underscore_ids(id in "[a-z][a-z0-9_]{1,31}") {
+    fn prop_provider_id_grammar_accepts_valid(id in VALID_ID) {
+        match ProviderId::new(&id) {
+            Ok(provider) => prop_assert_eq!(provider.as_str(), id.as_str()),
+            Err(e) => prop_assert!(false, "valid id `{}` rejected: {}", id, e),
+        }
+    }
+
+    /// `ProviderId::new` accepts EXACTLY the grammar: over a broad alphabet
+    /// (uppercase, digits, separators, any length) it succeeds iff the
+    /// independent oracle agrees. A rejection is always a typed
+    /// `ConfigError::InvalidValue`.
+    #[test]
+    fn prop_provider_id_grammar_matches_oracle(s in "[a-zA-Z0-9_-]{0,36}") {
+        let expected = grammar_oracle(&s);
+        match ProviderId::new(&s) {
+            Ok(_) => prop_assert!(expected, "id `{}` accepted but oracle rejects", s),
+            Err(ConfigError::InvalidValue { field, .. }) => {
+                prop_assert!(!expected, "id `{}` rejected but oracle accepts", s);
+                prop_assert_eq!(field, "provider id");
+            }
+            Err(other) => prop_assert!(false, "unexpected error variant: {}", other),
+        }
+    }
+
+    /// `decode(encode(id)) == id` for EVERY valid id — the map is a total
+    /// bijection over the tightened grammar (no isolated-separator scoping).
+    #[test]
+    fn prop_provider_segment_roundtrips_all_valid_ids(id in VALID_ID) {
         let segment = encode_segment(&id);
         prop_assert_eq!(decode_segment(&segment), id);
     }
 
-    /// `decode(encode(id)) == id` for hyphenated ids where every hyphen sits
-    /// between alphanumeric groups (no adjacent separators) — the collision-free
-    /// hyphen domain, covering `my-broker`, `td-ameritrade`, etc.
+    /// Distinct valid ids never collide on one environment segment.
     #[test]
-    fn prop_provider_segment_roundtrips_hyphen_ids(
-        id in "[a-z][a-z0-9]{0,7}(-[a-z0-9]{1,7}){0,3}"
-    ) {
-        let segment = encode_segment(&id);
-        prop_assert_eq!(decode_segment(&segment), id);
+    fn prop_provider_segment_no_collision_all_valid_ids(a in VALID_ID, b in VALID_ID) {
+        prop_assume!(a != b);
+        prop_assert_ne!(encode_segment(&a), encode_segment(&b));
     }
 
-    /// Every encoded segment is a legal POSIX variable segment for ANY valid id
-    /// (this holds even for the collision-prone ids): only `[A-Z0-9_]`, starting
-    /// with a letter, so `CHAINVIEW_<SEG>_<KEY>` is always assignable in a shell.
+    /// Every encoded segment is a legal POSIX variable segment — only
+    /// `[A-Z0-9_]`, starting with a letter — so `CHAINVIEW_<SEG>_<KEY>` is always
+    /// assignable in a shell.
     #[test]
-    fn prop_provider_segment_is_shell_safe(id in "[a-z][a-z0-9_-]{1,31}") {
+    fn prop_provider_segment_is_shell_safe(id in VALID_ID) {
         let segment = encode_segment(&id);
         prop_assert!(!segment.is_empty());
         prop_assert!(
@@ -71,15 +134,22 @@ proptest! {
         prop_assert!(matches!(segment.chars().next(), Some(c) if c.is_ascii_uppercase()));
     }
 
-    /// Distinct underscore/alphanumeric ids never collide on one segment (the
-    /// `'_' → '__'` escape keeps this class injective).
+    /// `serde` round-trips a valid `ProviderId` through its string form and
+    /// re-validates on the way in.
     #[test]
-    fn prop_provider_segment_no_collision_underscore_ids(
-        a in "[a-z][a-z0-9_]{1,31}",
-        b in "[a-z][a-z0-9_]{1,31}",
-    ) {
-        prop_assume!(a != b);
-        prop_assert_ne!(encode_segment(&a), encode_segment(&b));
+    fn prop_provider_id_serde_roundtrips_valid(id in VALID_ID) {
+        let provider = match ProviderId::new(&id) {
+            Ok(p) => p,
+            Err(e) => return Err(TestCaseError::fail(format!("valid id rejected: {e}"))),
+        };
+        let rendered = match toml::to_string(&Wrap { id: provider }) {
+            Ok(s) => s,
+            Err(e) => return Err(TestCaseError::fail(format!("serialize failed: {e}"))),
+        };
+        match toml::from_str::<Wrap>(&rendered) {
+            Ok(w) => prop_assert_eq!(w.id.as_str(), id.as_str()),
+            Err(e) => prop_assert!(false, "deserialize failed: {}", e),
+        }
     }
 
     /// A `refresh_interval` string is accepted iff its parsed duration is within

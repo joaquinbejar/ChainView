@@ -36,13 +36,15 @@
 //! I/O (reads the process environment and the XDG-resolved file) and delegates
 //! to [`Config::assemble`].
 //!
-//! # Hand-off to issue #4
+//! # Provider-id grammar (owned by [`ProviderId`])
 //!
-//! Provider-id **grammar** validation (`^[a-z][a-z0-9_-]{1,31}$`) is performed
-//! locally here by [`validate_provider_id`]. Issue #4 centralizes it in
-//! `ProviderId::new` (making that constructor fallible); this module then
-//! delegates to it. Registry absence (`UnknownProvider`) is validated at
-//! startup by issue #12, not here.
+//! Provider-id **grammar** validation lives in
+//! [`ProviderId::new`] (issue #4); [`validate_provider_id`]
+//! is a thin wrapper that produces the config-shaped error. Issue #4 tightened
+//! the grammar to `^[a-z][a-z0-9]*(?:[_-][a-z0-9]+)*$` (2–32 chars, isolated
+//! separators), which makes the id ↔ environment-segment transliteration below
+//! a **total bijection** (ADR-0008). Registry absence (`UnknownProvider`) is
+//! validated at startup by issue #12, not here.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -180,19 +182,20 @@ impl fmt::Debug for Secret {
 /// | `my-broker` | `MY_BROKER`  |
 /// | `my_broker` | `MY__BROKER` |
 ///
-/// # Reversibility (a bijection only over the collision-free id space)
+/// # Reversibility (a total bijection over the `ProviderId` grammar)
 ///
-/// The map round-trips through [`decode_segment`] for every id whose separators
-/// are **not adjacent** to each other (no `--`, `-_`, or `_-` substring) — which
-/// covers `deribit`, `my-broker`, `my_broker`, `td-ameritrade`, and every
-/// realistic id. It is **not** a total bijection over the full placeholder
-/// grammar `^[a-z][a-z0-9_-]{1,31}$`: a per-character `'-' → '_'` and
-/// `'_' → '__'` cannot be injective when hyphens are adjacent, because
-/// `encode("a--") == encode("a_") == "A__"`. This is a defect in the documented
-/// §5.1 scheme, not this implementation. **Hand-off:** issue #4 owns the
-/// `ProviderId` grammar and must resolve it (tighten the grammar to forbid
-/// adjacent separators, or revise the escape) under an ADR; the collision-free
-/// contract above is what callers may rely on until then.
+/// The map round-trips through [`decode_segment`] for **every** valid
+/// [`ProviderId`]. A per-character `'-' → '_'` / `'_' → '__'`
+/// escape would not be injective if separators could be adjacent
+/// (`encode("a--") == encode("a_") == "A__"`), so issue #4 **tightened the
+/// `ProviderId` grammar** to `^[a-z][a-z0-9]*(?:[_-][a-z0-9]+)*$` — separators
+/// are isolated between alphanumerics, with no leading/trailing/adjacent
+/// separator (ADR-0008). Under that grammar every underscore run in a segment
+/// is exactly one (from a `-`) or exactly two (from a `_`) characters and is
+/// isolated by an alphanumeric, so `decode ∘ encode` is the identity for all
+/// valid ids. The bijection is proved by property test over the full valid-id
+/// space (`tests/property.rs`); these functions accept arbitrary `&str` for
+/// diagnostics, but the round-trip guarantee holds only for valid ids.
 #[must_use]
 pub fn encode_segment(id: &str) -> String {
     let mut out = String::with_capacity(id.len() + 2);
@@ -477,34 +480,17 @@ fn parse_file(contents: &str) -> Result<RawFile, ConfigError> {
     Ok(raw)
 }
 
-/// Validate the provider-id grammar `^[a-z][a-z0-9_-]{1,31}$` locally and wrap
-/// it into a [`ProviderId`]. Issue #4 moves this into `ProviderId::new`.
+/// Validate a provider-id string and wrap it into a [`ProviderId`]. Delegates
+/// to [`ProviderId::new`] — the single owner of the grammar
+/// (`^[a-z][a-z0-9]*(?:[_-][a-z0-9]+)*$`, 2–32 chars, isolated separators; issue
+/// #4, ADR-0008).
 ///
 /// # Errors
 ///
 /// [`ConfigError::InvalidValue`] with `field: "provider id"` for a malformed id.
 #[must_use = "the validated provider id must be used"]
 pub fn validate_provider_id(id: &str) -> Result<ProviderId, ConfigError> {
-    if is_valid_provider_id(id) {
-        Ok(ProviderId::new(id))
-    } else {
-        Err(ConfigError::InvalidValue {
-            field: "provider id".to_owned(),
-            reason: format!("`{id}` must match ^[a-z][a-z0-9_-]{{1,31}}$"),
-        })
-    }
-}
-
-/// The `^[a-z][a-z0-9_-]{1,31}$` grammar check: 2–32 chars, first a lowercase
-/// letter, the rest lowercase letters, digits, `-`, or `_`.
-fn is_valid_provider_id(id: &str) -> bool {
-    let len = id.chars().count();
-    if !(2..=32).contains(&len) {
-        return false;
-    }
-    let mut chars = id.chars();
-    let first_ok = matches!(chars.next(), Some(c) if c.is_ascii_lowercase());
-    first_ok && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+    ProviderId::new(id)
 }
 
 /// Validate the underlying: non-empty after trimming, then upper-cased.
@@ -715,7 +701,7 @@ impl Config {
             .or_else(|| file.provider.clone());
         let provider = match provider_raw {
             Some(s) => validate_provider_id(&s)?,
-            None => ProviderId::new(DEFAULT_PROVIDER),
+            None => ProviderId::new(DEFAULT_PROVIDER)?,
         };
 
         // Underlying.
@@ -880,6 +866,16 @@ mod tests {
 
     fn empty_env() -> MapEnv {
         MapEnv(BTreeMap::new())
+    }
+
+    /// Construct a `ProviderId` from a known-valid literal in tests without an
+    /// `unwrap`/`expect` (the constructor is fallible since issue #4).
+    #[track_caller]
+    fn pid(id: &str) -> ProviderId {
+        match ProviderId::new(id) {
+            Ok(p) => p,
+            Err(e) => panic!("expected a valid provider id `{id}`, got: {e}"),
+        }
     }
 
     #[track_caller]
@@ -1246,7 +1242,7 @@ mod tests {
         let env = env(&[("CHAINVIEW_DERIBIT_ENDPOINT", "https://env.example")]);
         let file = "[providers.deribit]\nendpoint = \"https://file.example\"\n";
         let config = assembled(cli, &env, Some(file));
-        let settings = match config.providers.get(&ProviderId::new("deribit")) {
+        let settings = match config.providers.get(&pid("deribit")) {
             Some(s) => s,
             None => panic!("expected deribit provider settings"),
         };
@@ -1267,7 +1263,7 @@ mod tests {
     fn test_config_per_provider_env_refresh_override() {
         let env = env(&[("CHAINVIEW_DERIBIT_REFRESH", "45s")]);
         let config = assembled(CliOverrides::default(), &env, None);
-        let settings = match config.providers.get(&ProviderId::new("deribit")) {
+        let settings = match config.providers.get(&pid("deribit")) {
             Some(s) => s,
             None => panic!("expected deribit provider settings"),
         };
@@ -1297,14 +1293,21 @@ mod tests {
     }
 
     #[test]
-    fn test_encode_segment_known_limitation_adjacent_hyphens_pending_issue_4() {
-        // Documented defect in docs/07 §5.1: the per-character `'-' → '_'` /
-        // `'_' → '__'` scheme is NOT injective when hyphens are adjacent, so the
-        // round-trip does not hold there. This test pins the known limitation so
-        // any future change to the scheme (issue #4, under an ADR) must revisit
-        // it. Realistic ids with isolated separators are unaffected.
-        assert_eq!(encode_segment("a--"), encode_segment("a_"));
-        assert_ne!(decode_segment(&encode_segment("a--")), "a--");
+    fn test_provider_id_grammar_resolves_adjacent_separator_collision() {
+        // Resolution of the docs/07 §5.1 defect (issue #4, ADR-0008): the
+        // per-character `'-' → '_'` / `'_' → '__'` scheme was non-injective for
+        // ADJACENT separators (`encode("a--") == encode("a_") == "A__"`). The
+        // fix TIGHTENS the `ProviderId` grammar so neither colliding form is a
+        // valid id, making the transliteration a total bijection over the
+        // grammar. The two strings still collide as bare segments, but they can
+        // no longer be minted as provider ids.
+        assert_eq!(encode_segment("a--"), encode_segment("a_")); // still true for raw &str
+        assert!(ProviderId::new("a--").is_err()); // ...but neither is a valid id
+        assert!(ProviderId::new("a_").is_err());
+        // Every valid id round-trips through the segment map.
+        for id in ["deribit", "my-broker", "my_broker", "td-ameritrade"] {
+            assert_eq!(decode_segment(&encode_segment(id)), id);
+        }
     }
 
     #[test]
@@ -1325,7 +1328,7 @@ mod tests {
             ("CHAINVIEW_IG_PASSWORD", "correct horse"),
             ("CHAINVIEW_IG_API_KEY", "key-123"),
         ]);
-        let provider = ProviderId::new("ig");
+        let provider = pid("ig");
         let result = require_credentials(&env, &provider, &["username", "password", "api_key"]);
         match result {
             Ok(map) => {
@@ -1343,7 +1346,7 @@ mod tests {
     #[test]
     fn test_require_credentials_missing_returns_missing_credential() {
         let env = env(&[("CHAINVIEW_IG_USERNAME", "alice")]);
-        let provider = ProviderId::new("ig");
+        let provider = pid("ig");
         let result = require_credentials(&env, &provider, &["username", "password"]);
         match result {
             Err(ConfigError::MissingCredential(p)) => assert_eq!(p.as_str(), "ig"),
@@ -1354,7 +1357,7 @@ mod tests {
     #[test]
     fn test_require_credentials_empty_value_treated_as_missing() {
         let env = env(&[("CHAINVIEW_IG_PASSWORD", "")]);
-        let provider = ProviderId::new("ig");
+        let provider = pid("ig");
         let result = require_credentials(&env, &provider, &["password"]);
         assert!(matches!(result, Err(ConfigError::MissingCredential(_))));
     }
@@ -1385,7 +1388,7 @@ mod tests {
         assert!(!format!("{config:?}").contains(SECRET_VALUE));
 
         // The resolved secret map redacts the value in Debug.
-        let provider = ProviderId::new("ig");
+        let provider = pid("ig");
         match require_credentials(&env, &provider, &["password"]) {
             Ok(map) => {
                 assert!(!format!("{map:?}").contains(SECRET_VALUE));
