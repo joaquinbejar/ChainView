@@ -14,6 +14,73 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- **The tastytrade adapter, behind a DISABLED-by-default feature gate**
+  (`src/providers/tastytrade.rs`, `src/providers/mod.rs`, `src/app/registry.rs`,
+  issue #40; `docs/03-data-providers.md` §7.2, `docs/SECURITY.md` §2,
+  `CLAUDE.md`). The `Provider` for tastytrade: the REST nested-chain snapshot that
+  seeds strikes joined to tastytrade's bundled dxfeed `Quote`/`Greeks` stream
+  through the per-leg alias catalog (OCC <-> dxfeed), decoded through the shared
+  neutral `dxfeed_decode` helpers (#38) — no duplicate decode, no
+  `tastytrade -> dxlink` import edge (the arch test confirms it).
+  - **Gated by construction, not discipline.** The published `tastytrade` 0.3.0 —
+    the checksum-pinned artifact ChainView resolves — logs the session token, the
+    DXLink token, and the raw quote-token body at `DEBUG` (`docs/SECURITY.md`
+    §2.1). The whole adapter therefore sits behind the disabled `tastytrade` Cargo
+    feature and is **excluded from `with_builtins()`**; it is reachable only via
+    the explicit `with_gated_builtin`, which returns `RegistryError::Gated` while
+    the gate holds. A stock binary can never execute the upstream's logging — a
+    default `cargo build` does not even compile the adapter or pull the crate.
+  - **Auth injected programmatically (no dotenv, no foreign namespace).** Unlike a
+    crate that hardcodes its own env/file loading, `TastyTradeConfig` has
+    all-public fields, so the adapter builds it as a struct literal from
+    ChainView-namespaced `CHAINVIEW_TASTYTRADE_*` env vars and calls
+    `TastyTrade::login(&config)` directly — it never calls the upstream `from_env`
+    (which would read the foreign `TASTYTRADE_*` namespace, load a `.env`, AND
+    install a tracing subscriber). Credentials are read once via `Secret`, never
+    logged or echoed in a `ProviderError`.
+  - **US-equity expiry, DST-correct.** `16:00 America/New_York -> UTC` resolved
+    DST-aware locally (EDT `20:00 UTC` / EST `21:00 UTC`), so the fixed `21:00 UTC`
+    upstream helper (DST-wrong half the year) is not used; asserted on both
+    March/November transition boundaries.
+  - **IV source: the streamed dxfeed Greeks event.** The REST nested-chain
+    snapshot carries **no** IV field, so the streamed dxfeed Greeks event is this
+    provider's sole venue IV source. The published `tastytrade` 0.3.0 preserves
+    that IV (`volatility: greeks.volatility`) and has no `optionstratlib`
+    dependency, so there is no "conversion zeroes IV" step: the value flows through
+    the neutral `decode_greeks` helper (#38) as-is (dxfeed IV is already decimal)
+    and lands in the sidecar tagged `GreeksOrigin::Provider`.
+  - **Robustness bypasses.** An empty venue response is `ProviderError::NoChain`,
+    never a panic/OOB index (no slice is ever indexed); the adapter owns its
+    reconnect/resubscribe loop and re-subscribes the full leg set off the fresh
+    aliases on every (re)connect, so a leg first seen on a later poll is always
+    observed (not the racy one-time sender-map clone) — proven over a mock
+    transport.
+  - **Honest capabilities** (`docs/03` §8 row): `chain: Native`, `depth: false`,
+    `greeks: Provided`, `option_stream: ChainQuotes { verified: false }`,
+    `underlying_stream: true`, `chain_poll: Poll`, `auth: UserPass`.
+  - **Tests (+33, feature-gated).** Nested-chain assembly from a recorded SPY
+    fixture, OCC<->dxfeed alias round-trips, DST/expiry cases (both boundaries),
+    strike/streamer normalization, empty-response -> `NoChain`, the #38 view
+    mapping (`i64` sizes + venue `time`, `time == 0` -> absent), streamed venue IV
+    surviving to the emitted `GreeksRow` as-is, crossed/unknown-symbol benign
+    drops, and the reconnect loop over a mock transport (first + later
+    subscription observed; cancel stops the loop).
+    The default suite stays green without the feature; gated reachability
+    (`with_builtins` never registers it, `with_gated_builtin` fails) is proven by
+    the existing `src/app/registry.rs` tests. The `dxfeed_decode` `#[allow(dead_code)]`
+    is narrowed to `not(feature = "tastytrade")` now that this adapter consumes it;
+    `clamp_symbol` and the views' opaque `symbol` field keep a per-item allow with
+    a note (their only reader is the deferred tracing symbol-echo).
+  - **New dependency `tastytrade = "0.3"` (optional, `tastytrade` feature) —
+    ADR-0007 audit note.** `cargo audit` + `cargo deny check --all-features` (the
+    `deny.toml` graph runs `all-features = true`) were run with the feature
+    enabled: **advisories/bans/licenses/sources all pass**, no NEW advisory. The
+    tastytrade tree adds a third source of the already-ignored **RUSTSEC-2021-0141**
+    (`dotenv` unmaintained) — the `deny.toml` reason is updated to name tastytrade
+    and note the adapter never calls the `.env`-loading `from_env`. Feature-on
+    duplicate-version warnings (`tokio-tungstenite` 0.28/0.29 + `tungstenite`,
+    from tastytrade's native-tls stack vs. `reqwest` 0.13) are the documented
+    `warn`-level ban policy (upstream clients pull disjoint epochs), not failures.
 - **Shared neutral dxfeed decode helpers — the v0.4 provider foundation**
   (`src/providers/dxfeed_decode.rs`, `src/providers/mod.rs`, issue #38;
   `docs/03-data-providers.md` §3/§7.2/§7.3/§12, `CLAUDE.md` module map). The

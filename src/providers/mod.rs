@@ -71,15 +71,32 @@ pub(crate) mod deribit;
 /// provider-layer helper: no `Provider` impl, no upstream crate dependency, and
 /// it never `use`s a sibling adapter, `src/app.rs`, or `src/ui/*`.
 ///
-/// `#[allow(dead_code)]` is a **deliberate, time-boxed** exception: #38 is
-/// sequenced ahead of its two consumers (`blocks: [040, 042]`, both landing in
-/// this same v0.4 milestone) precisely because the module-map rule requires the
-/// shared decode to exist as a neutral node *before* either adapter wires it in.
-/// Until #40/#42 land there is no production caller (only the in-module fixture
-/// + property tests exercise it), so the crate-internal helpers would trip
-/// `dead_code`; the allow is removed the moment the first adapter calls in.
-#[allow(dead_code)]
+/// The first consumer wired in is the tastytrade adapter (#40), which decodes its
+/// bundled dxfeed `Quote`/`Greeks` events through `decode_quote` / `decode_greeks`
+/// and echoes an unknown streamer symbol through `clamp_symbol`. That adapter sits
+/// behind the DISABLED-by-default `tastytrade` feature, so the shared decode has a
+/// production caller ONLY when the feature is on. The `dead_code` allow is
+/// therefore **narrowed** (not removed) to `not(feature = "tastytrade")`: with the
+/// feature on every `pub(crate)` item here has a real caller (the #38 time-boxed
+/// blanket allow is gone); with the feature off — the default build, where the
+/// only consumer is compiled out — the helpers are exercised solely by this
+/// module's own fixture + property tests, so the allow keeps `-D warnings` clean.
+/// The standalone dxlink overlay (#42) will broaden this condition when it lands.
+#[cfg_attr(not(feature = "tastytrade"), allow(dead_code))]
 pub(crate) mod dxfeed_decode;
+
+/// The tastytrade adapter — the poll->stream merge provider (issue #40,
+/// `docs/03-data-providers.md` §7.2). Behind the DISABLED-by-default `tastytrade`
+/// Cargo feature and **excluded from `with_builtins()`**: the published
+/// `tastytrade` 0.3.0 (the checksum-pinned artifact ChainView resolves) logs
+/// credential material at `DEBUG` (`docs/SECURITY.md` §2.1), so it is reachable only through
+/// the explicit `with_gated_builtin(id)` opt-in, which fails with a typed startup
+/// error while the gate holds — a stock binary can never execute that logging
+/// (`docs/SECURITY.md` §2/§3). Crate-internal: no raw `tastytrade` DTO crosses the
+/// port. It maps its bundled dxfeed events onto the neutral [`dxfeed_decode`]
+/// views (never an adapter-to-adapter edge).
+#[cfg(feature = "tastytrade")]
+pub(crate) mod tastytrade;
 
 /// The seam every adapter implements: one trait, one adapter per provider id
 /// (`docs/03-data-providers.md` §2).

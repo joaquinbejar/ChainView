@@ -22,6 +22,18 @@ include = ["src/**/*", "Cargo.toml", "README.md", "LICENSE"]
 # `[[bench]]` targets set `required-features = ["bench"]`, so `cargo bench`
 # without the feature simply skips them.
 bench = []
+# `tastytrade` gates the whole tastytrade adapter (`src/providers/tastytrade.rs`,
+# issue #40). It is DISABLED by default and stays off the shippable set: the
+# published tastytrade 0.3.0 (the checksum-pinned artifact ChainView resolves) logs
+# the session token, the DXLink token, and the raw quote-token body at DEBUG — a
+# credential-guarantee violation (docs/SECURITY.md §2.1). The provider is
+# therefore excluded from `with_builtins()` and reachable only via the explicit
+# `with_gated_builtin(id)` opt-in, which fails with a typed startup error while
+# the gate holds — so a stock binary can NEVER execute the upstream's logging
+# (docs/SECURITY.md §2/§3). A normal `cargo build` (no `--features tastytrade`)
+# does not compile the adapter or pull the `tastytrade` crate at all. `dep:` keeps
+# the optional crate from implicitly defining a same-named feature.
+tastytrade = ["dep:tastytrade"]
 
 [lib]
 name = "chainview"
@@ -105,6 +117,24 @@ deribit-http = "0.7.1"
 # (feature-unified toward `full`), `serde`/`serde_json`, `url`, and `dotenv`
 # with the existing tree. `aws-lc-rs` requires a C/ASM toolchain at build time.
 deribit-websocket = "0.3.1"
+# The tastytrade client (issue #40, the poll->stream merge provider —
+# `docs/03-data-providers.md` §7.2). OPTIONAL and behind the DISABLED-by-default
+# `tastytrade` feature: a normal build never pulls it, and it is reachable only
+# via `with_gated_builtin` (which fails while the credential-logging gate holds,
+# docs/SECURITY.md §2). Wraps tastytrade's REST option-chain + its bundled dxfeed
+# streaming binding; ChainView never reimplements the protocol (CLAUDE.md "Key
+# Decisions"). Explicit-approval addition (CLAUDE.md "Coding Rules") — ADR-0007
+# audit note in CHANGELOG (`cargo audit` + `cargo deny check --all-features`).
+# Auth is injected programmatically: `TastyTradeConfig` has all-public fields, so
+# the adapter builds it from ChainView-namespaced `CHAINVIEW_TASTYTRADE_*` env
+# vars and calls `TastyTrade::login(&config)` WITHOUT the crate's `from_env()`
+# (which would read the foreign `TASTYTRADE_*` namespace, load a dotenv file, and
+# install a tracing subscriber) — verified against the 0.3.0 checkout.
+# Supply-chain delta (feature-on only): pulls `tokio-tungstenite` (native-tls
+# backend), `dxlink`, `reqwest`, `erased-serde`, `flume`, `derive_builder`,
+# `pretty-simple-display`, and (transitively) `dotenv`/`tracing-subscriber` — the
+# latter two are never exercised because the adapter never calls `from_env`.
+tastytrade = { version = "0.3", optional = true }
 # The Parquet reader for the IronCondor result bundle (issue #30, ADR-0010,
 # `docs/04-replay-mode.md` §2/§3). The bundle's four tables are Parquet; the
 # reader decodes them batch-by-batch under measured resource ceilings. ChainView

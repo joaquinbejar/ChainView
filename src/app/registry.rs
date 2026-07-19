@@ -72,6 +72,8 @@ use crate::chain::{Instrument, ProviderId, StreamHealth};
 use crate::config::{CliOverrides, Config, ModeSelect};
 use crate::error::{ChainViewError, ConfigError, ProviderError, RegistryError};
 use crate::providers::deribit::DeribitAdapter;
+#[cfg(feature = "tastytrade")]
+use crate::providers::tastytrade::TastytradeAdapter;
 use crate::providers::{Provider, SubscriptionRequest};
 
 use super::{BridgeSenders, SourceBinding, Supervisor, chain_present};
@@ -252,6 +254,14 @@ impl ChainViewAppBuilder {
     /// adapter's pinned upstream clears its gate (`docs/ROADMAP.md`).
     #[must_use]
     pub fn with_gated_builtin(mut self, id: ProviderId) -> Self {
+        // A gated built-in is NEVER enabled while its upstream credential-logging
+        // gate holds (`docs/SECURITY.md` §2): record the typed startup error and
+        // never construct the adapter. `note_gated_builtins` names each gated
+        // adapter's factory (never invoked here) purely so the deliberately
+        // unregistered adapter stays compiled + linted in a plain
+        // `--features <gated>` library build.
+        #[cfg(feature = "tastytrade")]
+        note_gated_builtins();
         self.record(RegistryError::Gated(id).into());
         self
     }
@@ -413,6 +423,31 @@ impl ChainViewAppBuilder {
             self.pending = Some(error);
         }
     }
+}
+
+/// Keep every security-gated built-in adapter compiled and linted without
+/// enabling it (`docs/SECURITY.md` §2, `docs/03-data-providers.md` §9). A gated
+/// adapter is deliberately **not** registered — [`with_gated_builtin`](ChainViewAppBuilder::with_gated_builtin)
+/// records [`RegistryError::Gated`] and never constructs it — so in a plain
+/// `--features <gated>` library build (no `#[cfg(test)]`) nothing references the
+/// adapter and the dead-code lint would flag its real, tested code. Naming each
+/// gated adapter's factory here (behind its own feature) makes the full `Provider`
+/// call graph reachable — the `Arc<dyn Provider>` coercion builds the vtable — WITHOUT
+/// invoking the factory. The factory is invoked only once the gate lifts and the
+/// adapter is registered for real.
+/// A gated built-in adapter factory: it reads the provider's credentials from the
+/// environment and yields a registry-ready `Arc<dyn Provider>`. Invoked only once
+/// the adapter's security gate lifts; while the gate holds it is merely *named*
+/// (see [`note_gated_builtins`]).
+#[cfg(feature = "tastytrade")]
+type GatedBuiltinFactory =
+    fn(&dyn crate::config::EnvSource) -> Result<Arc<dyn Provider>, ConfigError>;
+
+#[cfg(feature = "tastytrade")]
+fn note_gated_builtins() {
+    let _tastytrade: GatedBuiltinFactory =
+        |env| Ok(Arc::new(TastytradeAdapter::from_env(env)?) as Arc<dyn Provider>);
+    let _ = _tastytrade;
 }
 
 // ---------------------------------------------------------------------------
