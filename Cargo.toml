@@ -22,6 +22,7 @@ name = "chainview"
 path = "src/main.rs"
 
 [dependencies]
+thiserror = "2"
 
 [lints.rust]
 warnings = { level = "deny", priority = -1 }
