@@ -44,8 +44,8 @@ use chainview::{
     ExpirySource, FinalTeardown, GreeksCapability, Instrument, InstrumentKey, LiveScreen,
     MarketUpdate, MarketUpdateSink, ModeSelect, Provider, ProviderCapabilities, ProviderError,
     ProviderId, RESERVED_PROVIDER_IDS, RegistryError, SettlementStyle, StreamHealth,
-    SubscriptionHandle, SubscriptionRequest,
-    Supervisor, ThemeChoice, UnderlyingRef, is_screen_reachable, spawn_supervised_subscription,
+    SubscriptionHandle, SubscriptionRequest, Supervisor, ThemeChoice, UnderlyingRef,
+    is_screen_reachable, spawn_supervised_subscription,
 };
 
 // --- Test constructors (no unwrap/expect/indexing per the ruleset) -----------
