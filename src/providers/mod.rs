@@ -38,14 +38,21 @@
 //! [ADR-0006]: https://github.com/joaquinbejar/ChainView/blob/main/docs/adr/0006-open-provider-extension.md
 //! [SEMVER.md]: https://github.com/joaquinbejar/ChainView/blob/main/docs/SEMVER.md
 
+use std::collections::HashMap;
 use std::fmt;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use optionstratlib::ExpirationDate;
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
-use crate::chain::{ChainFetch, Instrument, MarketUpdate, ProviderId};
+use crate::chain::{
+    ChainFetch, DepthLadder, GreeksRow, Instrument, InstrumentKey, MarketUpdate, ProviderId,
+    QuoteUpdate,
+};
 use crate::error::ProviderError;
 
 /// The Deribit adapter — the zero-config, public-data poll leg (issue #15,
@@ -113,20 +120,25 @@ pub trait Provider: Send + Sync {
         expiration: &ExpirationDate,
     ) -> Result<ChainFetch, ProviderError>;
 
-    /// Open a streaming subscription; normalized [`MarketUpdate`]s are pushed to
-    /// `tx` until the returned [`SubscriptionHandle`] is dropped. The adapter
-    /// owns the reconnect/resubscribe loop behind the handle and always
-    /// interposes this **bounded** sender (`docs/03-data-providers.md` §5). A
-    /// poll-only provider returns [`ProviderError::Unsupported`].
+    /// Open a streaming subscription; normalized [`MarketUpdate`]s are pushed into
+    /// `sink` until the returned [`SubscriptionHandle`] is dropped (or the loop's
+    /// [`SubscriptionRequest::cancel`] token is cancelled). The adapter owns the
+    /// reconnect/resubscribe loop behind the handle and routes every update through
+    /// the two-class [`MarketUpdateSink`] — control-class (`Chain`/`Health`)
+    /// await-sent, coalesced-class (`Quote`/`Greeks`/`Depth`) producer-staged
+    /// last-value-wins ([ADR-0009], `docs/03-data-providers.md` §5). A poll-only
+    /// provider returns [`ProviderError::Unsupported`].
     ///
     /// # Errors
     ///
     /// [`ProviderError::Unsupported`] for a poll-only provider, or a
     /// transport/auth failure.
+    ///
+    /// [ADR-0009]: https://github.com/joaquinbejar/ChainView/blob/main/docs/adr/0009-provider-sink-two-class-routing.md
     async fn subscribe(
         &self,
         req: SubscriptionRequest,
-        tx: mpsc::Sender<MarketUpdate>,
+        sink: MarketUpdateSink,
     ) -> Result<SubscriptionHandle, ProviderError>;
 }
 
@@ -435,21 +447,34 @@ pub struct SubscriptionRequest {
     /// The legs to (re)subscribe, each carrying its native/stream symbols from
     /// the alias catalog.
     pub instruments: Vec<Instrument>,
+    /// The per-provider cancellation token the reconnect loop selects on
+    /// ([ADR-0009]). It is the supervisor's [`child_token`] for this provider:
+    /// the root cancel cascades to it (clean shutdown), and a per-provider
+    /// `Unsubscribe`/`Rediscover` cancels **only** this subtree. The composition
+    /// seam ([`spawn_supervised_subscription`](crate::spawn_supervised_subscription))
+    /// mints it and keeps a clone for the mid-run per-provider cancel.
+    ///
+    /// [ADR-0009]: https://github.com/joaquinbejar/ChainView/blob/main/docs/adr/0009-provider-sink-two-class-routing.md
+    /// [`child_token`]: crate::Supervisor
+    pub cancel: CancellationToken,
 }
 
 impl SubscriptionRequest {
     /// Construct a subscription request scoped to one `(underlying, expiry)` over
-    /// the given legs.
+    /// the given legs, carrying the supervisor-owned per-provider `cancel` token
+    /// the reconnect loop selects on.
     #[must_use]
     pub fn new(
         underlying: impl Into<String>,
         expiration_utc: DateTime<Utc>,
         instruments: Vec<Instrument>,
+        cancel: CancellationToken,
     ) -> Self {
         Self {
             underlying: underlying.into(),
             expiration_utc,
             instruments,
+            cancel,
         }
     }
 }
@@ -465,13 +490,21 @@ impl SubscriptionRequest {
 #[must_use = "dropping the handle immediately cancels the subscription"]
 pub struct SubscriptionHandle {
     /// The cancellation action, run once on drop or [`abort`](Self::abort).
-    /// `None` after it has run, so the action fires at most once.
+    /// `None` after it has run (or after [`take_join_handle`](Self::take_join_handle)
+    /// detaches it, since the supervisor then owns the lifecycle), so the action
+    /// fires at most once.
     cancel: Option<Box<dyn FnOnce() + Send>>,
+    /// The spawned reconnect-loop join handle, present only for a
+    /// [`spawned`](Self::spawned) handle. The composition seam takes it via
+    /// [`take_join_handle`](Self::take_join_handle) and hands it to the supervisor,
+    /// which then owns the join (an ordered, bounded join, not just a drop-abort).
+    join: Option<JoinHandle<()>>,
 }
 
 impl SubscriptionHandle {
     /// Build a handle from the adapter's cancellation action, which runs once
-    /// when the handle is dropped (or [`abort`](Self::abort)ed).
+    /// when the handle is dropped (or [`abort`](Self::abort)ed). Used by an
+    /// adapter that manages its own task lifecycle without exposing a join handle.
     #[must_use = "dropping the handle immediately cancels the subscription"]
     pub fn new<F>(on_cancel: F) -> Self
     where
@@ -479,7 +512,43 @@ impl SubscriptionHandle {
     {
         Self {
             cancel: Some(Box::new(on_cancel)),
+            join: None,
         }
+    }
+
+    /// Build a handle over a spawned reconnect-loop task ([ADR-0009]): the
+    /// `cancel` token stops the loop cooperatively (a drop/`abort` cancels it),
+    /// and `join` is carried so the supervised composition seam can take it via
+    /// [`take_join_handle`](Self::take_join_handle) and register it for an ordered,
+    /// bounded join. Dropping the handle **before** the join is taken cancels the
+    /// token (the RAII backstop); once the join is taken, the supervisor owns the
+    /// lifecycle.
+    ///
+    /// [ADR-0009]: https://github.com/joaquinbejar/ChainView/blob/main/docs/adr/0009-provider-sink-two-class-routing.md
+    #[must_use = "dropping the handle immediately cancels the subscription"]
+    pub fn spawned(cancel: CancellationToken, join: JoinHandle<()>) -> Self {
+        Self {
+            cancel: Some(Box::new(move || cancel.cancel())),
+            join: Some(join),
+        }
+    }
+
+    /// Take the spawned loop's [`JoinHandle`] out of the handle for the supervisor
+    /// to own, **detaching** the RAII cancel action at the same time — the
+    /// supervisor's watched join + the request's [`cancel`](SubscriptionRequest::cancel)
+    /// token now own the lifecycle, so a subsequent drop of this handle must not
+    /// also cancel the loop out from under the supervisor ([ADR-0009]). Returns
+    /// `None` for a [`new`](Self::new)-style handle (no join to transfer).
+    ///
+    /// [ADR-0009]: https://github.com/joaquinbejar/ChainView/blob/main/docs/adr/0009-provider-sink-two-class-routing.md
+    pub fn take_join_handle(&mut self) -> Option<JoinHandle<()>> {
+        let join = self.join.take();
+        if join.is_some() {
+            // The supervisor owns the lifecycle now: detach the RAII cancel so a
+            // later drop of this husk does not cancel the supervised loop.
+            self.cancel = None;
+        }
+        join
     }
 
     /// Cancel the subscription now, without waiting for the handle to drop. The
@@ -495,6 +564,7 @@ impl fmt::Debug for SubscriptionHandle {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SubscriptionHandle")
             .field("active", &self.cancel.is_some())
+            .field("supervised", &self.join.is_some())
             .finish()
     }
 }
@@ -504,6 +574,330 @@ impl Drop for SubscriptionHandle {
         if let Some(cancel) = self.cancel.take() {
             cancel();
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MarketUpdateSink: the two-class adapter-side facade (ADR-0009).
+// ---------------------------------------------------------------------------
+
+/// Whether the bounded fan-in channel is still open. A closed channel means the
+/// consumer (the app) is gone, so the adapter's reconnect loop shuts down rather
+/// than reconnecting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum SendState {
+    /// The update was accepted (delivered, or staged into a producer slot).
+    Open,
+    /// The channel is closed — the consumer dropped its receiver.
+    Closed,
+}
+
+/// The two-class sender an adapter's [`subscribe`](Provider::subscribe) sends
+/// every [`MarketUpdate`] into ([ADR-0009], `docs/02-tui-architecture.md` §5).
+///
+/// It is the missing **adapter-side facade** that reconciles the one-sender port
+/// with the two physical bridge channels: it routes **internally by class** so the
+/// consumer bridge's priority + coalescing guarantees are honest end to end.
+///
+/// - **Control class** — [`Chain`](MarketUpdate::Chain) /
+///   [`Health`](MarketUpdate::Health): **await-sent** onto the small priority
+///   control channel, never coalesced or dropped, so a `Health(Reconnecting)` or a
+///   reconnect backfill `Chain` is delivered promptly even under a quote burst.
+/// - **Coalesced class** — [`Quote`](MarketUpdate::Quote) /
+///   [`Greeks`](MarketUpdate::Greeks) / [`Depth`](MarketUpdate::Depth): routed
+///   through a per-[`InstrumentKey`] **producer-side overwrite-on-full staging
+///   map** onto the coalesced channel, so the freshest value per instrument
+///   survives sustained saturation (the NFR-15 latest-value-wins completion). The
+///   staging is O(N subscribed) and reuses its allocation across bursts.
+///
+/// # Epoch on reconnect ([ADR-0009], the sink-staging fix)
+///
+/// The sink is created **once per subscription** and outlives individual socket
+/// drops, so a value staged before an outage would otherwise flush over the fresh
+/// REST reconnect backfill `Chain` (a stale quote overwriting the current state,
+/// since a poll does not advance the store's per-instrument event watermark). The
+/// adapter's reconnect loop clears the coalesced staging on a disconnect/refetch
+/// (the crate-internal `epoch` seam), so pre-outage staged values never flush over
+/// the backfill.
+#[derive(Debug)]
+pub struct MarketUpdateSink {
+    /// The control channel (`Chain` / `Health`), drained first by the bridge.
+    tx_control: mpsc::Sender<MarketUpdate>,
+    /// The coalesced channel (`Quote` / `Greeks` / `Depth`).
+    tx_coalesced: mpsc::Sender<MarketUpdate>,
+    /// The producer-side overwrite-on-full conflater for the coalesced class.
+    staging: ProducerStaging,
+}
+
+impl MarketUpdateSink {
+    /// Build a sink over the bridge's two producer senders. Constructed by
+    /// [`BridgeSenders::market_update_sink`](crate::BridgeSenders::market_update_sink).
+    #[must_use]
+    pub fn new(
+        tx_control: mpsc::Sender<MarketUpdate>,
+        tx_coalesced: mpsc::Sender<MarketUpdate>,
+    ) -> Self {
+        Self {
+            tx_control,
+            tx_coalesced,
+            staging: ProducerStaging::new(),
+        }
+    }
+
+    /// Send one update, routing **internally by class** ([ADR-0009]). Control-class
+    /// (`Chain`/`Health`) is await-sent on the priority channel; coalesced-class
+    /// (`Quote`/`Greeks`/`Depth`) is producer-staged onto the coalesced channel.
+    /// The match is total over the closed [`MarketUpdate`] set with no wildcard arm.
+    ///
+    /// [ADR-0009]: https://github.com/joaquinbejar/ChainView/blob/main/docs/adr/0009-provider-sink-two-class-routing.md
+    pub async fn send(&mut self, update: MarketUpdate) -> SendState {
+        match update {
+            control @ (MarketUpdate::Chain(_) | MarketUpdate::Health(_, _)) => {
+                self.send_control(control).await
+            }
+            coalesced @ (MarketUpdate::Quote(_)
+            | MarketUpdate::Greeks(_)
+            | MarketUpdate::Depth(_)) => self.publish_coalesced(coalesced),
+        }
+    }
+
+    /// Await-send a control-class update onto the priority channel — never
+    /// coalesced, never dropped. The caller races this against its cancel token so
+    /// a full channel cannot defer cancellation.
+    pub(crate) async fn send_control(&mut self, update: MarketUpdate) -> SendState {
+        match self.tx_control.send(update).await {
+            Ok(()) => SendState::Open,
+            Err(_) => SendState::Closed,
+        }
+    }
+
+    /// Publish a coalesced-class update through the producer overwrite-on-full
+    /// staging onto the coalesced channel (synchronous — no `.await`). A full
+    /// channel **stages** the freshest value per instrument rather than dropping it.
+    pub(crate) fn publish_coalesced(&mut self, update: MarketUpdate) -> SendState {
+        self.staging.publish(&self.tx_coalesced, update)
+    }
+
+    /// Retry the staged coalesced residue onto the coalesced channel as it drains
+    /// — the producer flush the streaming loop performs on a tick when the feed is
+    /// quiet, so the freshest staged value is not stranded.
+    pub(crate) fn flush(&mut self) -> SendState {
+        self.staging.flush(&self.tx_coalesced)
+    }
+
+    /// True while any instrument still holds a staged coalesced value awaiting a
+    /// free channel slot — gates the streaming loop's flush tick.
+    pub(crate) fn has_pending(&self) -> bool {
+        self.staging.has_pending()
+    }
+
+    /// Clear the coalesced staging (an **epoch**), so pre-outage staged values are
+    /// dropped on a disconnect/refetch and never flush over the fresh reconnect
+    /// backfill `Chain` ([ADR-0009], the sink-staging fix). The allocation is
+    /// retained for reuse.
+    ///
+    /// [ADR-0009]: https://github.com/joaquinbejar/ChainView/blob/main/docs/adr/0009-provider-sink-two-class-routing.md
+    pub(crate) fn epoch(&mut self) {
+        self.staging.clear();
+    }
+
+    /// Whether either bounded channel has closed (the consumer is gone), so the
+    /// adapter's reconnect loop can stop instead of reconnecting.
+    pub(crate) fn is_closed(&self) -> bool {
+        self.tx_control.is_closed() || self.tx_coalesced.is_closed()
+    }
+}
+
+// Test-only inspection of the producer staging bound (NFR-15): the O(N)
+// slots-per-instrument view the Deribit staging tests assert on. `pub(crate)`, so
+// the default semver surface is unchanged.
+#[cfg(test)]
+impl MarketUpdateSink {
+    /// The number of staged instruments — a view of the O(N) producer bound.
+    pub(crate) fn staged_len(&self) -> usize {
+        self.staging.slots.len()
+    }
+}
+
+/// One producer-staged slot for one instrument: the latest of each coalesced
+/// update **kind** independently, so a Greeks refresh never clobbers a pending
+/// quote — the producer mirror of the consumer `StagedInstrument` (#10).
+#[derive(Debug, Default)]
+struct StagedInstrument {
+    quote: Option<QuoteUpdate>,
+    greeks: Option<GreeksRow>,
+    depth: Option<DepthLadder>,
+}
+
+impl StagedInstrument {
+    /// True while any kind is still staged.
+    fn has_any(&self) -> bool {
+        self.quote.is_some() || self.greeks.is_some() || self.depth.is_some()
+    }
+
+    /// Flush this slot's present kinds onto `tx`, reserving a channel slot
+    /// **before** taking the value so a full channel never drops the staged
+    /// update. Stops at the first full/closed reservation, leaving the remaining
+    /// kinds staged.
+    fn flush_into(&mut self, tx: &mpsc::Sender<MarketUpdate>) -> FlushStep {
+        if self.quote.is_some() {
+            match reserve_send(tx, &mut self.quote, MarketUpdate::Quote) {
+                FlushStep::Drained => {}
+                blocked => return blocked,
+            }
+        }
+        if self.greeks.is_some() {
+            match reserve_send(tx, &mut self.greeks, MarketUpdate::Greeks) {
+                FlushStep::Drained => {}
+                blocked => return blocked,
+            }
+        }
+        if self.depth.is_some() {
+            match reserve_send(tx, &mut self.depth, MarketUpdate::Depth) {
+                FlushStep::Drained => {}
+                blocked => return blocked,
+            }
+        }
+        FlushStep::Drained
+    }
+}
+
+/// The outcome of trying to flush one staged kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FlushStep {
+    /// The kind was sent (or was absent).
+    Drained,
+    /// The channel had no capacity — the value stays staged.
+    Full,
+    /// The channel is closed.
+    Closed,
+}
+
+/// Reserve a channel slot, then move the staged value out of `slot` into it — so
+/// a full channel leaves the value **in place** (it is only `take`n on a
+/// successful reservation, never lost). The caller only calls this for a
+/// non-empty `slot`.
+fn reserve_send<T>(
+    tx: &mpsc::Sender<MarketUpdate>,
+    slot: &mut Option<T>,
+    wrap: fn(T) -> MarketUpdate,
+) -> FlushStep {
+    match tx.try_reserve() {
+        Ok(permit) => {
+            if let Some(value) = slot.take() {
+                permit.send(wrap(value));
+            }
+            FlushStep::Drained
+        }
+        Err(TrySendError::Full(())) => FlushStep::Full,
+        Err(TrySendError::Closed(())) => FlushStep::Closed,
+    }
+}
+
+/// The producer-side conflater: one slot per [`InstrumentKey`], overwritten
+/// last-value-wins per kind when the bounded channel is full
+/// (`docs/02-tui-architecture.md` §5). Completes the NFR-15 latest-value-wins
+/// guarantee under sustained saturation — the mirror of the #10 consumer-side
+/// staging. It is O(N subscribed) and **reuses its allocation** across bursts.
+#[derive(Debug, Default)]
+struct ProducerStaging {
+    slots: HashMap<InstrumentKey, StagedInstrument>,
+}
+
+impl ProducerStaging {
+    /// An empty staging map.
+    fn new() -> Self {
+        Self {
+            slots: HashMap::new(),
+        }
+    }
+
+    /// Publish `update` on the bounded `tx`, preserving the freshest value under
+    /// saturation: first opportunistically flush anything already staged (the
+    /// channel may now have space), then try to send `update`; on a **full**
+    /// channel the update is **staged** (overwriting its kind's slot) rather than
+    /// dropped. Returns [`SendState::Closed`] once the channel is closed.
+    fn publish(&mut self, tx: &mpsc::Sender<MarketUpdate>, update: MarketUpdate) -> SendState {
+        if self.flush(tx) == SendState::Closed {
+            return SendState::Closed;
+        }
+        match tx.try_send(update) {
+            Ok(()) => SendState::Open,
+            Err(TrySendError::Full(update)) => {
+                self.stage(update);
+                SendState::Open
+            }
+            Err(TrySendError::Closed(_)) => SendState::Closed,
+        }
+    }
+
+    /// True while any instrument still holds a staged value awaiting a free
+    /// channel slot.
+    fn has_pending(&self) -> bool {
+        self.slots.values().any(StagedInstrument::has_any)
+    }
+
+    /// Flush the staged current values onto `tx`, retaining the map allocation.
+    /// Stops sending once the channel is full (leaving the rest staged) and
+    /// reports a closed channel.
+    fn flush(&mut self, tx: &mpsc::Sender<MarketUpdate>) -> SendState {
+        let mut closed = false;
+        let mut full = false;
+        self.slots.retain(|_key, slot| {
+            if !closed && !full {
+                match slot.flush_into(tx) {
+                    FlushStep::Drained => {}
+                    FlushStep::Full => full = true,
+                    FlushStep::Closed => closed = true,
+                }
+            }
+            slot.has_any()
+        });
+        if closed {
+            SendState::Closed
+        } else {
+            SendState::Open
+        }
+    }
+
+    /// Drop every staged value (an epoch), retaining the allocation.
+    fn clear(&mut self) {
+        self.slots.clear();
+    }
+
+    /// Overwrite the staged slot for `update`'s instrument, last-value-wins per
+    /// kind. A control-class update never reaches here (the sink await-sends it
+    /// directly), but the match stays total over the closed [`MarketUpdate`] set.
+    fn stage(&mut self, update: MarketUpdate) {
+        match update {
+            MarketUpdate::Quote(quote) => {
+                if let Some(slot) = self.slot_mut(&quote.instrument.key) {
+                    slot.quote = Some(quote);
+                }
+            }
+            MarketUpdate::Greeks(greeks) => {
+                if let Some(slot) = self.slot_mut(&greeks.instrument.key) {
+                    slot.greeks = Some(greeks);
+                }
+            }
+            MarketUpdate::Depth(depth) => {
+                if let Some(slot) = self.slot_mut(&depth.instrument.key) {
+                    slot.depth = Some(depth);
+                }
+            }
+            MarketUpdate::Chain(_) | MarketUpdate::Health(_, _) => {}
+        }
+    }
+
+    /// A mutable reference to `key`'s slot, creating it on first use. The key is
+    /// cloned **only** when the slot is vacant (the HP-3 discipline); the `None`
+    /// arm is treated as a no-op, never an `expect`.
+    fn slot_mut(&mut self, key: &InstrumentKey) -> Option<&mut StagedInstrument> {
+        if !self.slots.contains_key(key) {
+            let _ = self.slots.insert(key.clone(), StagedInstrument::default());
+        }
+        self.slots.get_mut(key)
     }
 }
 
@@ -626,7 +1020,7 @@ mod tests {
         async fn subscribe(
             &self,
             _req: SubscriptionRequest,
-            _tx: mpsc::Sender<MarketUpdate>,
+            _sink: MarketUpdateSink,
         ) -> Result<SubscriptionHandle, ProviderError> {
             Err(ProviderError::Unsupported("streaming"))
         }
@@ -790,8 +1184,14 @@ mod tests {
     fn test_fake_provider_subscribe_is_unsupported_for_poll_only_shape() {
         let provider = fake_provider();
         let (tx, _rx) = mpsc::channel::<MarketUpdate>(1);
-        let request = SubscriptionRequest::new("BTC", utc(1_700_000_000), Vec::new());
-        match block_on(provider.subscribe(request, tx)) {
+        let sink = MarketUpdateSink::new(tx.clone(), tx);
+        let request = SubscriptionRequest::new(
+            "BTC",
+            utc(1_700_000_000),
+            Vec::new(),
+            CancellationToken::new(),
+        );
+        match block_on(provider.subscribe(request, sink)) {
             Err(ProviderError::Unsupported(what)) => assert_eq!(what, "streaming"),
             other => panic!("expected Unsupported(\"streaming\"), got {other:?}"),
         }
@@ -824,14 +1224,20 @@ mod tests {
 
     #[test]
     fn test_subscription_request_new_sets_fields() {
+        let cancel = CancellationToken::new();
         let request = SubscriptionRequest::new(
             "BTC",
             utc(1_700_000_000),
             vec![sample_instrument("deribit", "native", None)],
+            cancel.clone(),
         );
         assert_eq!(request.underlying, "BTC");
         assert_eq!(request.expiration_utc, utc(1_700_000_000));
         assert_eq!(request.instruments.len(), 1);
+        // The request carries the supervisor's per-provider cancel token verbatim.
+        assert!(!request.cancel.is_cancelled());
+        cancel.cancel();
+        assert!(request.cancel.is_cancelled());
     }
 
     #[test]

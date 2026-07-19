@@ -59,9 +59,10 @@ pub use app::{
     App, BridgeSenders, BundleLoad, COMMAND_CHANNEL_CAPACITY, CONTROL_CHANNEL_CAPACITY,
     ChainViewApp, ChainViewAppBuilder, DEFAULT_JOIN_BUDGET, EventBridge, ExitCause, ExitReporter,
     FinalTeardown, GuardTeardown, LegFocus, LiveScreen, LiveState, LoadedReplay, Mode,
-    OverlayBinding, PayoffBuilder, Playback, ReplayScreen, ReplayState, ScreenLoad, Selection,
-    SourceBinding, StatusLine, SupervisedTask, Supervisor, TaskExit, TokioTask,
-    is_replay_screen_reachable, is_screen_reachable,
+    OverlayBinding, PayoffBuilder, Playback, ProviderSubscription, ReplayScreen, ReplayState,
+    Resolved, ScreenLoad, Selection, SourceBinding, StatusLine, SupervisedTask, Supervisor,
+    TaskExit, TokioTask, is_replay_screen_reachable, is_screen_reachable,
+    spawn_supervised_subscription,
 };
 // The closed event set folded by the state machine and the render -> data
 // command channel (`docs/02-tui-architecture.md` §4).
@@ -127,9 +128,9 @@ pub use error::{
 // (`ChainFetch`/`ExpirySource`/`AliasCatalog`, `MarketUpdate`, `ProviderError`,
 // `ProviderId`) are re-exported above from their home layers.
 pub use providers::{
-    AuthKind, ChainCapability, ChainPollCapability, GreeksCapability, OptionStreamCapability,
-    Provider, ProviderCapabilities, ProviderCapabilitiesBuilder, SubscriptionHandle,
-    SubscriptionRequest, UnderlyingRef,
+    AuthKind, ChainCapability, ChainPollCapability, GreeksCapability, MarketUpdateSink,
+    OptionStreamCapability, Provider, ProviderCapabilities, ProviderCapabilitiesBuilder, SendState,
+    SubscriptionHandle, SubscriptionRequest, UnderlyingRef,
 };
 // The terminal lifecycle surface (`docs/02-tui-architecture.md` §6, ADR-0001):
 // the RAII restore guard and the panic-hook restore installer. Public so an

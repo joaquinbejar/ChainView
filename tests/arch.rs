@@ -287,32 +287,221 @@ fn normalize_use(trimmed: &str) -> Option<&str> {
     rest.starts_with("use ").then_some(rest)
 }
 
+/// The forbidden `crate::` / `tokio::` path prefixes for a layer, each with its
+/// reason. A reference to any of these — in a `use` (single, grouped, or
+/// multiline) OR a fully-qualified expression (`let x = crate::providers::…`) — is
+/// a back-edge. The adapter→adapter edge is handled separately (it needs the
+/// importing file's stem). This is the single source of truth both the `use`-scan
+/// ([`forbidden_reason`]) and the fully-qualified scan ([`fully_qualified_reason`])
+/// enforce, so neither form of the same compile edge can evade detection.
+fn forbidden_prefixes(layer: Layer) -> &'static [(&'static str, &'static str)] {
+    match layer {
+        Layer::Domain => &[
+            (
+                "crate::providers",
+                "domain → provider/port (domain must not reference crate::providers)",
+            ),
+            (
+                "crate::app",
+                "domain → application (domain must not reference crate::app)",
+            ),
+            (
+                "crate::ui",
+                "ui reverse edge (domain must not reference crate::ui)",
+            ),
+        ],
+        Layer::Providers => &[
+            (
+                "crate::app",
+                "adapter → application (a provider must not reference crate::app)",
+            ),
+            (
+                "crate::ui",
+                "ui reverse edge (a provider must not reference crate::ui)",
+            ),
+        ],
+        Layer::Ui => &[
+            (
+                "crate::providers",
+                "ui → provider (the draw path must not reference crate::providers)",
+            ),
+            (
+                "tokio::net",
+                "ui → tokio I/O (no socket/file I/O reachable from the draw path)",
+            ),
+            (
+                "tokio::fs",
+                "ui → tokio I/O (no socket/file I/O reachable from the draw path)",
+            ),
+            (
+                "tokio::process",
+                "ui → tokio I/O (no socket/file I/O reachable from the draw path)",
+            ),
+        ],
+        Layer::App => &[(
+            "crate::ui",
+            "ui reverse edge (application must not reference crate::ui)",
+        )],
+        Layer::Leaf => &[
+            (
+                "crate::ui",
+                "ui reverse edge (a leaf must not reference crate::ui)",
+            ),
+            (
+                "crate::app",
+                "leaf → application (a leaf must not reference crate::app)",
+            ),
+            (
+                "crate::providers",
+                "leaf → provider (a leaf must not reference crate::providers)",
+            ),
+        ],
+    }
+}
+
+/// Whether `hay` contains `needle` as a **path reference** — i.e. an occurrence
+/// whose next character is a path boundary (`::` or a non-identifier char), so
+/// `crate::providers` matches `crate::providers::deribit` and `crate::providers;`
+/// but NOT `crate::providers_foo`.
+fn contains_path_ref(hay: &str, needle: &str) -> bool {
+    let mut from = 0;
+    while let Some(slice) = hay.get(from..) {
+        let Some(rel) = slice.find(needle) else {
+            return false;
+        };
+        let end = from
+            .checked_add(rel)
+            .and_then(|n| n.checked_add(needle.len()))
+            .unwrap_or(hay.len());
+        let boundary = hay
+            .get(end..)
+            .and_then(|rest| rest.chars().next())
+            .is_none_or(|c| !(c.is_alphanumeric() || c == '_'));
+        if boundary {
+            return true;
+        }
+        from = end;
+    }
+    false
+}
+
+/// Strip a trailing line comment (`// …`, including `/// …` / `//! …`) so a
+/// forbidden path named only in a doc/intra-doc link or a comment is not flagged.
+/// Approximate (it does not model `//` inside a string literal), which is safe
+/// here — no scanned source names a forbidden `crate::`/`tokio::` path inside a
+/// string.
+fn strip_comment(line: &str) -> &str {
+    match line.find("//") {
+        Some(idx) => line.get(..idx).unwrap_or(line),
+        None => line,
+    }
+}
+
+/// A fully-qualified (non-`use`) back-edge finding for one comment-stripped code
+/// fragment, or `None` when it is clean. Catches the evasions the `use`-only scan
+/// misses: a fully-qualified reference `crate::providers::deribit::foo()` and (for
+/// an adapter) a fully-qualified sibling-adapter reference.
+fn fully_qualified_reason(layer: Layer, rel: &str, code: &str) -> Option<String> {
+    for (prefix, reason) in forbidden_prefixes(layer) {
+        if contains_path_ref(code, prefix) {
+            return Some((*reason).to_owned());
+        }
+    }
+    if layer == Layer::Providers {
+        return adapter_to_adapter_ref(rel, code);
+    }
+    None
+}
+
+/// An adapter→adapter finding for a fully-qualified reference: a provider file
+/// `<stem>.rs` naming a DIFFERENT concrete adapter as a contiguous
+/// `crate::providers::<adapter>` path. The neutral `dxfeed_decode` and the port
+/// `mod`/`sink` are not adapters, so referencing them is allowed.
+fn adapter_to_adapter_ref(rel: &str, code: &str) -> Option<String> {
+    let stem = file_stem(rel);
+    for adapter in ADAPTER_IDS {
+        if adapter == stem {
+            continue;
+        }
+        let needle = format!("crate::providers::{adapter}");
+        if contains_path_ref(code, &needle) {
+            return Some(format!(
+                "adapter → adapter (`{stem}` must not reference the `{adapter}` adapter; \
+                 shared decode belongs in the neutral dxfeed_decode module)"
+            ));
+        }
+    }
+    None
+}
+
 /// Every forbidden-edge finding for one source file (production regions only),
-/// formatted `rel:line — reason — <use stmt>`.
+/// formatted `rel:line — reason — <fragment>`.
+///
+/// Two passes over the test-module-masked source:
+///
+/// - **Pass A — `use` statements (single, grouped, or MULTILINE).** A `use`/`pub
+///   use` whose statement spans several lines (a `use crate::providers::{ \n
+///   deribit::X \n }` group) is joined into one logical statement before the
+///   grouped-adapter tail split runs, so a multiline-group back-edge cannot slip
+///   between lines.
+/// - **Pass B — FULLY-QUALIFIED references.** Every non-`use` code line
+///   (comment-stripped) is scanned for a fully-qualified `crate::providers::…` /
+///   `crate::app` / `crate::ui` (or `tokio::net`…) reference, so a back-edge
+///   written as `crate::providers::deribit::foo()` — never a `use` — is caught too.
 fn violations_in(rel: &str, src: &str) -> Vec<String> {
     let Some(layer) = classify(rel) else {
         return Vec::new();
     };
     let mask = test_module_mask(src);
+    let lines: Vec<&str> = src.lines().collect();
     let mut out = Vec::new();
-    for (idx, (line, masked)) in src.lines().zip(mask.iter()).enumerate() {
-        if *masked {
+
+    // Pass A: logical `use` statements, joining multiline groups until `;`.
+    let mut idx = 0;
+    while let Some(line) = lines.get(idx) {
+        if mask.get(idx).copied().unwrap_or(false) {
+            idx = idx.checked_add(1).unwrap_or(lines.len());
             continue;
         }
-        let trimmed = line.trim_start();
-        // Normalize any visibility prefix so a re-export (`pub use …`,
-        // `pub(crate) use …`, `pub(in path) use …`) is scanned the same as a
-        // plain `use …` — a `pub use crate::providers::Foo;` from a domain/ui
-        // file creates the identical compile edge and must not evade detection.
-        let Some(use_stmt) = normalize_use(trimmed) else {
+        if normalize_use(strip_comment(line).trim_start()).is_none() {
+            idx = idx.checked_add(1).unwrap_or(lines.len());
             continue;
-        };
-        if let Some(reason) = forbidden_reason(layer, rel, use_stmt) {
-            let lineno = idx.checked_add(1).unwrap_or(idx);
-            out.push(format!(
-                "{rel}:{lineno} — {reason} — `{}`",
-                use_stmt.trim_end()
-            ));
+        }
+        // Accumulate the (comment-stripped) statement until a line carries `;`, so a
+        // grouped/multiline `use` becomes one logical string.
+        let start = idx;
+        let mut joined = String::new();
+        while let Some(piece) = lines.get(idx) {
+            let piece = strip_comment(piece);
+            joined.push_str(piece.trim());
+            joined.push(' ');
+            let terminated = piece.contains(';');
+            idx = idx.checked_add(1).unwrap_or(lines.len());
+            if terminated {
+                break;
+            }
+        }
+        if let Some(use_stmt) = normalize_use(joined.trim_start())
+            && let Some(reason) = forbidden_reason(layer, rel, use_stmt.trim_end())
+        {
+            let lineno = start.checked_add(1).unwrap_or(start);
+            out.push(format!("{rel}:{lineno} — {reason} — `{}`", use_stmt.trim()));
+        }
+    }
+
+    // Pass B: fully-qualified references in code (non-`use` lines).
+    for (i, line) in lines.iter().enumerate() {
+        if mask.get(i).copied().unwrap_or(false) {
+            continue;
+        }
+        let stripped = strip_comment(line);
+        // `use` lines are handled by Pass A (with grouping); skip them here.
+        if normalize_use(stripped.trim_start()).is_some() {
+            continue;
+        }
+        if let Some(reason) = fully_qualified_reason(layer, rel, stripped) {
+            let lineno = i.checked_add(1).unwrap_or(i);
+            out.push(format!("{rel}:{lineno} — {reason} — `{}`", stripped.trim()));
         }
     }
     out
@@ -435,6 +624,97 @@ fn test_detector_flags_a_synthetic_back_edge() {
     assert!(
         violations_in("error.rs", "use crate::chain::ProviderId;\n").is_empty(),
         "a leaf naming the domain ProviderId newtype is allowed"
+    );
+}
+
+#[test]
+fn test_detector_catches_use_only_evasions() {
+    // Codex finding #7: the prior `use`-line-only detector was evadable. These are
+    // the two evasions it missed — both MUST now be caught.
+
+    // (1) A FULLY-QUALIFIED reference (never a `use`) from the domain into an
+    // adapter — the classic evasion of an import fence.
+    let fq_domain = violations_in(
+        "chain/store.rs",
+        "        let adapter = crate::providers::deribit::DeribitAdapter::new();\n",
+    );
+    assert!(
+        fq_domain.iter().any(|v| v.contains("domain →")),
+        "a fully-qualified domain→provider reference must be flagged, got {fq_domain:?}"
+    );
+
+    // A fully-qualified ui→provider reference and a fully-qualified ui reverse edge.
+    let fq_ui_provider = violations_in(
+        "ui/surface.rs",
+        "    let _ = crate::providers::deribit::deribit_capabilities();\n",
+    );
+    assert!(
+        fq_ui_provider.iter().any(|v| v.contains("ui → provider")),
+        "a fully-qualified ui→provider reference must be flagged, got {fq_ui_provider:?}"
+    );
+    let fq_app_ui = violations_in("app/registry.rs", "    crate::ui::render(&app, frame);\n");
+    assert!(
+        fq_app_ui.iter().any(|v| v.contains("ui reverse edge")),
+        "a fully-qualified app→ui reference must be flagged, got {fq_app_ui:?}"
+    );
+
+    // A fully-qualified adapter→adapter reference (never a `use`).
+    let fq_adapter = violations_in(
+        "providers/dxlink.rs",
+        "    let x = crate::providers::alpaca::decode(frame);\n",
+    );
+    assert!(
+        fq_adapter.iter().any(|v| v.contains("adapter → adapter")),
+        "a fully-qualified adapter→adapter reference must be flagged, got {fq_adapter:?}"
+    );
+
+    // (2) A MULTILINE grouped `use` back-edge — the adapter name sits on its own
+    // line inside the `{ … }`, so a line-by-line scan of the group's opening line
+    // would miss it. The neutral `dxfeed_decode` sibling in the same group stays
+    // allowed; only the sibling ADAPTER trips the fence.
+    let multiline_group = violations_in(
+        "providers/dxlink.rs",
+        "use crate::providers::{\n    dxfeed_decode::decode,\n    alpaca::Overlay,\n};\n",
+    );
+    assert!(
+        multiline_group
+            .iter()
+            .any(|v| v.contains("adapter → adapter")),
+        "a multiline-group adapter→adapter import must be flagged, got {multiline_group:?}"
+    );
+
+    // A MULTILINE grouped `use` domain→provider back-edge is caught too.
+    let multiline_domain = violations_in(
+        "chain/store.rs",
+        "use crate::providers::{\n    deribit::DeribitAdapter,\n    Provider,\n};\n",
+    );
+    assert!(
+        multiline_domain.iter().any(|v| v.contains("domain →")),
+        "a multiline-group domain→provider import must be flagged, got {multiline_domain:?}"
+    );
+}
+
+#[test]
+fn test_detector_does_not_flag_forbidden_paths_in_comments() {
+    // The fully-qualified scan strips comments first, so a forbidden path named
+    // only in a doc comment / intra-doc link (as several real module docs do) is
+    // NOT a back-edge — otherwise the detector would fire on documentation.
+    let doc_only = violations_in(
+        "chain/store.rs",
+        "    /// See [`crate::providers::deribit`] for the adapter that feeds this.\n",
+    );
+    assert!(
+        doc_only.is_empty(),
+        "a forbidden path named only in a comment is not a back-edge, got {doc_only:?}"
+    );
+    // A trailing line comment naming a forbidden path is likewise ignored.
+    let trailing = violations_in(
+        "chain/store.rs",
+        "    let n = 1; // crate::providers::deribit is the source\n",
+    );
+    assert!(
+        trailing.is_empty(),
+        "a forbidden path in a trailing comment is not a back-edge, got {trailing:?}"
     );
 }
 

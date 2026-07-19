@@ -4,22 +4,58 @@
 //! [`Config`](chainview::Config). Replay mode is entered by the
 //! `chainview replay <dir>` **subcommand** (§4.1), never a `--replay` flag.
 //!
-//! Startup order (`docs/02-tui-architecture.md` §6): parse the CLI, load `.env`,
-//! assemble the config, install the panic hook, then enter the terminal under an
-//! RAII [`TerminalGuard`](chainview::TerminalGuard) whose `Drop` restores the
-//! shell on every exit path. The tokio runtime, event loop, and render loop land
-//! in later issues (#9/#11/#13); this entry point returns the typed
-//! [`ChainViewError`](chainview::ChainViewError), so `anyhow` is not needed here
-//! and the `main.rs` `anyhow` deviation (CLAUDE.md "Governance precedence") is
-//! left untouched.
+//! # The live-loop composition lives here (ADR-0009, `docs/02-tui-architecture.md`
+//! §12)
+//!
+//! The synchronous render loop is in the `ui` layer and the application layer must
+//! not import `crate::ui` (the arch fence, `tests/arch.rs`), so the binary is the
+//! one place that wires **both** halves together. Startup order
+//! (`docs/02-tui-architecture.md` §6): parse the CLI, load `.env`, assemble the
+//! config, install the panic hook, then — for a live session — build the tokio
+//! runtime and compose the loop:
+//!
+//! 1. resolve the provider + [`SourceBinding`] via
+//!    [`ChainViewApp::builder()…resolve()`](chainview::ChainViewApp);
+//! 2. seed the [`ChainStore`](chainview::ChainStore) from the provider's first
+//!    `fetch_chain` (best-effort — an initial failure seeds an empty chain and the
+//!    supervised reconnect loop retries, so the loop still runs and renders the
+//!    honest connecting state);
+//! 3. build the bounded, coalescing [`EventBridge`](chainview::EventBridge) and the
+//!    [`Supervisor`](chainview::Supervisor) that owns the ordered,
+//!    terminal-restored-last teardown;
+//! 4. register the provider stream task via
+//!    [`spawn_supervised_subscription`](chainview::spawn_supervised_subscription)
+//!    (watched, so a mid-run panic/return wakes the supervisor), then the
+//!    tick + input tasks (ancillary), then the render loop (the render task) under
+//!    an RAII [`TerminalGuard`](chainview::TerminalGuard) whose `Drop` restores the
+//!    shell on every exit path;
+//! 5. `supervisor.run().await` supervises until the first shutdown trigger, joins
+//!    provider → ancillary → render, and restores the terminal **last**.
+//!
+//! `anyhow` is intentionally NOT used: the typed [`ChainViewError`](chainview::ChainViewError)
+//! carries every startup/teardown failure, so the CLAUDE.md `main.rs`-`anyhow`
+//! deviation is left unexercised.
 
 #![forbid(unsafe_code)]
 
+use std::io::{self, Stdout};
 use std::path::PathBuf;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chainview::config::{CliOverrides, Config, ModeSelect};
-use chainview::{ChainViewError, TerminalGuard, install_panic_hook};
+use chainview::{
+    AliasCatalog, App, ChainFetch, ChainSource, ChainStore, ChainViewApp, ChainViewError,
+    EventBridge, ExitCause, ExpirySource, GuardTeardown, Instrument, LiveState, Mode, Resolved,
+    SourceBinding, Supervisor, TerminalGuard, TokioTask, event_channel, install_panic_hook,
+    run_render_loop, spawn_input_reader, spawn_supervised_subscription, spawn_tick_task,
+};
+use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand};
+use optionstratlib::ExpirationDate;
+use optionstratlib::chains::chain::OptionChain;
+use optionstratlib::prelude::Positive;
+use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
 
 /// `chainview` — a terminal UI for option chains, Greeks, and volatility.
 #[derive(Debug, Parser)]
@@ -107,26 +143,213 @@ fn main() -> Result<(), ChainViewError> {
     let _ = dotenvy::dotenv();
 
     let overrides = Cli::parse().into_overrides();
-    // `ConfigError` folds into `ChainViewError::Config` via `#[from]`, so an
-    // early `?` here returns before any terminal setup — stderr is safe.
-    let _config = Config::load(overrides)?;
+    // `ConfigError` folds into `ChainViewError::Config` via `#[from]`, so an early
+    // `?` here returns before any terminal setup — stderr is safe.
+    let config = Config::load(overrides)?;
 
-    // Install the panic hook BEFORE entering the alternate screen so a panic at
-    // any later point restores the terminal before the backtrace prints
-    // (`docs/02-tui-architecture.md` §6). The TUI-safe tracing file/pane sink
-    // (CLAUDE.md "Governance precedence" item 3) is wired in #3/#11; until then
-    // nothing competes with the TUI for stdout.
+    // Install the panic hook BEFORE entering the alternate screen so a panic at any
+    // later point restores the terminal before the backtrace prints
+    // (`docs/02-tui-architecture.md` §6). While the supervisor drives the ordered
+    // teardown it owns the single restore and the hook defers (§12).
     install_panic_hook();
 
-    // Enter raw mode + the alternate screen under an RAII guard. Its `Drop`
-    // restores the terminal on EVERY exit path from here on — a normal return,
-    // an early `?`, or a panic. No `std::process::exit` runs while the guard is
-    // held, so `Drop` is never bypassed; the supervised, ordered teardown that
-    // sequences this last lands in #11.
-    let _guard = TerminalGuard::new()?;
+    // Resolve the registry + mode. Resolution is the validation seam: an empty
+    // registry / unknown provider / chain-less source surfaces here (stderr-safe,
+    // no terminal entered yet). The zero-config Deribit BTC path resolves with no
+    // network (capabilities are static).
+    match ChainViewApp::builder()
+        .with_builtins()
+        .with_config(config)
+        .resolve()?
+    {
+        Resolved::Live {
+            provider,
+            source,
+            config,
+        } => run_live(provider, source, config),
+        Resolved::Replay { dir, config: _ } => run_replay(dir),
+    }
+}
 
-    // The event fan-in, provider tasks, and render loop land in #9/#11/#13. Today
-    // the assembled config and the guard prove the lifecycle end to end: on
-    // return `_guard` drops and restores the terminal.
+/// Compose and drive the live loop on a fresh tokio runtime, returning once the
+/// supervisor has restored the terminal (`docs/02-tui-architecture.md` §12).
+fn run_live(
+    provider: std::sync::Arc<dyn chainview::Provider>,
+    source: SourceBinding,
+    config: Config,
+) -> Result<(), ChainViewError> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| ChainViewError::Terminal(format!("tokio runtime: {e}")))?;
+    let cause = runtime.block_on(compose_and_run_live(provider, source, config));
+    // The terminal has already been restored by the supervisor (LAST step), so a
+    // post-restore stderr line is safe (CLAUDE.md "Governance precedence" item 3).
+    match cause {
+        ExitCause::Clean => Ok(()),
+        ExitCause::TaskPanicked => Err(ChainViewError::Terminal(
+            "a supervised task panicked; see the log".to_owned(),
+        )),
+        ExitCause::Failed(error) => Err(error),
+    }
+}
+
+/// The async live composition: seed the store, build the bridge + supervisor,
+/// register the provider stream (watched) + the tick/input/render tasks, and drive
+/// the supervisor to its ordered, terminal-restored-last teardown.
+async fn compose_and_run_live(
+    provider: std::sync::Arc<dyn chainview::Provider>,
+    source: SourceBinding,
+    config: Config,
+) -> ExitCause {
+    let now = now_utc();
+
+    // (2) Seed the store from the provider's first fetch (best-effort). A default
+    // near-term expiry is used for the zero-config path; on any failure the store
+    // is seeded EMPTY so the loop still runs and renders the honest connecting
+    // state while the supervised reconnect loop retries.
+    let expiration = ExpirationDate::Days(positive_or_one(7.0));
+    let (fetch, instruments) = match provider.fetch_chain(&config.underlying, &expiration).await {
+        Ok(fetch) => {
+            let instruments: Vec<Instrument> = fetch.aliases.instruments().cloned().collect();
+            (fetch, instruments)
+        }
+        Err(_) => (empty_seed(&config.underlying, &source, now), Vec::new()),
+    };
+    // The absolute-UTC expiry the subscription is scoped to — resolved by the poll
+    // leg (or the empty-seed placeholder), never a relative offset.
+    let expiration_utc = fetch.expiry_source.expiration_utc;
+    let store = ChainStore::seed(fetch, ChainSource::Merged, config.refresh_interval, now);
+    let live = LiveState::new(source, store);
+
+    // (3) The bounded, coalescing bridge + the App (holding the render -> data
+    // command sender).
+    let (mut bridge, senders) = EventBridge::new(config.channel_capacity);
+    let mut app = App::new(Mode::Live(live), config.theme, senders.tx_command.clone())
+        .with_no_color(config.no_color);
+
+    // (4) The single supervisor owning the ordered, terminal-restored-last
+    // teardown. The TerminalGuard enters raw mode + the alternate screen; the
+    // GuardTeardown drops it LAST.
+    let guard = match TerminalGuard::new() {
+        Ok(guard) => guard,
+        Err(error) => return ExitCause::Failed(error),
+    };
+    let mut supervisor = Supervisor::new(Box::new(GuardTeardown::new(guard)));
+
+    // The provider stream task, registered under the supervisor's `watch` seam so a
+    // mid-run panic/return wakes the loop and it is reaped at teardown.
+    let _subscription = match spawn_supervised_subscription(
+        &provider,
+        &config.underlying,
+        expiration_utc,
+        instruments,
+        &senders,
+        &mut supervisor,
+    )
+    .await
+    {
+        Ok(subscription) => subscription,
+        Err(error) => {
+            supervisor.fail(ChainViewError::provider(provider.id(), error));
+            return supervisor.run().await;
+        }
+    };
+
+    // The input/tick tasks (ancillary) feed the bounded AppEvent channel; only they
+    // hold the sender, so both ending closes the channel and the render loop's
+    // `blocking_recv` returns `None`.
+    let (tx_events, mut rx_events) = event_channel();
+    let tick_child = supervisor.child_token();
+    let tick = spawn_tick_task(config.tick_interval, tx_events.clone(), tick_child.clone());
+    supervisor.register_ancillary(tick_child, Box::new(TokioTask::new(tick)));
+    let input_child = supervisor.child_token();
+    let input = spawn_input_reader(tx_events, input_child.clone());
+    supervisor.register_ancillary(input_child, Box::new(TokioTask::new(input)));
+
+    // The render loop on a dedicated blocking thread (so `blocking_recv` is legal).
+    // On quit it cancels the root so the supervisor tears down.
+    let backend = CrosstermBackend::new(io::stdout());
+    let terminal = match Terminal::new(backend) {
+        Ok(terminal) => terminal,
+        Err(error) => {
+            supervisor.fail(ChainViewError::Terminal(error.to_string()));
+            return supervisor.run().await;
+        }
+    };
+    let render_child = supervisor.child_token();
+    let root = supervisor.root_token();
+    let render = tokio::task::spawn_blocking(move || {
+        render_thread(terminal, &mut app, &mut bridge, &mut rx_events);
+        // The loop returned (quit or channel close): trip the root so the
+        // supervisor runs the ordered teardown.
+        root.cancel();
+    });
+    supervisor.set_render(render_child, Box::new(TokioTask::new(render)));
+
+    // Drop the last stray sender clones so the bridge channels close cleanly once
+    // the provider + app halves drop.
+    drop(senders);
+
+    // (5) Supervise until the first shutdown trigger, then the ordered teardown
+    // restores the terminal LAST.
+    supervisor.run().await
+}
+
+/// The synchronous render loop body on the blocking render thread. A command from
+/// the fold is currently a no-op route (per-provider recovery routing lands with
+/// the navigation layer); the loop is driven purely by the bounded channels.
+fn render_thread(
+    mut terminal: Terminal<CrosstermBackend<Stdout>>,
+    app: &mut App,
+    bridge: &mut EventBridge,
+    rx_events: &mut tokio::sync::mpsc::Receiver<chainview::AppEvent>,
+) {
+    // A draw failure ends the loop; the supervisor's teardown still restores the
+    // terminal. The route closure is a no-op in v0.1 (commands are surfaced, not
+    // yet acted on beyond the seam).
+    let _ = run_render_loop(&mut terminal, app, bridge, rx_events, |_command| {});
+}
+
+/// Replay mode (v0.3): the bundle reader, timeline, and replay screens land in
+/// #34 (`docs/ROADMAP.md`). Until then this is a typed no-op — it never enters the
+/// terminal (there is nothing to render), and it must NOT write to stdout/stderr
+/// (the logging discipline forbids `println!`/`eprintln!`), so the pending mode is
+/// surfaced by the v0.3 work, not here.
+fn run_replay(_dir: PathBuf) -> Result<(), ChainViewError> {
     Ok(())
+}
+
+/// A [`Positive`] from a controlled startup value, degrading a non-positive/`NaN`
+/// input to `1.0` rather than panicking (no `unwrap`/`expect` in `main`).
+fn positive_or_one(value: f64) -> Positive {
+    Positive::new(value).unwrap_or_else(|_| positive_one())
+}
+
+/// The constant `1.0` as a [`Positive`] — the empty-seed spot placeholder.
+fn positive_one() -> Positive {
+    Positive::new(1.0).unwrap_or(Positive::ZERO)
+}
+
+/// An empty [`ChainFetch`] used to seed the store when the initial fetch fails, so
+/// the loop still runs and renders the connecting/empty state while the reconnect
+/// loop retries. Carries the source provider + a placeholder expiry so the
+/// [`ExpirySource`] identity is well-formed.
+fn empty_seed(underlying: &str, source: &SourceBinding, now: DateTime<Utc>) -> ChainFetch {
+    let chain = OptionChain::new(underlying, positive_one(), now.to_rfc3339(), None, None);
+    ChainFetch::new(
+        chain,
+        ExpirySource::new(underlying, now, source.provider.clone()),
+        AliasCatalog::new(),
+    )
+}
+
+/// The current wall-clock instant from `std`'s clock (chrono's `clock` feature is
+/// off), clamped to the representable range, never `unwrap`ping.
+fn now_utc() -> DateTime<Utc> {
+    let since = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO);
+    let secs = i64::try_from(since.as_secs()).unwrap_or(i64::MAX);
+    DateTime::<Utc>::from_timestamp(secs, since.subsec_nanos()).unwrap_or(DateTime::<Utc>::MIN_UTC)
 }

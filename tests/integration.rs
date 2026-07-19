@@ -35,15 +35,16 @@ use optionstratlib::chains::chain::OptionChain;
 use optionstratlib::prelude::Positive;
 use optionstratlib::{ExpirationDate, OptionStyle};
 use proptest::prelude::*;
+use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 use chainview::{
-    AliasCatalog, ChainCapability, ChainFetch, ChainPollCapability, ChainViewApp, Config,
-    ContractSpecFingerprint, EventBridge, ExerciseStyle, ExpirySource, FinalTeardown,
-    GreeksCapability, Instrument, InstrumentKey, LiveScreen, MarketUpdate, MarketUpdateSink,
-    ModeSelect, Provider, ProviderCapabilities, ProviderError, ProviderId, RESERVED_PROVIDER_IDS,
-    SettlementStyle, StreamHealth, SubscriptionHandle, SubscriptionRequest, Supervisor,
-    ThemeChoice, UnderlyingRef, is_screen_reachable, spawn_supervised_subscription,
+    AliasCatalog, ChainCapability, ChainFetch, ChainPollCapability, ChainSnapshot, ChainSource,
+    ChainViewApp, Config, ContractSpecFingerprint, EventBridge, ExerciseStyle, ExpirySource,
+    FinalTeardown, GreeksCapability, Instrument, InstrumentKey, LiveScreen, MarketUpdate,
+    MarketUpdateSink, ModeSelect, Provider, ProviderCapabilities, ProviderError, ProviderId,
+    RESERVED_PROVIDER_IDS, SettlementStyle, StreamHealth, SubscriptionHandle, SubscriptionRequest,
+    Supervisor, ThemeChoice, UnderlyingRef, is_screen_reachable, spawn_supervised_subscription,
 };
 
 // --- Test constructors (no unwrap/expect/indexing per the ruleset) -----------
@@ -103,10 +104,15 @@ fn faux_spec(underlying: &str) -> ContractSpecFingerprint {
 struct FauxProvider {
     id: ProviderId,
     capabilities: ProviderCapabilities,
-    /// The native symbols handed to each `subscribe`, in call order.
+    /// The native symbols handed to each `subscribe`/resubscribe, in call order.
     subscribe_log: Arc<Mutex<Vec<Vec<String>>>>,
     /// The next `fetch_chain` generation — stamped into alias symbols.
     fetch_gen: Arc<AtomicU64>,
+    /// The recoverable-disconnect trigger: firing it makes the supervised
+    /// reconnect loop treat the socket as dropped, back off, refetch the chain, and
+    /// resubscribe off the FRESH aliases — the real reconnect seam (issue #22,
+    /// finding 6), not a handle drop.
+    disconnect: Arc<Notify>,
 }
 
 impl FauxProvider {
@@ -116,6 +122,7 @@ impl FauxProvider {
             capabilities,
             subscribe_log: Arc::new(Mutex::new(Vec::new())),
             fetch_gen: Arc::new(AtomicU64::new(0)),
+            disconnect: Arc::new(Notify::new()),
         }
     }
 
@@ -137,59 +144,99 @@ impl FauxProvider {
         Arc::clone(&self.subscribe_log)
     }
 
-    /// Build a fully-normalized [`ChainFetch`] whose alias symbols carry
-    /// `generation`, so successive fetches yield fresh (distinct) aliases.
-    fn build_fetch(&self, underlying: &str, generation: u64) -> ChainFetch {
-        let mut chain = OptionChain::new(
-            underlying,
-            pos(60_000.0),
-            "2025-06-27".to_owned(),
+    /// A trigger clone the test fires to simulate a recoverable socket disconnect.
+    fn disconnect_trigger(&self) -> Arc<Notify> {
+        Arc::clone(&self.disconnect)
+    }
+
+    /// Build a fully-normalized [`ChainFetch`] whose alias symbols carry the next
+    /// generation, so successive fetches yield fresh (distinct) aliases.
+    fn build_fetch(&self, underlying: &str) -> ChainFetch {
+        let generation = self.fetch_gen.fetch_add(1, Ordering::SeqCst);
+        build_faux_fetch(&self.id, underlying, generation)
+    }
+}
+
+/// Record one (re)subscription's native-symbol set into the shared log.
+fn record_subscription(log: &Arc<Mutex<Vec<Vec<String>>>>, legs: &[Instrument]) {
+    let symbols: Vec<String> = legs
+        .iter()
+        .map(|instrument| instrument.native_symbol.clone())
+        .collect();
+    match log.lock() {
+        Ok(mut guard) => guard.push(symbols),
+        Err(_) => panic!("faux subscribe_log mutex poisoned"),
+    }
+}
+
+/// A generation-stamped [`ChainFetch`] — a free fn so the spawned reconnect loop
+/// can refetch off the moved state (it cannot borrow `&FauxProvider`).
+fn build_faux_fetch(id: &ProviderId, underlying: &str, generation: u64) -> ChainFetch {
+    let mut chain = OptionChain::new(
+        underlying,
+        pos(60_000.0),
+        "2025-06-27".to_owned(),
+        None,
+        None,
+    );
+    let mut aliases = AliasCatalog::new();
+    for strike in STRIKES {
+        chain.add_option(
+            pos(strike),
+            Some(pos(1.0)),
+            Some(pos(1.2)),
+            Some(pos(2.0)),
+            Some(pos(2.4)),
+            pos(0.5),
+            None,
+            None,
+            None,
+            None,
             None,
             None,
         );
-        let mut aliases = AliasCatalog::new();
-        for strike in STRIKES {
-            chain.add_option(
-                pos(strike),
-                Some(pos(1.0)),
-                Some(pos(1.2)),
-                Some(pos(2.0)),
-                Some(pos(2.4)),
-                pos(0.5),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            );
-            for style in [OptionStyle::Call, OptionStyle::Put] {
-                aliases.insert(Instrument {
-                    key: InstrumentKey {
-                        underlying: underlying.to_owned(),
-                        expiration_utc: expiry_utc(),
-                        strike: pos(strike),
-                        style,
-                    },
-                    provider: self.id.clone(),
-                    // The generation stamp is what makes a re-fetch's aliases FRESH.
-                    native_symbol: format!(
-                        "FAUX-{underlying}-{strike}-{}-g{generation}",
-                        style.as_str()
-                    ),
-                    stream_symbol: Some(format!(
-                        "faux-stream-{strike}-{}-g{generation}",
-                        style.as_str()
-                    )),
-                    spec: faux_spec(underlying),
-                });
-            }
+        for style in [OptionStyle::Call, OptionStyle::Put] {
+            aliases.insert(Instrument {
+                key: InstrumentKey {
+                    underlying: underlying.to_owned(),
+                    expiration_utc: expiry_utc(),
+                    strike: pos(strike),
+                    style,
+                },
+                provider: id.clone(),
+                // The generation stamp is what makes a re-fetch's aliases FRESH.
+                native_symbol: format!(
+                    "FAUX-{underlying}-{strike}-{}-g{generation}",
+                    style.as_str()
+                ),
+                stream_symbol: Some(format!(
+                    "faux-stream-{strike}-{}-g{generation}",
+                    style.as_str()
+                )),
+                spec: faux_spec(underlying),
+            });
         }
-        ChainFetch::new(
-            chain,
-            ExpirySource::new(underlying, expiry_utc(), self.id.clone()),
-            aliases,
-        )
+    }
+    ChainFetch::new(
+        chain,
+        ExpirySource::new(underlying, expiry_utc(), id.clone()),
+        aliases,
+    )
+}
+
+/// A streaming-current [`ChainSnapshot`] control-class backfill from a fetch.
+fn faux_snapshot(fetch: &ChainFetch) -> ChainSnapshot {
+    ChainSnapshot {
+        chain_key: (
+            fetch.expiry_source.provider.clone(),
+            fetch.expiry_source.underlying.clone(),
+            fetch.expiry_source.expiration_utc,
+        ),
+        chain: fetch.chain.clone(),
+        aliases: fetch.aliases.clone(),
+        source: ChainSource::Merged,
+        health: StreamHealth::Live,
+        last_full_poll: Some(fetch.expiry_source.expiration_utc),
     }
 }
 
@@ -214,8 +261,7 @@ impl Provider for FauxProvider {
     ) -> Result<ChainFetch, ProviderError> {
         // A fresh generation per poll -> fresh aliases (the reconnect backfill
         // resubscribes off THESE, never a stale/derived set).
-        let generation = self.fetch_gen.fetch_add(1, Ordering::SeqCst);
-        Ok(self.build_fetch(underlying, generation))
+        Ok(self.build_fetch(underlying))
     }
 
     async fn subscribe(
@@ -226,27 +272,53 @@ impl Provider for FauxProvider {
         // Record EXACTLY the legs the caller handed us (taken from
         // ChainFetch.aliases) — proving subscription is off the fetch artifact,
         // never a bare OptionChain or a re-derivation.
-        let symbols: Vec<String> = req
-            .instruments
-            .iter()
-            .map(|instrument| instrument.native_symbol.clone())
-            .collect();
-        match self.subscribe_log.lock() {
-            Ok(mut guard) => guard.push(symbols),
-            Err(_) => panic!("faux subscribe_log mutex poisoned"),
-        }
+        record_subscription(&self.subscribe_log, &req.instruments);
         // A control-class Health(Live) flows through the sink to the render side —
         // the port carries normalized domain data across the seam.
         let _ = sink
             .send(MarketUpdate::Health(self.id.clone(), StreamHealth::Live))
             .await;
-        // A cooperative reconnect-style loop that stops on the supervisor's child
-        // token — exactly the Deribit adapter shape, so the ordered join can await
-        // it (ADR-0009).
+
+        // The adapter-owned reconnect loop — exactly the Deribit shape (ADR-0009):
+        // it selects on the supervisor's child token (a clean stop) and a
+        // recoverable disconnect trigger. On a disconnect it surfaces
+        // `Reconnecting`, refetches the chain (FRESH aliases), resubscribes off
+        // those, and emits the backfill `Chain` — the real reconnect/backfill seam
+        // (issue #22, finding 6), not a handle drop.
         let cancel = req.cancel;
         let loop_cancel = cancel.clone();
+        let id = self.id.clone();
+        let underlying = req.underlying.clone();
+        let log = Arc::clone(&self.subscribe_log);
+        let fetch_gen = Arc::clone(&self.fetch_gen);
+        let disconnect = Arc::clone(&self.disconnect);
         let join = tokio::spawn(async move {
-            loop_cancel.cancelled().await;
+            loop {
+                tokio::select! {
+                    () = loop_cancel.cancelled() => break,
+                    () = disconnect.notified() => {
+                        // Recoverable disconnect -> reconnect + backfill.
+                        let _ = sink
+                            .send(MarketUpdate::Health(
+                                id.clone(),
+                                StreamHealth::Reconnecting { attempt: 1 },
+                            ))
+                            .await;
+                        let generation = fetch_gen.fetch_add(1, Ordering::SeqCst);
+                        let fetch = build_faux_fetch(&id, &underlying, generation);
+                        let legs: Vec<Instrument> =
+                            fetch.aliases.instruments().cloned().collect();
+                        // Resubscribe off the FRESH aliases (record them), then emit
+                        // the reconciled structure as a control-class Chain backfill,
+                        // then Live.
+                        record_subscription(&log, &legs);
+                        let _ = sink.send(MarketUpdate::Chain(faux_snapshot(&fetch))).await;
+                        let _ = sink
+                            .send(MarketUpdate::Health(id.clone(), StreamHealth::Live))
+                            .await;
+                    }
+                }
+            }
         });
         Ok(SubscriptionHandle::spawned(cancel, join))
     }
@@ -332,10 +404,11 @@ fn test_faux_provider_uses_a_valid_non_reserved_id() {
 async fn test_faux_reconnect_resubscribes_off_fresh_chainfetch_aliases() {
     let faux = FauxProvider::chainful(pid("faux"));
     let log = faux.subscribe_log();
+    let disconnect = faux.disconnect_trigger();
     let exp = ExpirationDate::DateTime(expiry_utc());
     let (mut bridge, senders) = EventBridge::new(64);
 
-    // (a) POLL leg: fetch_chain returns the NAMED ChainFetch artifact.
+    // (a) POLL leg: fetch_chain returns the NAMED ChainFetch artifact + its aliases.
     let fetch1 = match faux.fetch_chain("BTC", &exp).await {
         Ok(fetch) => fetch,
         Err(e) => panic!("faux fetch_chain must succeed, got {e}"),
@@ -346,41 +419,56 @@ async fn test_faux_reconnect_resubscribes_off_fresh_chainfetch_aliases() {
         "the fetch artifact carries the per-leg alias catalog to (re)subscribe off"
     );
 
-    // (b) SUBSCRIBE off the returned ChainFetch.aliases (never a re-derivation).
+    // (b) SUBSCRIBE off the returned ChainFetch.aliases (records subscription #1).
     let legs1: Vec<Instrument> = fetch1.aliases.instruments().cloned().collect();
-    let cancel1 = CancellationToken::new();
-    let req1 = SubscriptionRequest::new("BTC", expiry_utc(), legs1, cancel1.clone());
-    let handle1 = match faux.subscribe(req1, senders.market_update_sink()).await {
+    let cancel = CancellationToken::new();
+    let req = SubscriptionRequest::new("BTC", expiry_utc(), legs1, cancel.clone());
+    let handle = match faux.subscribe(req, senders.market_update_sink()).await {
         Ok(handle) => handle,
         Err(e) => panic!("faux subscribe must succeed, got {e}"),
     };
-    // Force the reconnect: drop the handle (stops the loop, exactly as an outage
-    // would trigger the adapter-owned reconnect).
-    drop(handle1);
 
-    // (c) RECONNECT BACKFILL: re-fetch -> FRESH aliases (distinct from fetch1),
-    // then resubscribe off THOSE.
-    let fetch2 = match faux.fetch_chain("BTC", &exp).await {
-        Ok(fetch) => fetch,
-        Err(e) => panic!("faux re-fetch on reconnect must succeed, got {e}"),
-    };
-    let aliases2 = sorted_aliases(&fetch2);
-    assert_ne!(
-        aliases1, aliases2,
-        "a reconnect re-fetch yields FRESH aliases, not the stale set (§5 backfill = current state)"
+    // (c) Force a RECOVERABLE DISCONNECT (NOT a handle drop): the adapter-owned
+    // reconnect loop surfaces Reconnecting, re-fetches the chain (FRESH aliases),
+    // resubscribes off THOSE, and emits the backfill Chain — the real §5 seam.
+    disconnect.notify_one();
+
+    // Drive the loop to completion of the reconnect: drain the bridge while yielding
+    // until the resubscribe is recorded AND the backfill Chain has flowed through.
+    let mut chains = 0usize;
+    let mut lives = 0usize;
+    let mut reconnecting = 0usize;
+    let mut resubscribed = false;
+    for _ in 0..2_000 {
+        bridge.pump_into(
+            |update| match update {
+                MarketUpdate::Chain(_) => chains = chains.checked_add(1).unwrap_or(chains),
+                MarketUpdate::Health(_, StreamHealth::Live) => {
+                    lives = lives.checked_add(1).unwrap_or(lives);
+                }
+                MarketUpdate::Health(_, StreamHealth::Reconnecting { .. }) => {
+                    reconnecting = reconnecting.checked_add(1).unwrap_or(reconnecting);
+                }
+                MarketUpdate::Health(_, StreamHealth::Stale { .. })
+                | MarketUpdate::Quote(_)
+                | MarketUpdate::Greeks(_)
+                | MarketUpdate::Depth(_) => {}
+            },
+            |_command| {},
+        );
+        resubscribed = log.lock().map(|g| g.len() >= 2).unwrap_or(false);
+        if resubscribed && chains >= 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        resubscribed,
+        "the reconnect recorded a second (re)subscription"
     );
-    let legs2: Vec<Instrument> = fetch2.aliases.instruments().cloned().collect();
-    let cancel2 = CancellationToken::new();
-    let req2 = SubscriptionRequest::new("BTC", expiry_utc(), legs2, cancel2.clone());
-    let handle2 = match faux.subscribe(req2, senders.market_update_sink()).await {
-        Ok(handle) => handle,
-        Err(e) => panic!("faux resubscribe must succeed, got {e}"),
-    };
-    drop(handle2);
 
-    // (d) The recorded subscriptions prove the load-bearing contract: subscribe #1
-    // used fetch #1's aliases EXACTLY, and the RESUBSCRIBE used the FRESH fetch #2
-    // aliases — never a bare OptionChain, never a symbol re-derivation.
+    // (d) The recorded subscriptions: #1 = fetch #1's aliases EXACTLY; the resubscribe
+    // used FRESH aliases (a distinct, higher-generation set), never the stale one.
     let recorded = match log.lock() {
         Ok(guard) => guard.clone(),
         Err(_) => panic!("faux subscribe_log mutex poisoned"),
@@ -398,25 +486,20 @@ async fn test_faux_reconnect_resubscribes_off_fresh_chainfetch_aliases() {
         first, aliases1,
         "the initial subscription used fetch #1's ChainFetch.aliases exactly"
     );
-    assert_eq!(
-        second, aliases2,
-        "the RESUBSCRIBE used the FRESH fetch #2 ChainFetch.aliases, not the stale set"
+    assert_ne!(
+        first, second,
+        "the RESUBSCRIBE used FRESH re-fetched aliases, not the stale set (§5 backfill = current state)"
     );
 
-    // The port carried a control-class Health(Live) to the render side each time.
-    let mut healths = 0usize;
-    bridge.pump_into(
-        |update| {
-            if matches!(update, MarketUpdate::Health(_, StreamHealth::Live)) {
-                healths = healths.checked_add(1).unwrap_or(healths);
-            }
-        },
-        |_command| {},
-    );
-    assert!(
-        healths >= 1,
-        "a control-class Health flowed through the port to the render bridge"
-    );
+    // (e) The reconnect drove the control-class path end to end: Reconnecting, a
+    // Chain backfill, and a resurfaced Live all reached the render bridge.
+    assert!(reconnecting >= 1, "the disconnect surfaced Reconnecting");
+    assert!(chains >= 1, "the reconnect emitted a Chain backfill");
+    assert!(lives >= 1, "the reconnect resurfaced Live");
+
+    // Clean stop: cancel the loop and drop the handle.
+    cancel.cancel();
+    drop(handle);
 }
 
 // =============================================================================
@@ -446,10 +529,18 @@ async fn test_faux_provider_plugs_into_supervision_like_a_builtin() {
         &mut supervisor,
     )
     .await;
-    match extra {
-        Ok(None) => {}
+    // A streaming provider is watched under the supervisor and hands back the
+    // per-provider cancel handle (Codex finding #3): the caller keeps it to cancel
+    // ONLY this provider's subtree.
+    let subscription = match extra {
+        Ok(Some(subscription)) => subscription,
         other => panic!("expected the faux task registered under the supervisor, got {other:?}"),
-    }
+    };
+    assert_eq!(
+        subscription.provider().as_str(),
+        "faux",
+        "the cancel handle names the supervised provider"
+    );
 
     supervisor.request_quit();
     let cause = supervisor.run().await;

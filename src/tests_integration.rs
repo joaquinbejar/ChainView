@@ -34,20 +34,15 @@
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use optionstratlib::OptionStyle;
-use optionstratlib::prelude::Positive;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use tokio::sync::mpsc;
 
-use crate::app::{App, LiveScreen, LiveState, Mode, ScreenLoad, SourceBinding};
-use crate::chain::{
-    ChainSource, ChainStore, ContractSpecFingerprint, ExerciseStyle, Instrument, InstrumentKey,
-    MergeOutcome, ProviderId, QuoteUpdate, SettlementStyle, StreamHealth,
-};
+use crate::app::{App, EventBridge, LiveScreen, LiveState, Mode, ScreenLoad, SourceBinding};
+use crate::chain::{ChainSource, ChainStore, MarketUpdate, ProviderId, StreamHealth};
 use crate::config::ThemeChoice;
 use crate::event::Command;
-use crate::providers::deribit::fixture_btc_chain_fetch_named;
+use crate::providers::deribit::{fixture_btc_chain_fetch_named, fixture_btc_stream_updates};
 use crate::providers::{ChainCapability, GreeksCapability, ProviderCapabilities};
 use crate::ui::chain::draw as draw_chain;
 use crate::ui::golden::{GOLDEN_HEIGHT, GOLDEN_WIDTH, assert_golden, buffer_to_text};
@@ -117,70 +112,20 @@ fn live_ready(store: ChainStore, provider: ProviderId) -> LiveState {
 #[track_caller]
 fn render_chain_body(live: &LiveState) -> String {
     let mut term = terminal(GOLDEN_WIDTH, GOLDEN_HEIGHT);
-    match term.draw(|frame| draw_chain(live, frame, frame.area(), theme(), 0)) {
+    match term.draw(|frame| draw_chain(live, frame, frame.area(), theme(), 0, utc(AS_OF))) {
         Ok(_) => {}
         Err(e) => panic!("chain golden draw failed: {e}"),
     }
     buffer_to_text(term.backend().buffer())
 }
 
-/// Build an **idempotent** streaming [`QuoteUpdate`] for one leg from the store's
-/// OWN current row values, so folding it patches the row to identical values (a
-/// real `apply_quote` merge) while the rendered chain stays byte-stable. The
-/// `provider` equals the chain's source provider, so this is a within-provider
-/// poll→stream merge (the overlay gate is a no-op).
-fn idempotent_quote(
-    provider: &ProviderId,
-    underlying: &str,
-    expiry: DateTime<Utc>,
-    strike: Positive,
-    style: OptionStyle,
-    bid: Positive,
-    ask: Positive,
-) -> QuoteUpdate {
-    QuoteUpdate {
-        instrument: Instrument {
-            key: InstrumentKey {
-                underlying: underlying.to_owned(),
-                expiration_utc: expiry,
-                strike,
-                style,
-            },
-            provider: provider.clone(),
-            native_symbol: format!("{underlying}-{strike}-{}", style.as_str()),
-            stream_symbol: None,
-            spec: ContractSpecFingerprint {
-                contract_multiplier: 1,
-                settlement: SettlementStyle::Cash,
-                exercise: ExerciseStyle::European,
-                quote_currency: "USD".to_owned(),
-                venue_product_code: underlying.to_owned(),
-            },
-        },
-        bid: Some(bid),
-        ask: Some(ask),
-        last: None,
-        bid_size: None,
-        ask_size: None,
-        event_time: None,
-        received_time: utc(AS_OF),
+/// The live [`LiveState`] borrowed out of a live [`App`], for rendering.
+#[track_caller]
+fn live_of(app: &App) -> &LiveState {
+    match &app.mode {
+        Mode::Live(live) => live,
+        Mode::Replay(_) => panic!("expected a live app"),
     }
-}
-
-/// Every priced leg (a call and/or a put with BOTH sides present) currently in
-/// the store, as owned `(strike, style, bid, ask)` tuples — the stream-mergeable
-/// set. Collected owned so the store's immutable borrow ends before the merge.
-fn priced_legs(store: &ChainStore) -> Vec<(Positive, OptionStyle, Positive, Positive)> {
-    let mut legs = Vec::new();
-    for od in store.chain().options.iter() {
-        if let (Some(bid), Some(ask)) = (od.call_bid, od.call_ask) {
-            legs.push((od.strike_price, OptionStyle::Call, bid, ask));
-        }
-        if let (Some(bid), Some(ask)) = (od.put_bid, od.put_ask) {
-            legs.push((od.strike_price, OptionStyle::Put, bid, ask));
-        }
-    }
-    legs
 }
 
 // =============================================================================
@@ -194,42 +139,81 @@ fn priced_legs(store: &ChainStore) -> Vec<(Positive, OptionStyle, Positive, Posi
 #[test]
 fn test_live_path_deribit_fixture_poll_stream_merge_renders_btc_atm_golden() {
     // POLL leg: the recorded #17 fixtures through the REAL normalize/assemble seam.
-    let fetch = fixture_btc_chain_fetch_named("BTC");
     let mut store = ChainStore::seed(
-        fetch,
+        fixture_btc_chain_fetch_named("BTC"),
         ChainSource::Merged,
         Duration::from_secs(2),
         utc(AS_OF),
     );
-
     // POLL -> a second identical poll exercises the bounded-generation merge
     // (generation bump, tombstone reconciliation with NO de-listing, pending
     // drain) deterministically and idempotently.
     store.apply_poll(fixture_btc_chain_fetch_named("BTC"), utc(AS_OF));
 
-    // -> STREAM leg: fold an idempotent quote into EVERY priced leg, reconstructed
-    // from the store's own current values, so each `apply_quote` patches its row to
-    // identical values (a real merge fold, `MergeOutcome::Applied`) while the
-    // rendered chain stays byte-identical to the seed-only #19 golden.
-    let key = store.chain_key().clone();
-    let (provider, underlying, expiry) = (key.0, key.1, key.2);
-    let legs = priced_legs(&store);
+    // Assemble the live App on the ready chain screen — the fan-in target.
+    let live = live_ready(store, pid("deribit"));
+    let (tx, _rx) = mpsc::channel::<Command>(16);
+    let mut app = App::new(Mode::Live(live), ThemeChoice::Auto, tx);
+    app.mark_drawn();
+
+    // -> STREAM leg through the PRODUCTION seams (issue #22, finding 5): the
+    // recorded `ticker.` frames are normalized by the real `normalize_ticker`, sent
+    // through the two-class `MarketUpdateSink`, drained by the bounded coalescing
+    // `EventBridge`, and folded into the store by `App::on_event` — NOT a hand-built
+    // `QuoteUpdate` applied directly. Because the overlay values come from the SAME
+    // recorded tickers the poll seed assembled from, the fold is idempotent and the
+    // render stays byte-stable against the seed-only #19 golden, so a regression in
+    // the real streaming normalize/route/merge path is caught here.
+    let updates = fixture_btc_stream_updates(utc(AS_OF));
     assert!(
-        !legs.is_empty(),
-        "the assembled fixture chain must have priced legs to stream-merge"
+        !updates.is_empty(),
+        "the recorded fixture yields streaming overlay updates"
     );
-    for (strike, style, bid, ask) in legs {
-        let update = idempotent_quote(&provider, &underlying, expiry, strike, style, bid, ask);
+    // The recorded tickers normalize to BOTH a quote and a Greeks row (the full
+    // `normalize_ticker` output is exercised). The QUOTE class is the mergeable
+    // overlay here: its bid/ask come from the SAME tickers the poll seed assembled,
+    // so folding it is idempotent and the render stays byte-stable. The Greeks
+    // class carries the venue `mark_iv` (49.22%), which by design overrides the
+    // seed's per-strike IV — folding it would (correctly) change the render, so it
+    // is proven by the Deribit unit tests and left out of this byte-golden overlay.
+    let quotes: Vec<MarketUpdate> = updates
+        .into_iter()
+        .filter(|u| matches!(u, MarketUpdate::Quote(_)))
+        .collect();
+    assert!(!quotes.is_empty(), "the overlay carries quotes to merge");
+
+    let (mut bridge, senders) = EventBridge::new(64);
+    let mut sink = senders.market_update_sink();
+    for update in quotes {
+        // Coalesced-class overlay updates ride the sink's producer staging (the real
+        // NFR-15 path). The synchronous test drives the sync coalesced publish.
         assert_eq!(
-            store.apply_quote(&update),
-            MergeOutcome::Applied,
-            "the streaming quote folds into its row at strike {strike} {style:?}",
+            sink.publish_coalesced(update),
+            crate::providers::SendState::Open,
+            "the overlay update is accepted by the bounded coalesced channel",
         );
     }
+    // Fold the coalesced result into the App through the real bridge pump.
+    bridge.pump(&mut app, |_command| {});
+    assert!(
+        app.dirty,
+        "the real-seam overlay fold changed store rows and marked the frame dirty"
+    );
+    app.mark_drawn();
+    // A second pump with no pending updates is a no-op — the coalescer delivered the
+    // whole overlay in one wakeup.
+    bridge.pump(&mut app, |_command| {});
+    assert!(
+        !app.dirty,
+        "no residual staged updates after the coalesced flush"
+    );
 
-    // RENDER the merged chain and assert the #19 end-to-end golden.
-    let live = live_ready(store, pid("deribit"));
-    assert_golden("chain", "deribit_btc_atm.txt", &render_chain_body(&live));
+    // RENDER the merged chain and assert the #19 end-to-end golden (byte-stable).
+    assert_golden(
+        "chain",
+        "deribit_btc_atm.txt",
+        &render_chain_body(live_of(&app)),
+    );
 }
 
 // =============================================================================
