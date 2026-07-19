@@ -2099,6 +2099,34 @@ mod tests {
         }
     }
 
+    /// The conformant `fills` batch **plus one trailing column the reader does not
+    /// know** — the shape a newer *minor* of `ironcondor.bundle.v1` emits (an added
+    /// optional/nullable field). The freeze's within-tag permissive rule
+    /// (`docs/04-replay-mode.md` §3, SEMVER.md) requires the reader to read the
+    /// documented columns **by projection** and ignore the extra, so such a bundle
+    /// still opens and loads (issue #56).
+    fn fills_batch_extra_column(n: usize) -> RecordBatch {
+        use std::sync::Arc;
+
+        use arrow_array::{ArrayRef, Int64Array};
+        use arrow_schema::{DataType, Field, Schema};
+
+        let base = fills_batch(n);
+        let mut fields: Vec<Field> = base
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.as_ref().clone())
+            .collect();
+        fields.push(Field::new("future_metric_cents", DataType::Int64, false));
+        let mut cols: Vec<ArrayRef> = base.columns().to_vec();
+        cols.push(Arc::new(Int64Array::from(vec![0_i64; n])));
+        match RecordBatch::try_new(Arc::new(Schema::new(fields)), cols) {
+            Ok(b) => b,
+            Err(e) => panic!("build extra-column fills batch: {e}"),
+        }
+    }
+
     fn equity_batch(n: usize) -> RecordBatch {
         use std::sync::Arc;
 
@@ -2488,6 +2516,96 @@ mod tests {
             BundleReader::open(dir.path()).is_ok(),
             "a newer-minor extra manifest field must still open (permissive)"
         );
+    }
+
+    // --- Compatibility freeze: the accepted-tag set is exactly `v1` (issue #56) --
+    //
+    // The reader accepts EXACTLY `ironcondor.bundle.v1` and rejects every other tag
+    // with `UnsupportedSchema` naming the (clamped) tag. Within the tag the read is
+    // permissive: a newer minor's extra optional column still opens, while a missing
+    // required column/table stays a hard `BundleError` (covered by
+    // `test_open_missing_table_is_missing_table` here and the `tables.rs` Schema/
+    // decode tests). The freeze itself — the pin, the gate, and the honest
+    // gated-on-upstream status — is `docs/04-replay-mode.md` §2/§5, SEMVER.md.
+
+    #[test]
+    fn test_schema_freeze_pin_is_exactly_v1() {
+        // The frozen tag is a canary: the pin is `ironcondor.bundle.v1` and nothing
+        // else. Changing it (adding/dropping a tag) is a coordinated cross-repo
+        // decision (a minor to add, a major to drop, SEMVER.md), so this const drift
+        // is a deliberate, reviewed edit — never accidental.
+        assert_eq!(SUPPORTED_SCHEMA, "ironcondor.bundle.v1");
+    }
+
+    #[test]
+    fn test_schema_gate_accepts_v1_rejects_fabricated_tags() {
+        // Accept EXACTLY the frozen tag.
+        let ok_dir = temp_bundle_dir();
+        write_bundle(
+            ok_dir.path(),
+            SUPPORTED_SCHEMA,
+            [1, 1, 1, 1],
+            [1, 1, 1, 1],
+            false,
+        );
+        assert!(
+            BundleReader::open(ok_dir.path()).is_ok(),
+            "the frozen tag `{SUPPORTED_SCHEMA}` must open"
+        );
+
+        // Reject every other tag — a bumped version, an unrelated format, a
+        // case-variant, and an empty tag — each with `UnsupportedSchema` echoing the
+        // offending (clamped) tag, never a partial read.
+        for bogus in [
+            "ironcondor.bundle.v2",
+            "ironcondor.bundle.v0",
+            "IRONCONDOR.BUNDLE.V1",
+            "totally.bogus.format",
+            "",
+        ] {
+            let dir = temp_bundle_dir();
+            write_bundle(dir.path(), bogus, [1, 1, 1, 1], [1, 1, 1, 1], false);
+            match BundleReader::open(dir.path()) {
+                Err(BundleError::UnsupportedSchema(tag)) => assert_eq!(
+                    tag, bogus,
+                    "the offending tag is echoed verbatim (short enough to be unclamped)"
+                ),
+                other => {
+                    panic!("a non-`v1` tag `{bogus}` must be UnsupportedSchema, got {other:?}")
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_extra_optional_column_still_opens_and_loads() {
+        // A bundle written by a newer MINOR of `v1` (an added optional column on
+        // `fills`) still opens AND loads clean end-to-end: the typed decode reads the
+        // documented columns by projection and ignores the extra one (§3, SEMVER.md).
+        let dir = temp_bundle_dir();
+        if let Err(e) = std::fs::write(
+            dir.path().join(MANIFEST_FILE),
+            manifest_json_with(SUPPORTED_SCHEMA, [3, 3, 3, 3], false),
+        ) {
+            panic!("write manifest: {e}");
+        }
+        let [(f0, _), (f1, _), (f2, _), (f3, _)] = TABLES;
+        write_record_batch(&dir.path().join(f0), &fills_batch_extra_column(3), false);
+        write_record_batch(&dir.path().join(f1), &equity_batch(3), false);
+        write_record_batch(&dir.path().join(f2), &positions_batch(3), false);
+        write_record_batch(&dir.path().join(f3), &greeks_batch(3), false);
+
+        let reader = match BundleReader::open(dir.path()) {
+            Ok(r) => r,
+            Err(e) => panic!("a newer-minor extra column must still open: {e}"),
+        };
+        match reader.load() {
+            Ok(loaded) => {
+                assert_eq!(loaded.fills.len(), 3, "the known columns still decode");
+                assert_eq!(loaded.equity.len(), 3);
+            }
+            Err(e) => panic!("a newer-minor extra column must still load: {e}"),
+        }
     }
 
     #[test]

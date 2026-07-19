@@ -14,6 +14,47 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- **The bundle-compatibility freeze against `ironcondor.bundle.v1`** (issue #56;
+  `src/replay/mod.rs`, `src/error.rs`, `tests/replay_bundle_fixtures.rs`,
+  `tests/common/sha256.rs`, `tests/fixtures/bundle/valid/SHA256SUMS`,
+  `docs/04-replay-mode.md` §2, `docs/TESTING.md` §6,
+  `docs/adr/0004-ironcondor-result-bundle-as-replay-format.md`). Freezes the set of
+  result-bundle `schema` tags the reader accepts, records the shared conformance
+  fixture's digest as the cross-repo handshake, and documents the coordinated
+  schema-change process — a new tag is a documented, cross-repo change, never a
+  unilateral drift on either side. The reader stays **read-only**, money stays
+  **integer cents**, and `run_id`/`metrics` stay **opaque** — the freeze relaxes
+  none of it.
+  - **The accepted-tag gate is exactly `{ "ironcondor.bundle.v1" }`.** The existing
+    `SUPPORTED_SCHEMA` pin is confirmed and covered by new tests: the gate accepts
+    exactly `v1` and rejects every other tag (a bumped version, an unrelated format,
+    a case-variant, an empty tag) with a typed `BundleError::UnsupportedSchema`
+    naming the (length-clamped) tag — never a partial render. A freeze-pin canary
+    asserts the const is `ironcondor.bundle.v1` so any drift is a reviewed edit. The
+    within-tag permissive rule is proven end-to-end: a newer-minor bundle with an
+    extra optional column still opens **and** loads, while a missing required
+    table/column stays a hard `BundleError` (`MissingTable`/`Schema`).
+  - **The conformance-fixture `sha256` is recorded and asserted.** A committed
+    `shasum -a 256`-format sidecar (`tests/fixtures/bundle/valid/SHA256SUMS`) pins
+    the digest of each of the five conformance-bundle files;
+    `test_conformance_fixture_sha256_is_frozen` recomputes and asserts them, so a
+    byte drift on either side fails a test rather than diverging silently. The
+    ignored regenerator refreshes the sidecar in lockstep. **No new dependency:** the
+    digest is computed by a self-contained, no-`sha2` SHA-256 (`tests/common/sha256.rs`)
+    verified against published NIST vectors and the system `shasum -a 256` — no
+    hashing crate is added to the tree.
+  - **`BundleError` is now `#[non_exhaustive]`.** Post-1.0 a new reject reason (a new
+    tag, a new integrity check) can land as a source-compatible addition; in-crate
+    match sites still exhaustiveness-check and downstream matches already carry the
+    mandatory wildcard arm, so no match site changed.
+  - **Honest status resolution.** `docs/04-replay-mode.md` §2's PROPOSED note is
+    resolved to the gated state — **frozen tag agreed, reader pinned, conformance
+    digest recorded; awaiting the upstream IronCondor writer release** — with no
+    fabricated cited frozen writer version. A new §2.4 documents the cross-repo
+    schema-change process (a new tag = coordinated ADR on both sides; ChainView adds
+    the new tag as a minor while still reading `v1`, drops `v1` only in a major; the
+    shared fixture regenerated in lockstep), and ADR-0004 records the freeze as an
+    implementation of its unchanged decision.
 - **The CLI / config / keybinding surface freeze and the SemVer CI machinery**
   (issue #55; `docs/SEMVER.md`, `docs/05-views-and-ux.md` §1/§3,
   `docs/07-configuration.md` §4, `.env.example`, `scripts/check-changelog.sh`,

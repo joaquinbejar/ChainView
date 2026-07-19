@@ -25,6 +25,8 @@
 
 #[path = "common/bundle_gen.rs"]
 mod bundle_gen;
+#[path = "common/sha256.rs"]
+mod sha256;
 
 use std::path::{Path, PathBuf};
 
@@ -43,6 +45,47 @@ fn corpus_root() -> PathBuf {
 /// The path of one committed fixture directory.
 fn fixture(name: &str) -> PathBuf {
     corpus_root().join(name)
+}
+
+// --- Cross-repo digest handshake (issue #56) ---------------------------------
+
+/// The digest sidecar committed inside the shared conformance bundle
+/// (`tests/fixtures/bundle/valid/SHA256SUMS`), in standard `shasum -a 256`
+/// format so it is checkable with `shasum -a 256 -c SHA256SUMS`.
+const SHA256SUMS: &str = "SHA256SUMS";
+
+/// The files whose bytes the cross-repo digest handshake pins, sorted — the four
+/// Parquet tables plus the manifest (`docs/04-replay-mode.md` §2,
+/// `docs/TESTING.md` §6). IronCondor's writer must emit a byte-identical bundle
+/// hashing to the digests recorded in [`SHA256SUMS`].
+const CONFORMANCE_FILES: [&str; 5] = [
+    "equity_curve.parquet",
+    "fills.parquet",
+    "greeks_attribution.parquet",
+    "manifest.json",
+    "positions.parquet",
+];
+
+/// Recompute the `valid/` bundle's per-file digests and (re)write [`SHA256SUMS`]
+/// in standard `shasum -a 256` format. Called by the ignored regenerator so the
+/// sidecar stays in lockstep with any deliberate fixture-byte change (a schema
+/// tag change regenerates the shared fixture on both repos in the same week —
+/// `docs/04-replay-mode.md` §2).
+fn write_sha256sums(valid_dir: &Path) {
+    let mut lines = String::new();
+    for name in CONFORMANCE_FILES {
+        let bytes = match std::fs::read(valid_dir.join(name)) {
+            Ok(b) => b,
+            Err(e) => panic!("read {name} for digest: {e}"),
+        };
+        lines.push_str(&sha256::sha256_hex(&bytes));
+        lines.push_str("  ");
+        lines.push_str(name);
+        lines.push('\n');
+    }
+    if let Err(e) = std::fs::write(valid_dir.join(SHA256SUMS), lines) {
+        panic!("write {SHA256SUMS}: {e}");
+    }
 }
 
 // --- Load helpers (no unwrap/expect/indexing per the ruleset) ----------------
@@ -82,7 +125,11 @@ fn load_ok(name: &str) -> LoadedBundle {
 #[ignore = "writes the committed fixture corpus; run explicitly to regenerate"]
 fn regenerate_committed_fixtures() {
     let root = corpus_root();
-    bundle_gen::write_valid(&root.join("valid"));
+    let valid = root.join("valid");
+    bundle_gen::write_valid(&valid);
+    // Refresh the cross-repo digest sidecar in lockstep with the fixture bytes it
+    // pins (issue #56); `write_valid` clears the directory first, so this runs after.
+    write_sha256sums(&valid);
     bundle_gen::write_bad_schema(&root.join("bad_schema"));
     bundle_gen::write_missing_table(&root.join("missing_table"));
     bundle_gen::write_oversized_footer(&root.join("oversized_footer"));
@@ -164,6 +211,53 @@ fn test_valid_bundle_load_is_deterministic() {
     let b = load_ok("valid");
     assert_eq!(a, b, "loading the committed bytes twice must be identical");
     assert_eq!(compare_bundles(&a, &b), Ok(()));
+}
+
+#[test]
+fn test_conformance_fixture_sha256_is_frozen() {
+    // The cross-repo handshake ChainView commits to: the shared conformance
+    // bundle's per-file sha256 is recorded in `valid/SHA256SUMS`, and recomputing it
+    // from the committed bytes must match. A drift on EITHER side — a regenerated
+    // fixture whose bytes changed without refreshing the sidecar, or a stale sidecar
+    // — fails here rather than diverging silently. IronCondor's writer must emit a
+    // byte-identical bundle hashing to these values (issue #56, `docs/TESTING.md` §6,
+    // `docs/04-replay-mode.md` §2). The digest is computed by the no-dependency
+    // hasher in `common/sha256.rs` (verified against published NIST vectors), so no
+    // `sha2` dependency is added.
+    let valid = fixture("valid");
+    let sums = match std::fs::read_to_string(valid.join(SHA256SUMS)) {
+        Ok(s) => s,
+        Err(e) => panic!("read {SHA256SUMS}: {e}"),
+    };
+
+    let mut seen: Vec<&str> = Vec::new();
+    for line in sums.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let (hex, name) = match line.split_once("  ") {
+            Some(pair) => pair,
+            None => panic!("malformed {SHA256SUMS} line: `{line}`"),
+        };
+        let bytes = match std::fs::read(valid.join(name)) {
+            Ok(b) => b,
+            Err(e) => panic!("read {name} for digest: {e}"),
+        };
+        let actual = sha256::sha256_hex(&bytes);
+        assert_eq!(
+            actual, hex,
+            "sha256 drift for `{name}`: the committed fixture bytes no longer match \
+             the frozen digest — regenerate the corpus AND {SHA256SUMS} in lockstep, \
+             or reconcile against IronCondor's writer output"
+        );
+        seen.push(name);
+    }
+    seen.sort_unstable();
+    let expected: Vec<&str> = CONFORMANCE_FILES.to_vec();
+    assert_eq!(
+        seen, expected,
+        "{SHA256SUMS} must pin exactly the five conformance-bundle files"
+    );
 }
 
 // =====================================================================
