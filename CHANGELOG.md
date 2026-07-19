@@ -14,6 +14,59 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- The PUBLIC, semver-governed **provider port** (`src/providers/mod.rs`, issue #6):
+  the `#[async_trait] Provider: Send + Sync` trait (`id` / `capabilities` /
+  `discover` / `fetch_chain` / `subscribe`) an external adapter compiles against
+  to plug in its own venue (`docs/03-data-providers.md` §2, §11.1, ADR-0006). The
+  `#[non_exhaustive] ProviderCapabilities` capability self-declaration with its
+  `ProviderCapabilitiesBuilder` — the ONLY cross-crate construction path — plus
+  the `#[non_exhaustive]` dimension enums `ChainCapability` (Native / Assemble /
+  Partial / None), `GreeksCapability` (Provided / ComputedLocally / None),
+  `OptionStreamCapability` (None / SymbolOnly{verified} / ChainQuotes{verified}),
+  `ChainPollCapability` (None / Poll{interval_hint_secs: u32}), and `AuthKind`
+  (None / Token / KeySecret / UserPass). Streaming is **three independent
+  dimensions** (`option_stream` / `underlying_stream` / `chain_poll`) so a
+  real-time underlying is never mis-badged as a real-time option chain; every
+  dimension defaults to its least-capable variant, so a future field lands with a
+  safe default and keeps external adapters compiling and honest
+  (`docs/SEMVER.md`). The port helper types `UnderlyingRef`,
+  `SubscriptionRequest`, and the drop-cancels `SubscriptionHandle` (a `Send`
+  cancel closure so the port stays agnostic to the adapter's cancellation
+  mechanism). The `async_trait` per-call allocation is accepted and doc-noted —
+  provider methods are cold-path, the hot render loop holds no `dyn Provider`.
+- The named fetch artifact (`src/chain/fetch.rs`, issue #6): `ChainFetch { chain,
+  expiry_source, aliases }` — the artifact `Provider::fetch_chain` returns,
+  **never** a bare `OptionChain`, so the poll leg preserves the absolute-UTC
+  expiry/source identity (`ExpirySource { underlying, expiration_utc, provider }`)
+  and the per-leg `AliasCatalog` the merge/subscription/resubscription/DXLink
+  overlay joins need (`docs/01-domain-model.md` §6, `docs/03-data-providers.md`
+  §2, §4). `AliasCatalog` maps the provider-agnostic `InstrumentKey` to each
+  feed's `Instrument` (native + stream symbols + spec fingerprint) with
+  `instrument()`, `resolve_symbol()` (native AND stream symbol → shared key), and
+  `overlay_compatible()` — the cross-provider economic-equivalence gate returning
+  `Result<(), OverlayError>` with the **real `ContractSpecFingerprint`
+  comparison** wired (first disagreeing dimension → `OverlayError::SpecMismatch`;
+  the within-provider merge is a no-op; the store-level *invocation* lands in #7).
+  These are DOMAIN types (the trait emits them, the future `ChainStore` consumes
+  them) defined in `src/chain/*` and re-exported through the port surface so the
+  module graph stays acyclic (port → domain, never domain → port,
+  `docs/03-data-providers.md` §12). Now that `AliasCatalog` and a trivial
+  `ChainSource` (Poll / Stream / Merged) enum exist, the forward-declared
+  `ChainSnapshot` (issue #5) gains its documented `aliases: AliasCatalog` and
+  `source: ChainSource` fields (the store LOGIC that drives them still lands in
+  #7). The full port surface — trait, capabilities + builder + enums,
+  `ChainFetch`/`ExpirySource`/`AliasCatalog`, and the helper types — is
+  re-exported from the crate root. Adds two runtime dependencies (audit notes):
+  - `async-trait` `0.1` — object-safe `async fn` methods on the `Provider` trait
+    (the port must be `dyn`-dispatched via the `ProviderRegistry`, issue #12).
+    The per-call box allocation is cold-path only. Ubiquitous, `RUSTSEC`-clean;
+    the standard way to express an object-safe async trait on stable Rust.
+  - `tokio` `1` (`default-features = false`, `features = ["sync"]`) — only
+    `tokio::sync::mpsc::Sender<MarketUpdate>` for the `subscribe` bounded fan-in
+    channel (`docs/03-data-providers.md` §5). Minimal features: **no** runtime /
+    macros / net yet — the full runtime features land with the adapters and app
+    loop in later issues. `RUSTSEC`-clean; the mandated async runtime
+    (`rules/global_rules.md` "Concurrency").
 - Normalized streaming update events and freshness clocks
   (`src/chain/events.rs`, issue #5): the DOMAIN payloads a provider emits across
   the seam (`docs/01-domain-model.md` §5 and §5.1). `QuoteUpdate` (bid/ask/last/

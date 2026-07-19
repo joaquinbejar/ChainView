@@ -24,7 +24,10 @@
 use std::time::Duration;
 
 use chainview::config::{CliOverrides, Config, EnvSource, decode_segment, encode_segment};
-use chainview::{ConfigError, ProviderId};
+use chainview::{
+    AuthKind, ChainCapability, ChainPollCapability, ConfigError, GreeksCapability,
+    OptionStreamCapability, ProviderCapabilities, ProviderId,
+};
 use proptest::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -183,5 +186,95 @@ proptest! {
             (false, Ok(_)) => prop_assert!(false, "out-of-range tick accepted: {}ms", ms),
             (_, Err(other)) => prop_assert!(false, "unexpected error variant: {}", other),
         }
+    }
+}
+
+// --- Provider-capability builder totality (`capabilities_total`-adjacent) -----
+//
+// The `capabilities_total` invariant (`docs/TESTING.md` §3) requires every
+// registered provider to return a COMPLETE `ProviderCapabilities`. The registry
+// lands in issue #12; the adjacent property provable at the port here is that the
+// builder ALWAYS yields a complete capability set — for arbitrary values of every
+// dimension, `build()` populates all eight fields with exactly the values set, so
+// no field can be left indeterminate. This is what makes the builder the safe,
+// total, cross-crate construction path.
+
+fn chain_capability_strategy() -> impl Strategy<Value = ChainCapability> {
+    prop_oneof![
+        Just(ChainCapability::Native),
+        Just(ChainCapability::Assemble),
+        Just(ChainCapability::Partial),
+        Just(ChainCapability::None),
+    ]
+}
+
+fn greeks_capability_strategy() -> impl Strategy<Value = GreeksCapability> {
+    prop_oneof![
+        Just(GreeksCapability::Provided),
+        Just(GreeksCapability::ComputedLocally),
+        Just(GreeksCapability::None),
+    ]
+}
+
+fn option_stream_strategy() -> impl Strategy<Value = OptionStreamCapability> {
+    prop_oneof![
+        Just(OptionStreamCapability::None),
+        any::<bool>().prop_map(|verified| OptionStreamCapability::SymbolOnly { verified }),
+        any::<bool>().prop_map(|verified| OptionStreamCapability::ChainQuotes { verified }),
+    ]
+}
+
+fn chain_poll_strategy() -> impl Strategy<Value = ChainPollCapability> {
+    prop_oneof![
+        Just(ChainPollCapability::None),
+        any::<u32>()
+            .prop_map(|interval_hint_secs| ChainPollCapability::Poll { interval_hint_secs }),
+    ]
+}
+
+fn auth_kind_strategy() -> impl Strategy<Value = AuthKind> {
+    prop_oneof![
+        Just(AuthKind::None),
+        Just(AuthKind::Token),
+        Just(AuthKind::KeySecret),
+        Just(AuthKind::UserPass),
+    ]
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 1024, max_shrink_iters: 50_000, ..ProptestConfig::default() })]
+
+    /// For any values of the eight dimensions, `ProviderCapabilities::builder`
+    /// yields a complete capability set whose fields equal exactly what was set —
+    /// the builder never leaves a dimension indeterminate.
+    #[test]
+    fn prop_capabilities_builder_yields_complete_set(
+        chain in chain_capability_strategy(),
+        depth in any::<bool>(),
+        greeks in greeks_capability_strategy(),
+        option_stream in option_stream_strategy(),
+        underlying_stream in any::<bool>(),
+        chain_poll in chain_poll_strategy(),
+        trades_tape in any::<bool>(),
+        auth in auth_kind_strategy(),
+    ) {
+        let caps = ProviderCapabilities::builder()
+            .chain(chain)
+            .depth(depth)
+            .greeks(greeks)
+            .option_stream(option_stream)
+            .underlying_stream(underlying_stream)
+            .chain_poll(chain_poll)
+            .trades_tape(trades_tape)
+            .auth(auth)
+            .build();
+        prop_assert_eq!(caps.chain, chain);
+        prop_assert_eq!(caps.depth, depth);
+        prop_assert_eq!(caps.greeks, greeks);
+        prop_assert_eq!(caps.option_stream, option_stream);
+        prop_assert_eq!(caps.underlying_stream, underlying_stream);
+        prop_assert_eq!(caps.chain_poll, chain_poll);
+        prop_assert_eq!(caps.trades_tape, trades_tape);
+        prop_assert_eq!(caps.auth, auth);
     }
 }

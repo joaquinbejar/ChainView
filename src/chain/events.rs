@@ -55,6 +55,7 @@ use chrono::{DateTime, Utc};
 use optionstratlib::chains::chain::OptionChain;
 use optionstratlib::prelude::{Decimal, Positive};
 
+use super::fetch::AliasCatalog;
 use super::identity::{Instrument, ProviderId};
 
 // --- Streaming events (§5) ---------------------------------------------------
@@ -190,10 +191,12 @@ pub struct DepthLevel {
 /// by the compiler.
 ///
 /// The [`Chain`](MarketUpdate::Chain) and [`Health`](MarketUpdate::Health)
-/// variants reference the store types [`ChainSnapshot`] and [`StreamHealth`],
-/// which are **thin forward declarations** in this module (see their docs);
-/// their full form and the store logic that produces them land with the chain
-/// store in issues #6/#7.
+/// variants reference the store types [`ChainSnapshot`] and [`StreamHealth`].
+/// [`ChainSnapshot`]'s data shape is complete as of issue #6 (its `aliases` and
+/// `source` fields landed with [`AliasCatalog`] and [`ChainSource`]);
+/// [`StreamHealth`] remains a thin forward declaration. The store **logic** that
+/// produces both — the poll→stream merge and the health machine — lands with the
+/// chain store in issue #7.
 #[derive(Debug, Clone)]
 pub enum MarketUpdate {
     /// A quote refresh for one instrument (§5).
@@ -209,15 +212,18 @@ pub enum MarketUpdate {
     Health(ProviderId, StreamHealth),
 }
 
-// --- Thin forward declarations completed by the chain store (#6/#7) ----------
+// --- Store types (data shape here; the store LOGIC lands in #7) ---------------
 
-/// **Thin forward declaration** of the streaming-current chain snapshot
-/// (`docs/01-domain-model.md` §6), landed here so [`MarketUpdate::Chain`] can be
-/// a closed variant. Its full form is **completed with the chain store in
-/// issues #6/#7**, which add the per-leg `aliases: AliasCatalog` (native/stream
-/// symbols for subscribe/resubscribe/join) and the `source: ChainSource`
-/// (`Poll | Stream | Merged`) fields; they may also relocate this type into the
-/// store module. Only the self-contained fields are declared now.
+/// The streaming-current chain snapshot (`docs/01-domain-model.md` §6), landed
+/// here so [`MarketUpdate::Chain`] can be a closed variant.
+///
+/// Issue #6 completed its `aliases` and `source` fields now that
+/// [`AliasCatalog`] and [`ChainSource`] exist. It is assembled from a
+/// [`ChainFetch`](super::fetch::ChainFetch), carrying the SAME `AliasCatalog`
+/// forward with no copy or re-derivation. The store LOGIC that produces and
+/// mutates a `ChainSnapshot` — the poll→stream merge, the watermark/staleness
+/// transitions, and the health machine — lands with the `ChainStore` in issue
+/// #7, which may relocate this type into the store module.
 #[derive(Debug, Clone)]
 pub struct ChainSnapshot {
     /// `(source provider, underlying, absolute-UTC expiry)` — the chain's
@@ -226,10 +232,35 @@ pub struct ChainSnapshot {
     pub chain_key: (ProviderId, String, DateTime<Utc>),
     /// The normalized `optionstratlib` chain — the source of truth.
     pub chain: OptionChain,
+    /// The per-leg native+stream alias catalog carried forward from the
+    /// [`ChainFetch`](super::fetch::ChainFetch) the poll leg returned — for
+    /// subscribe/resubscribe/join (`docs/01-domain-model.md` §6,
+    /// `docs/03-data-providers.md` §4).
+    pub aliases: AliasCatalog,
+    /// How the chain is being kept current ([`ChainSource`]). The store (#7) sets
+    /// it from the active merge.
+    pub source: ChainSource,
     /// How current the chain is ([`StreamHealth`]).
     pub health: StreamHealth,
     /// The wall-time of the last full poll, or `None` before the first poll.
     pub last_full_poll: Option<DateTime<Utc>>,
+}
+
+/// How a [`ChainSnapshot`] is being kept current (`docs/01-domain-model.md` §6).
+///
+/// A pure data enum here; the store (issue #7) sets it from the active merge.
+/// `Merged` means a REST poll seeded the strikes and a stream overlays
+/// quotes/Greeks (the tastytrade and Alpaca case,
+/// `docs/03-data-providers.md` §4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ChainSource {
+    /// Kept current by REST polling only.
+    Poll,
+    /// Kept current by a live stream only.
+    Stream,
+    /// A REST poll seeds the strikes and a stream overlays quotes/Greeks.
+    Merged,
 }
 
 /// **Thin forward declaration** of the stream connection health
@@ -533,6 +564,8 @@ mod tests {
         let snapshot = ChainSnapshot {
             chain_key: (pid("deribit"), "BTC".to_owned(), utc(1_700_000_000)),
             chain: OptionChain::new("BTC", pos(60_000.0), "2025-06-27".to_owned(), None, None),
+            aliases: AliasCatalog::new(),
+            source: ChainSource::Poll,
             health: StreamHealth::Live,
             last_full_poll: Some(utc(1_700_000_100)),
         };
@@ -541,6 +574,8 @@ mod tests {
             MarketUpdate::Chain(c) => {
                 assert_eq!(c.chain.symbol, "BTC");
                 assert_eq!(c.chain_key.1, "BTC");
+                assert_eq!(c.source, ChainSource::Poll);
+                assert!(c.aliases.is_empty());
             }
             other => panic!("expected Chain, got {other:?}"),
         }

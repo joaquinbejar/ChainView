@@ -19,15 +19,26 @@ pub(crate) mod providers;
 pub(crate) mod ui;
 
 pub use chain::{
-    CHAIN_STALE_SLACK, ChainSnapshot, ContractSpecFingerprint, DIRECTION_DECAY, DepthLadder,
-    DepthLevel, ExerciseStyle, FEED_DELAY_WARN, GREEKS_STALE_AFTER, GreeksOrigin, GreeksRow,
-    Instrument, InstrumentKey, MarketUpdate, ProviderId, QUOTE_STALE_AFTER, QuoteUpdate,
-    RESERVED_PROVIDER_IDS, SettlementStyle, StreamHealth, chain_stale_after,
+    AliasCatalog, CHAIN_STALE_SLACK, ChainFetch, ChainSnapshot, ChainSource,
+    ContractSpecFingerprint, DIRECTION_DECAY, DepthLadder, DepthLevel, ExerciseStyle, ExpirySource,
+    FEED_DELAY_WARN, GREEKS_STALE_AFTER, GreeksOrigin, GreeksRow, Instrument, InstrumentKey,
+    MarketUpdate, ProviderId, QUOTE_STALE_AFTER, QuoteUpdate, RESERVED_PROVIDER_IDS,
+    SettlementStyle, StreamHealth, chain_stale_after,
 };
 pub use config::{CliOverrides, Config, ModeSelect, ProviderSettings, ThemeChoice};
 pub use error::{
     BundleError, ChainViewError, ConfigError, NormalizeKind, OverlayError, ProviderError, Redacted,
     RegistryError, TransportDetail, TransportKind,
+};
+// The PUBLIC, semver-governed provider port surface (`docs/03-data-providers.md`
+// §2, §11.1): the trait, the capability self-declaration + its builder + every
+// dimension enum, and the port helper types. The emitted domain types
+// (`ChainFetch`/`ExpirySource`/`AliasCatalog`, `MarketUpdate`, `ProviderError`,
+// `ProviderId`) are re-exported above from their home layers.
+pub use providers::{
+    AuthKind, ChainCapability, ChainPollCapability, GreeksCapability, OptionStreamCapability,
+    Provider, ProviderCapabilities, ProviderCapabilitiesBuilder, SubscriptionHandle,
+    SubscriptionRequest, UnderlyingRef,
 };
 // The domain speaks `optionstratlib`'s numeric vocabulary
 // (`docs/01-domain-model.md` §3–§4); re-export the two types that appear on the
