@@ -48,6 +48,12 @@ use tokio::sync::mpsc;
 use crate::chain::{ChainFetch, Instrument, MarketUpdate, ProviderId};
 use crate::error::ProviderError;
 
+/// The Deribit adapter — the zero-config, public-data poll leg (issue #15,
+/// `docs/03-data-providers.md` §7.1). Crate-internal: it is registered through
+/// [`ChainViewAppBuilder::with_builtins`](crate::ChainViewAppBuilder), never
+/// named on the public surface, so no raw `deribit-http` DTO crosses the port.
+pub(crate) mod deribit;
+
 /// The seam every adapter implements: one trait, one adapter per provider id
 /// (`docs/03-data-providers.md` §2).
 ///

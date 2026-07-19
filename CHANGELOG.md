@@ -14,6 +14,66 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- The Deribit adapter chain assembly, normalization, and honest capabilities
+  (`src/providers/deribit.rs`, issue #15; `docs/03-data-providers.md` §7.1, §3,
+  §8, ADR-0003) — the zero-config, public-data poll leg and the first provider
+  wired end-to-end. Key behaviours:
+  - **Chain assembly from an instrument list (no chain endpoint).** `fetch_chain`
+    wraps `deribit-http` `get_instruments(currency, "option")` for structure and
+    `get_ticker(instrument)` for mark/IV/Greeks, filters to the requested expiry
+    day, and assembles one `optionstratlib::OptionChain` — call and put at each
+    strike collapse into one `OptionData` row — returning the named `ChainFetch`
+    with its per-leg `AliasCatalog` (native `instrument_name` + the Deribit
+    `ContractSpecFingerprint`) and absolute-UTC `ExpirySource`. Per-contract
+    tickers are hydrated with **bounded concurrency** (a `tokio::task::JoinSet`
+    capped at 16 in-flight requests), so a large expiry meets the
+    startup-to-first-chain budget without a sequential round-trip per instrument
+    and without hammering the venue rate limiter (ADR-0007,
+    `docs/06-performance.md`); assembly stays order-independent (grouped by
+    strike). A per-ticker failure degrades that leg only, never the whole chain.
+    `discover` lists the venue's currencies as underlyings. Public data needs
+    **no credentials** (the adapter drives `HttpConfig::production()`), so it is
+    the zero-config default.
+  - **Field-specific numeric normalization at the `f64` seam.** Prices/IV/sizes
+    become `Positive`, Greeks become `Decimal`, each checked before it enters the
+    domain (CLAUDE.md "Governance precedence" item 2): Deribit IV is
+    percentage-form and divided by 100 (`49.22` → `0.4922`); a zero bid is a real
+    zero; a zero ask on a non-zero bid or any `ask < bid` is crossed and rejects
+    the whole quote; a `NaN`/`Inf`/negative price/IV/Greek is dropped, never
+    becoming a fabricated value; and only a payload that cannot yield a valid
+    strike/style/expiry rejects the row as a typed `ProviderError::Normalize`
+    naming the field.
+  - **Symbol + direct-UTC expiry mapping.** A Deribit `instrument_name`
+    (`BTC-27JUN25-60000-C`) maps to the provider-agnostic `InstrumentKey`; expiry
+    is the direct UTC instant from the instrument's millisecond timestamp (or the
+    `DDMMMYY` date code resolved to 08:00 UTC settlement), never a relative
+    offset. Upstream errors map to a redaction-safe `ProviderError` by category
+    only — no URL, body, or token is interpolated.
+  - **Honest capabilities + honest streaming stub.** `capabilities()` matches the
+    §8 Deribit row exactly (`chain: Assemble`, `depth: true`, `greeks: Provided`,
+    `option_stream: ChainQuotes { verified: false }`, `underlying_stream: true`,
+    `chain_poll: Poll`, `trades_tape: false`, `auth: None`). `subscribe` returns
+    `Unsupported` — the streaming overlay + reconnect loop is issue #16. Raw
+    `deribit-http` DTOs never leave the adapter.
+  - **Registered through `with_builtins`.** `ChainViewAppBuilder::with_builtins`
+    now registers the real Deribit adapter under the reserved `deribit` id (via a
+    new `register_builtin` helper that expects the reserved id), so
+    `builder().with_builtins().run()` resolves the Deribit live source instead of
+    reporting an empty registry.
+- **`deribit-http` `0.7.1`** (`[dependencies]`, issue #15) — the upstream Deribit
+  REST client ChainView wraps for the poll leg; the JSON-RPC-over-HTTP protocol
+  lives upstream and is never reimplemented here.
+  - **Audit note (supply-chain).** An explicit-approval dependency addition
+    (CLAUDE.md "Coding Rules"). It pulls `reqwest` (with its default TLS),
+    `tokio` (feature-unified toward `full`), `serde_json`, request-signing crates
+    (`hmac`/`sha2`/`base64`, unused on the public path), `url`, `serde_with`,
+    `rand`, and `dotenv`. No `rustls` crypto-provider install is needed — the
+    HTTP client relies on `reqwest`'s default TLS and exposes no
+    `install_default_crypto_provider`; any provider install belongs to the
+    websocket path (issue #16), and no live TLS handshake runs in the test suite.
+    `deribit-websocket` (streaming) is a separate, deferred addition (#16). The
+    public data path requires no credential and logs none; the public endpoints
+    send none.
 - The single-source keybinding map, the modal help overlay, the auto/dark/light
   theme, the truthful status bar / keybar, and the `NO_COLOR` fallback
   (`src/app/keymap.rs` + `src/ui/theme.rs`, issue #14; `docs/05-views-and-ux.md`
