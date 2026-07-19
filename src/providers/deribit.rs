@@ -145,6 +145,17 @@ const JITTER_MAGNITUDE: f64 = 0.2;
 /// large `attempt` would otherwise reach.
 const BACKOFF_MAX_SHIFT: u32 = 20;
 
+/// How often the streaming loop retries a producer-staged flush while the feed
+/// is quiet. A value coalesced onto a full channel would otherwise wait for the
+/// next `publish` to flush it — and after a burst subsides that notification may
+/// never come, stranding the freshest quote/greeks/depth exactly when the user
+/// is watching a now-stale "latest". A bounded tick delivers it instead. The
+/// cadence sits well within the render loop's 16 ms/60 fps frame budget, so a
+/// staged value reaches the consumer by the next frame; the tick only arms while
+/// a value is staged, so an idle stream never wakes
+/// (`docs/02-tui-architecture.md` §5).
+const STAGING_FLUSH_INTERVAL: Duration = Duration::from_millis(10);
+
 // ---------------------------------------------------------------------------
 // The adapter.
 // ---------------------------------------------------------------------------
@@ -1334,6 +1345,14 @@ impl ProducerStaging {
         }
     }
 
+    /// True while any instrument still holds a staged value awaiting a free
+    /// channel slot. Gates the streaming loop's flush tick so an idle stream
+    /// (nothing staged) never wakes, while a burst residue is retried until it
+    /// drains.
+    fn has_pending(&self) -> bool {
+        self.slots.values().any(StagedInstrument::has_any)
+    }
+
     /// Flush the staged current values onto `tx`, retaining the map allocation.
     /// Stops sending once the channel is full (leaving the rest staged) and
     /// reports a closed channel.
@@ -1521,10 +1540,24 @@ async fn connect_stream_once(
 
     let lookup = instrument_lookup(instruments);
     let mut staging = ProducerStaging::new();
+    // The producer flushes staged values at the start of the next `publish`, but
+    // once a burst subsides and the feed goes quiet no further `publish` arrives
+    // to drain the freshest staged value. A bounded tick flushes it instead, so
+    // the latest quote/greeks/depth is delivered promptly after capacity frees
+    // rather than stranded. The tick is gated on `has_pending`, so an idle stream
+    // never wakes; `Delay` keeps a post-idle re-arm from firing a catch-up burst.
+    let mut flush_tick = tokio::time::interval(STAGING_FLUSH_INTERVAL);
+    flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         let message = tokio::select! {
             biased;
             () = cancel.cancelled() => return StreamExit::Shutdown,
+            _ = flush_tick.tick(), if staging.has_pending() => {
+                if staging.flush(tx) == SendState::Closed {
+                    return StreamExit::Shutdown; // consumer gone
+                }
+                continue;
+            }
             message = client.receive_message() => message,
         };
         let text = match message {
@@ -2889,6 +2922,57 @@ mod tests {
                 .and_then(|(_, bid)| bid),
             Some(pos(3.0)),
             "the freshest staged value survived, not the intermediate 2.0"
+        );
+    }
+
+    #[test]
+    fn test_deribit_producer_staging_flush_delivers_freshest_after_quiet() {
+        // A burst saturates the cap-1 channel and coalesces two overwrites into
+        // the staging slot, then the feed goes QUIET: no further `publish`
+        // arrives to flush it. The streaming loop's flush tick (here `flush`,
+        // the method the tick drives) must still deliver the FRESHEST staged
+        // value once capacity frees, so the latest quote is never stranded when
+        // the user is watching a now-stale "latest" (Codex review, PR #74).
+        let (tx, mut rx) = mpsc::channel::<MarketUpdate>(1);
+        let mut staging = ProducerStaging::new();
+        // Fill the cap-1 channel (1.0 sent), then stage two overwrites: freshest
+        // wins per kind, so 3.0 sits in staging, 2.0 is superseded.
+        assert_eq!(
+            staging.publish(&tx, quote_update(100.0, 1.0)),
+            SendState::Open
+        );
+        assert_eq!(
+            staging.publish(&tx, quote_update(100.0, 2.0)),
+            SendState::Open
+        );
+        assert_eq!(
+            staging.publish(&tx, quote_update(100.0, 3.0)),
+            SendState::Open
+        );
+        assert!(staging.has_pending(), "the burst left a value staged");
+        // The feed goes quiet: the consumer drains the already-sent 1.0, freeing
+        // capacity. NO further `publish` will arrive.
+        let sent = drain_channel(&mut rx);
+        assert_eq!(sent.len(), 1);
+        // The tick-driven flush (not a next publish) delivers the freshest value.
+        assert_eq!(staging.flush(&tx), SendState::Open);
+        let after = drain_channel(&mut rx);
+        assert_eq!(
+            after.len(),
+            1,
+            "flush-on-tick delivers the staged value with no further publish"
+        );
+        assert_eq!(
+            after
+                .first()
+                .and_then(quote_strike_bid)
+                .and_then(|(_, bid)| bid),
+            Some(pos(3.0)),
+            "the freshest staged value (3.0) reached the channel after the feed went quiet"
+        );
+        assert!(
+            !staging.has_pending(),
+            "nothing remains staged once the tick flush drains the slot"
         );
     }
 
