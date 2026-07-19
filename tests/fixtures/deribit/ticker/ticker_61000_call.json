@@ -1,0 +1,43 @@
+{
+  "instrument_name": "BTC-27JUN25-61000-C",
+  "last_price": 0.032,
+  "mark_price": 0.0331,
+  "best_bid_price": 0.03,
+  "best_ask_price": 0.04,
+  "best_bid_amount": 4.0,
+  "best_ask_amount": 7.0,
+  "volume": 15.0,
+  "volume_usd": 907500.0,
+  "open_interest": 28.0,
+  "high": 0.05,
+  "low": 0.025,
+  "price_change": 0.3,
+  "price_change_percentage": 6.0,
+  "bid_iv": 49.6,
+  "ask_iv": 51.4,
+  "mark_iv": 50.5,
+  "timestamp": 1751011200000,
+  "state": "open",
+  "settlement_price": 0.033,
+  "stats": {
+    "volume": 15.0,
+    "volume_usd": 907500.0,
+    "price_change": 0.3,
+    "high": 0.05,
+    "low": 0.025
+  },
+  "greeks": {
+    "delta": 0.42,
+    "gamma": 0.0001,
+    "vega": 9.1,
+    "theta": -10.2,
+    "rho": 6.4
+  },
+  "index_price": 61000.0,
+  "min_price": 0.001,
+  "max_price": 0.2,
+  "interest_rate": 0.0,
+  "underlying_price": 60500.0,
+  "underlying_index": "index_price",
+  "estimated_delivery_price": 60400.0
+}

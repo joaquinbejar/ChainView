@@ -48,6 +48,14 @@ pub mod replay;
 pub mod surface;
 pub mod theme;
 
+// The render-golden test support (#19): render a screen into a fixed-size
+// `TestBackend`, capture the buffer as text, and compare against — or, under
+// `UPDATE_GOLDENS=1`, rewrite — a committed golden under
+// `tests/render/golden/` (`docs/TESTING.md` §4). Test-only, so it never rides in
+// the release binary.
+#[cfg(test)]
+pub(crate) mod golden;
+
 // ---------------------------------------------------------------------------
 // The root layout: status bar (top), screen body (middle), hint line (bottom).
 // ---------------------------------------------------------------------------

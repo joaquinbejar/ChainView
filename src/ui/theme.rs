@@ -410,12 +410,57 @@ pub(crate) fn spinner_frame(tick: u64) -> char {
     SPINNER_FRAMES.get(idx).copied().unwrap_or(' ')
 }
 
-/// Strip control/escape characters from a venue- or user-controlled string before
-/// it reaches the render edge (`docs/SECURITY.md` terminal escape-sequence
-/// hygiene). Applied only to short, display-only strings on the status line.
+/// The visible placeholder a neutralized control/introducer scalar is replaced
+/// with, so a stripped byte reads as a deliberate "removed" glyph rather than
+/// vanishing silently (`docs/SECURITY.md` §6.4). `U+FFFD` sits above the C1 range
+/// and is a single display column, so the placeholder can neither re-introduce an
+/// unsafe byte nor widen a cell.
+pub(crate) const SANITIZE_PLACEHOLDER: char = '\u{FFFD}';
+
+/// Whether `c` is a terminal-unsafe control scalar: a **C0** control
+/// (`0x00..=0x1F`, including `TAB`/`LF`/`CR` and the `ESC` `0x1B` introducer),
+/// `DEL` (`0x7F`), or a **C1** control (`0x80..=0x9F`, including the 8-bit `CSI`
+/// `0x9B` / `OSC` `0x9D` / `DCS` `0x90` introducers).
+///
+/// Equivalent to [`char::is_control`], but spelled out over explicit code-point
+/// ranges so the escape-hygiene coverage is auditable directly against
+/// `docs/SECURITY.md` §6.4.
 #[must_use]
-fn sanitize(raw: &str) -> String {
-    raw.chars().filter(|c| !c.is_control()).collect()
+fn is_unsafe_control(c: char) -> bool {
+    let cp = c as u32;
+    cp < 0x20 || cp == 0x7f || (0x80..=0x9f).contains(&cp)
+}
+
+/// Neutralize a venue- or user-controlled string for the render edge
+/// (`docs/SECURITY.md` §6.4 terminal escape-sequence hygiene): every C0/C1 control
+/// and every escape introducer (`ESC`/`CSI`/`OSC`/`DCS`, 7-bit **and** 8-bit) is
+/// replaced with a visible [`SANITIZE_PLACEHOLDER`], so a hostile instrument name,
+/// symbol, or venue error string renders as **inert visible text** — never a
+/// cursor move, a title change, a clipboard write (`OSC 52`), or a torn matrix
+/// layout (a `TAB`/`LF` cannot break a row).
+///
+/// Because a terminal only enters escape-processing on an **introducer** byte —
+/// all of which are C0/C1 controls — replacing every introducer leaves the
+/// residual bytes as inert printable text; the sanitizer therefore neutralizes a
+/// whole `ESC`-prefixed sequence (`\x1b]52;c;…\x07`, `\x1b[2J`, …) without parsing
+/// it. It is a **pure** helper, unit- and property-testable independent of a
+/// rendered frame, and is the single sanitizer every venue-string render edge
+/// routes through (the status bar, keybar/hint, and the chain matrix's
+/// title/symbol/expiry/message).
+///
+/// It does **not** touch ChainView's own styling or the `NO_COLOR` markers
+/// (`docs/SECURITY.md` §6.4) — those bytes are not venue-controlled.
+#[must_use]
+pub(crate) fn sanitize(raw: &str) -> String {
+    raw.chars()
+        .map(|c| {
+            if is_unsafe_control(c) {
+                SANITIZE_PLACEHOLDER
+            } else {
+                c
+            }
+        })
+        .collect()
 }
 
 /// The health badge glyph, exhaustive over [`StreamHealth`]. Paired with the text
@@ -704,6 +749,7 @@ mod tests {
     use crate::app::{LiveScreen, ReplayScreen, ScreenLoad};
     use crate::providers::{ChainCapability, GreeksCapability, ProviderCapabilities};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use proptest::prelude::*;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::layout::Rect;
@@ -1098,5 +1144,118 @@ mod tests {
             rendered.contains("widen the terminal"),
             "render must show the widen hint below the minimum size",
         );
+    }
+
+    // --- Escape-sequence sanitizer (docs/SECURITY.md §6.4) -------------------
+
+    #[test]
+    fn test_sanitize_replaces_c0_controls_including_esc_tab_newline() {
+        // Every C0 control (incl. ESC 0x1B, TAB, LF, CR, BEL) is replaced with the
+        // visible placeholder, never left to reach the terminal — so a TAB/LF in an
+        // instrument name cannot break the matrix layout.
+        let raw = "a\u{0}b\tc\nd\re\u{7}f\u{1b}g";
+        let out = sanitize(raw);
+        assert!(!out.contains('\u{1b}'), "no ESC survives");
+        assert!(!out.contains('\t') && !out.contains('\n') && !out.contains('\r'));
+        assert!(!out.contains('\u{7}'), "no BEL survives");
+        assert_eq!(
+            out.chars()
+                .filter(char::is_ascii_alphabetic)
+                .collect::<String>(),
+            "abcdefg",
+            "the printable letters survive, in order",
+        );
+        assert_eq!(
+            out.chars().filter(|&c| c == SANITIZE_PLACEHOLDER).count(),
+            6,
+            "each of the six C0 controls becomes one placeholder",
+        );
+    }
+
+    #[test]
+    fn test_sanitize_replaces_c1_controls_including_8bit_introducers() {
+        // The 8-bit C1 introducers CSI (0x9B) / OSC (0x9D) / DCS (0x90), and the C1
+        // range generally, are replaced — a raw 8-bit escape is as dangerous as ESC.
+        let raw = "x\u{9b}\u{9d}\u{90}\u{85}y";
+        let out = sanitize(raw);
+        for c in ['\u{9b}', '\u{9d}', '\u{90}', '\u{85}'] {
+            assert!(!out.contains(c), "no C1 control {:#x} survives", c as u32);
+        }
+        assert_eq!(
+            out.chars().filter(|&c| c == SANITIZE_PLACEHOLDER).count(),
+            4,
+        );
+        assert!(out.starts_with('x') && out.ends_with('y'));
+    }
+
+    #[test]
+    fn test_sanitize_neutralizes_osc_csi_dcs_sequences_to_inert_text() {
+        // An OSC clipboard-write, a CSI clear-screen, and a DCS payload each render
+        // as inert visible text: the introducer is gone, so the residual params are
+        // printable and cause no terminal side effect.
+        let raw = "\u{1b}]52;c;cHduZWQ=\u{7}\u{1b}[2J\u{1b}Pq#0;2\u{1b}\\";
+        let out = sanitize(raw);
+        assert!(!out.contains('\u{1b}'), "no ESC introducer survives");
+        assert!(
+            out.contains("52;c;cHduZWQ="),
+            "the OSC params are inert text"
+        );
+        assert!(out.contains("[2J"), "the CSI params are inert text");
+    }
+
+    #[test]
+    fn test_sanitize_preserves_printable_ascii_and_unicode_glyphs() {
+        // Sanitize is identity for a normal venue string and for ChainView's own
+        // glyphs/markers — the NO_COLOR/marker policy is unaffected (§6.4).
+        let raw = "BTC-27JUN25-60000-C  ◀ATM ▲▼· — Γ Δ 49.22%";
+        assert_eq!(sanitize(raw), raw);
+    }
+
+    #[test]
+    fn test_is_unsafe_control_matches_c0_del_c1_ranges() {
+        assert!(is_unsafe_control('\u{0}') && is_unsafe_control('\u{1b}'));
+        assert!(is_unsafe_control('\u{7f}'), "DEL is unsafe");
+        assert!(is_unsafe_control('\u{80}') && is_unsafe_control('\u{9f}'));
+        assert!(!is_unsafe_control(' ') && !is_unsafe_control('A'));
+        assert!(!is_unsafe_control('◀') && !is_unsafe_control('—'));
+    }
+
+    proptest! {
+        /// The sanitizer invariant holds for ANY input: the output carries no C0
+        /// control (0x00-0x1F), no DEL (0x7F), no C1 control (0x80-0x9F) — hence no
+        /// ESC / 8-bit introducer — over an arbitrary Unicode string.
+        #[test]
+        fn prop_sanitize_output_has_no_control_or_introducer(
+            chars in proptest::collection::vec(any::<char>(), 0..64),
+        ) {
+            let raw: String = chars.into_iter().collect();
+            let out = sanitize(&raw);
+            for c in out.chars() {
+                let cp = c as u32;
+                prop_assert!(cp >= 0x20, "C0 control 0x{cp:x} leaked");
+                prop_assert!(cp != 0x7f, "DEL leaked");
+                prop_assert!(!(0x80..=0x9f).contains(&cp), "C1 control 0x{cp:x} leaked");
+            }
+            for b in out.bytes() {
+                prop_assert_ne!(b, 0x1b, "raw ESC byte leaked");
+            }
+        }
+
+        /// The same invariant over ARBITRARY BYTES, lossy-decoded to a `str` — the
+        /// shape a venue payload takes after UTF-8 decode.
+        #[test]
+        fn prop_sanitize_arbitrary_bytes_are_display_safe(
+            bytes in proptest::collection::vec(any::<u8>(), 0..96),
+        ) {
+            let raw = String::from_utf8_lossy(&bytes);
+            let out = sanitize(&raw);
+            for c in out.chars() {
+                let cp = c as u32;
+                prop_assert!(
+                    cp >= 0x20 && cp != 0x7f && !(0x80..=0x9f).contains(&cp),
+                    "control 0x{cp:x} leaked",
+                );
+            }
+        }
     }
 }

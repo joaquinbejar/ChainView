@@ -961,6 +961,96 @@ fn assemble_chain(
 }
 
 // ---------------------------------------------------------------------------
+// Render-golden data source (#19) — test-only.
+// ---------------------------------------------------------------------------
+
+/// Assemble the recorded BTC option chain from the committed #17 fixtures through
+/// the **real** adapter seam ([`normalize_leg`] + [`assemble_chain`]), under the
+/// caller-supplied `underlying` display symbol — the source for the chain render
+/// goldens (#19, `docs/TESTING.md` §4) and the escape-hygiene seam probe.
+///
+/// Driving the golden through the actual normalize/assemble path (not a hand-built
+/// chain) proves the rendered matrix reflects the adapter's output. Passing a
+/// **hostile** `underlying` also proves the seam keeps venue bytes verbatim — the
+/// domain never mangles a venue string — so it is the render edge, not the domain,
+/// that neutralizes the escape sequence (`docs/SECURITY.md` §6.4). `#[cfg(test)]`,
+/// so it never rides in the release binary; the fixture bytes are baked in with
+/// `include_str!`, so the golden is byte-stable across machines (no I/O, no socket).
+#[cfg(test)]
+pub(crate) fn fixture_btc_chain_fetch_named(underlying: &str) -> ChainFetch {
+    use deribit_http::model::ticker::TickerData;
+    use deribit_websocket::prelude::Value;
+
+    const INSTRUMENTS_JSON: &str =
+        include_str!("../../tests/fixtures/deribit/instruments/instruments_btc.json");
+    // A DISTINCT recorded ticker per instrument, so the assembled chain depicts a
+    // believable call/put asymmetry (a call delta near +0.55, a put delta near
+    // -0.45, the 61000 call its own distinct quote) — not one cloned ticker. This
+    // also removes a test blind spot: with distinct per-leg Greeks the golden would
+    // catch a projection that read the wrong leg's delta.
+    const TICKER_60000_CALL_JSON: &str =
+        include_str!("../../tests/fixtures/deribit/ticker/ticker_normal.json");
+    const TICKER_60000_PUT_JSON: &str =
+        include_str!("../../tests/fixtures/deribit/ticker/ticker_put.json");
+    const TICKER_61000_CALL_JSON: &str =
+        include_str!("../../tests/fixtures/deribit/ticker/ticker_61000_call.json");
+
+    fn ticker_json_for(instrument_name: &str) -> &'static str {
+        match instrument_name {
+            "BTC-27JUN25-60000-P" => TICKER_60000_PUT_JSON,
+            "BTC-27JUN25-61000-C" => TICKER_61000_CALL_JSON,
+            _ => TICKER_60000_CALL_JSON,
+        }
+    }
+
+    fn deserialize_ticker(json: &str) -> TickerData {
+        let value: Value = match json.parse() {
+            Ok(value) => value,
+            Err(e) => panic!("ticker fixture must parse: {e}"),
+        };
+        match TickerData::deserialize(&value) {
+            Ok(ticker) => ticker,
+            Err(e) => panic!("ticker fixture must deserialize: {e}"),
+        }
+    }
+
+    let instruments_value: Value = match INSTRUMENTS_JSON.parse() {
+        Ok(value) => value,
+        Err(e) => panic!("instruments fixture must parse: {e}"),
+    };
+    let instruments = match Vec::<DeribitInstrument>::deserialize(&instruments_value) {
+        Ok(list) => list,
+        Err(e) => panic!("instruments fixture must deserialize: {e}"),
+    };
+
+    let legs: Vec<NormalizedLeg> = instruments
+        .into_iter()
+        .filter(|instrument| instrument.is_option())
+        .filter_map(|instrument| {
+            let ticker = deserialize_ticker(ticker_json_for(&instrument.instrument_name));
+            normalize_leg(&OptionInstrument { instrument, ticker }).ok()
+        })
+        .collect();
+
+    let spot = match legs.iter().find_map(|leg| leg.underlying_price) {
+        Some(spot) => spot,
+        None => panic!("the recorded tickers carry an underlying price"),
+    };
+    let expiration_utc = match legs.first() {
+        Some(leg) => leg.key.expiration_utc,
+        None => panic!("the recorded fixture yields at least one normalized leg"),
+    };
+
+    assemble_chain(
+        underlying,
+        spot,
+        expiration_utc,
+        &legs,
+        &deribit_provider_id(),
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Redaction-safe transport error mapping.
 // ---------------------------------------------------------------------------
 
