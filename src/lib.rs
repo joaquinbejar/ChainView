@@ -30,6 +30,14 @@ pub(crate) mod ui;
 #[cfg(test)]
 mod tests_integration;
 
+// In-crate replay-path integration tests + the committed replay render goldens
+// (issue #37, the v0.3 acceptance gate). Like `tests_integration`, these live
+// in-crate because they use the `pub(crate)` render-golden harness
+// (`assert_golden`/`buffer_to_text`) and the `pub(crate)` two-level key dispatch —
+// none on the semver-governed surface (`docs/TESTING.md` §7/§4).
+#[cfg(test)]
+mod tests_replay_integration;
+
 // Bench-only support surface (issue #21), compiled ONLY under the `bench` Cargo
 // feature. It exposes the constructors the `benches/*` targets need — a
 // populated render `App`, a seeded `ChainStore`, a scripted `MarketUpdate`

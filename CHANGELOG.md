@@ -14,6 +14,57 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- **Replay integration test + render goldens — the v0.3 acceptance gate**
+  (`src/tests_replay_integration.rs`, `src/lib.rs`,
+  `tests/render/golden/replay/*`, issue #37; `docs/TESTING.md` §4/§7,
+  `docs/ROADMAP.md` v0.3, `docs/05-views-and-ux.md` §2.1/§5). Turns the v0.3
+  ROADMAP acceptance bullets into committed, executable tests — it ADDS
+  tests/goldens and changes no production behavior. New crate deps: none.
+  - **End-to-end replay path, network-free + deterministic** — the committed
+    `valid/` conformance fixture is opened + decoded through the **real**
+    `BundleReader` (`open`+`load`, the same reader the off-thread worker runs),
+    folded through the **real** `App::on_event(AppEvent::BundleLoaded(..))` (exactly
+    what `spawn_bundle_load` delivers — building the `TimelineCursor` + equity
+    geometry), synced off the draw path via `ViewState::sync`, and rendered through
+    the **real** `render(&App, &ViewState, frame)` — the production composition minus
+    the `spawn_blocking` worker thread. The rendered content (the populated equity
+    chart, the as-authored attribution values, a fixture fill, and the status line)
+    is asserted against the fixture's known data; the four Parquet tables round-trip
+    through the reader (one row per step across all four).
+  - **Six committed render goldens** at the fixed 120×40 (`tests/render/golden/replay/`,
+    via the house `assert_golden`/`UPDATE_GOLDENS` harness, all produced through the
+    real render path): `equity_curve.txt` (head at the last step — the full equity
+    curve, attribution, and fills), `greek_attribution.txt` (a mid-run scrub head —
+    the render-level scrub-consistency proof, fewer fills + a shorter curve),
+    `trade_drilldown.txt` (a fill drilled into via `.`, the selected-fill detail
+    panel), plus the `loading` / `error` / `empty` lifecycle states. The error golden
+    is driven by the **real** reader's `UnsupportedSchema` rejection of the `bad_schema`
+    fixture; the empty golden is a zero-row (degenerate) run rendering deliberate
+    per-panel empty states (`—` attribution, "no equity rows", "no fills"), never a
+    blank or a panic.
+  - **Scrub consistency** — seeking to each step (through the real `ReplaySeek` fold)
+    updates the framed title, the attribution header, the visible-fills count, and the
+    head equity/greeks rows to **one coherent post-fill head** each time (the
+    single-`position` invariant, observed at the render seam).
+  - **Two reachable screens, no dead Payoff key** — asserted at the reachability seam
+    (`is_replay_screen_reachable`: Replay yes, Payoff no) and the render seam: the
+    Payoff number key (`2`) is a consumed global that flashes the "v0.5" hint and never
+    switches; Tab/S-Tab cycle only reachable screens; and the keybar renders the Payoff
+    slot dimmed/parenthesized (`2 (Payoff)`), never a live body.
+  - **Unsupported schema rejected, not partial-rendered** — the `bad_schema` fixture
+    is rejected at `open()` with `BundleError::UnsupportedSchema`, folded to a retryable
+    `Error`, and rendered as the actionable error body (`! unsupported schema: …` +
+    "press R to retry") with **none** of the populated panels leaking through.
+  - **Load-error retry round-trip + playback tick end-to-end** — `Error → R` returns to
+    `Loading` and re-issues a `Command::ReloadBundle` for the same dir; a fresh valid
+    load completes the retry to `Ready`. `Space` starts playback; ticks advance the
+    play-head by the speed quantum and **auto-pause at the tape end without wrapping**.
+  - **In-crate, mirroring `src/tests_integration.rs`** — like the #19/#28 render
+    goldens, these live in-crate because the golden harness (`assert_golden`/
+    `buffer_to_text`) and the two-level key dispatch (`App::dispatch_key_global`/
+    `KeyRoute`) are `pub(crate)`, not on the semver-governed surface. Every test is
+    deterministic (committed fixture bytes + fixed `tick_count == 0`, no socket, no
+    wall-clock read) and finishes far under the 10 s integration bound. +12 tests.
 - **Replay adversarial fixtures + the HP-4 decode bench — the v0.3 security /
   performance gate** (`tests/fixtures/bundle/*`, `tests/common/bundle_gen.rs`,
   `tests/replay_bundle_fixtures.rs`, `benches/bench_replay_decode.rs`,
