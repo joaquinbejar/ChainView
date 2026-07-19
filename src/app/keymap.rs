@@ -196,13 +196,13 @@ pub enum DepthAction {
     Scroll,
 }
 
-/// A surface-screen action (`docs/05-views-and-ux.md` §3); bodies land in v0.2.
+/// A surface-screen action (`docs/05-views-and-ux.md` §3); bodies wired in #47.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum SurfaceAction {
-    /// Cycle the Greek axis (`g` / `G`).
+    /// Cycle the Greek/IV/Price axis (`g` forward / `G` back).
     CycleGreek,
-    /// Toggle smile / single-expiry surface (`x`).
+    /// Cycle the view `smile → curve → surface` (`x`).
     ToggleView,
 }
 
@@ -426,22 +426,26 @@ pub static KEYMAP: &[Binding] = &[
         help: "Scroll ladder",
         deferred: Some("v0.5"),
     },
-    // -- Surface (body v0.2) ---------------------------------------------------
+    // -- Surface (body wired #47) ----------------------------------------------
     Binding {
         context: Context::Live(LiveScreen::Surface),
         action: Action::Surface(SurfaceAction::CycleGreek),
         chords: &[KeyChord::Char('g'), KeyChord::Char('G')],
         keys_label: "g / G",
-        help: "Cycle Greek axis",
-        deferred: Some("v0.2"),
+        // SF-04: not just "Greek" — the cycle includes IV and price, which are not
+        // Greeks — and the axis applies to the curve/surface views (view-scoped per
+        // SF-01). Kept terse so it fits the overlay column without truncation; the full
+        // glyph list (Δ/Γ/Θ/ν/IV/price) lives in docs/05 §3.
+        help: "Cycle axis (curve/surf)",
+        deferred: None,
     },
     Binding {
         context: Context::Live(LiveScreen::Surface),
         action: Action::Surface(SurfaceAction::ToggleView),
         chords: &[KeyChord::Char('x')],
         keys_label: "x",
-        help: "Smile / surface",
-        deferred: Some("v0.2"),
+        help: "Smile / curve / surface",
+        deferred: None,
     },
     // -- Payoff (live, builder wired #26; the t+0 curve renders in #27) ---------
     Binding {
@@ -673,6 +677,32 @@ pub fn resolve_payoff(chord: KeyChord) -> Option<PayoffAction> {
         | Action::Chain(_)
         | Action::Depth(_)
         | Action::Surface(_)
+        | Action::Replay(_)
+        | Action::Ascend => None,
+    }
+}
+
+/// Resolve a chord against the **surface** screen's bindings
+/// (`docs/05-views-and-ux.md` §3), or `None` when no binding matches (the dispatch
+/// then ignores the key).
+///
+/// This is the read side the surface screen's `handle_key` (`src/ui/surface.rs`) uses,
+/// so the surface dispatch and the help overlay share the one map — a bound key and
+/// its documentation cannot drift (#47). The concrete direction of the shared
+/// [`SurfaceAction::CycleGreek`] chord (`g` forward vs `G` back) is read from the
+/// resolved chord at dispatch time, the same way [`resolve_global`] derives the
+/// screen-switch slot from the pressed digit.
+#[must_use]
+pub fn resolve_surface(chord: KeyChord) -> Option<SurfaceAction> {
+    let binding = KEYMAP
+        .iter()
+        .find(|b| b.context == Context::Live(LiveScreen::Surface) && b.chords.contains(&chord))?;
+    match binding.action {
+        Action::Surface(action) => Some(action),
+        Action::Global(_)
+        | Action::Chain(_)
+        | Action::Depth(_)
+        | Action::Payoff(_)
         | Action::Replay(_)
         | Action::Ascend => None,
     }
@@ -1003,6 +1033,58 @@ mod tests {
         assert_eq!(resolve_payoff(KeyChord::Esc), Some(PayoffAction::Cancel));
         // A non-payoff chord does not resolve here.
         assert_eq!(resolve_payoff(KeyChord::Char('q')), None);
+    }
+
+    #[test]
+    fn test_resolve_surface_every_surface_chord_resolves_and_is_documented() {
+        // Every chord in a surface-context binding resolves to a `SurfaceAction`
+        // (`ui::surface::handle_key` acts on it) AND appears in the help overlay, so
+        // the surface dispatch and its documentation cannot drift (#47).
+        let live = live_app_on(LiveScreen::Surface, ScreenLoad::Ready, false);
+        let documented = help_bindings(&live.mode);
+        for binding in KEYMAP
+            .iter()
+            .filter(|b| b.context == Context::Live(LiveScreen::Surface))
+        {
+            for &chord in binding.chords {
+                assert!(
+                    resolve_surface(chord).is_some(),
+                    "surface chord {chord:?} does not resolve",
+                );
+                assert!(
+                    documented.iter().any(|b| b.chords.contains(&chord)),
+                    "surface chord {chord:?} is dispatched but not in the overlay",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_keymap_surface_keys_are_wired_not_deferred() {
+        // The surface bodies land in #47, so the surface keys carry no deferred
+        // marker; the overlay advertises them as live.
+        for action in [SurfaceAction::CycleGreek, SurfaceAction::ToggleView] {
+            let deferred = KEYMAP
+                .iter()
+                .find(|b| b.action == Action::Surface(action))
+                .and_then(|b| b.deferred);
+            assert_eq!(deferred, None, "surface {action:?} is wired in #47");
+        }
+        // g/G share the CycleGreek action; x is ToggleView. The screen reads the
+        // concrete chord to decide the cycle direction.
+        assert_eq!(
+            resolve_surface(KeyChord::Char('g')),
+            Some(SurfaceAction::CycleGreek),
+        );
+        assert_eq!(
+            resolve_surface(KeyChord::Char('G')),
+            Some(SurfaceAction::CycleGreek),
+        );
+        assert_eq!(
+            resolve_surface(KeyChord::Char('x')),
+            Some(SurfaceAction::ToggleView),
+        );
+        assert_eq!(resolve_surface(KeyChord::Char('q')), None);
     }
 
     #[test]

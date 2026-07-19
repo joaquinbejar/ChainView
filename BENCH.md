@@ -69,6 +69,14 @@ are stable across re-runs. Treat p99.9/max as indicative, not a gate.
 All three latency figures are in **microseconds**. The 60 fps frame budget is
 **16 000 µs at p99** (NFR-14).
 
+> **#47 surface screen — off the four benched hot paths.** The vol-smile /
+> Greek-curve / single-expiry-surface draw is a **bounded, cached-projection paint**:
+> the geometry is projected off the draw path (the `ViewState` cache) and the surface
+> grid is capped at `MAX_SURFACE_CELLS` and downsampled to the visible rows/columns,
+> so per-frame work is O(visible cells), not O(chain). It adds no new hot-path bench —
+> this note closes the #47 DoD item "a hot-path render change carries bench evidence
+> in `BENCH.md`" explicitly (the #27 precedent).
+
 ### HP-1 — `bench_render_chain` (render loop)
 
 Draw the fullest 64-strike chain matrix into a `TestBackend` at 120×40 through

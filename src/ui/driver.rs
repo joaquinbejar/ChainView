@@ -277,17 +277,20 @@ fn dispatch_key(app: &mut App, key: KeyEvent) {
 
 /// A `Copy` snapshot of the active screen's local mutable state that a screen key can
 /// change without emitting an `AppEvent` (`docs/02-tui-architecture.md` §8): in live
-/// mode the chain [`Selection`] plus the payoff-builder edit revision; in replay mode
-/// the drill-down selection key (`(step, order_id, fill_seq)`, or `None`). The diff
-/// basis that turns a screen-local change into a redraw request.
+/// mode the chain [`Selection`], the payoff-builder edit revision, and the Surface
+/// panel's view/axis revision (#47); in replay mode the drill-down selection key
+/// (`(step, order_id, fill_seq)`, or `None`). The diff basis that turns a screen-local
+/// change into a redraw request.
 ///
 /// The replay scrub (`←`/`→`/`Home`/`End`) does **not** flow through this — it returns
 /// an [`AppEvent::ReplaySeek`](crate::event::AppEvent) whose fold sets `dirty`
-/// directly — so this signature only has to catch the direct `,` / `.` selection move.
+/// directly — so this signature catches the direct `,` / `.` selection move (replay)
+/// and the payoff / surface screen-local edits (live).
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum ViewSig {
-    /// The live chain selection + payoff-builder edit revision.
-    Live(Selection, u64),
+    /// The live chain selection, the payoff-builder edit revision, and the Surface
+    /// panel revision.
+    Live(Selection, u64, u64),
     /// The replay drill-down selection key (`None` when nothing is drilled).
     Replay(Option<(u32, u64, u32)>),
 }
@@ -295,7 +298,11 @@ enum ViewSig {
 #[must_use]
 fn view_sig(app: &App) -> ViewSig {
     match &app.mode {
-        Mode::Live(live) => ViewSig::Live(live.selection, live.payoff_builder.revision()),
+        Mode::Live(live) => ViewSig::Live(
+            live.selection,
+            live.payoff_builder.revision(),
+            live.surface.revision(),
+        ),
         Mode::Replay(replay) => {
             ViewSig::Replay(replay.loaded().and_then(LoadedReplay::selection_key))
         }

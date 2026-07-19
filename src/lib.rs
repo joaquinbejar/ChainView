@@ -211,8 +211,9 @@ pub use app::{
     EventBridge, ExitCause, ExitReporter, FinalTeardown, GuardTeardown, LegError, LegFocus,
     LiveScreen, LiveState, LoadedReplay, Mode, OverlayBinding, PayoffBuilder, ProviderSubscription,
     ReplayScreen, ReplayState, Resolved, ScreenLoad, Selection, Side, SourceBinding, StatusLine,
-    SupervisedTask, Supervisor, TaskExit, TokioTask, is_replay_screen_reachable,
-    is_screen_reachable, spawn_bundle_load, spawn_supervised_subscription,
+    SupervisedTask, Supervisor, SurfaceAxis, SurfacePanel, SurfaceView, TaskExit, TokioTask,
+    is_replay_screen_reachable, is_screen_reachable, spawn_bundle_load,
+    spawn_supervised_subscription,
 };
 // The closed event set folded by the state machine and the render -> data
 // command channel (`docs/02-tui-architecture.md` §4).
@@ -245,7 +246,8 @@ pub use ui::chain::{ChainRow, LegView};
 // screens (#35), and the vol surface (#47) can hold the cache on their state and
 // name the projected shapes.
 pub use ui::graph::{
-    AxisBounds, EmptyReason, GraphCache, GraphProjection, ProjectedSeries, project,
+    AxisBounds, EmptyReason, GraphCache, GraphProjection, ProjectedSeries, ProjectedSurface,
+    project,
 };
 // The theme + render surface: the `NO_COLOR`-aware `Theme`, the
 // help-overlay/status/keybar renderers, the `StrikeRelation` K/S bucket and its
@@ -267,7 +269,7 @@ pub use ui::theme::{
 pub use app::keymap::{
     Action, Binding, ChainAction, Context, DepthAction, GlobalAction, GlobalCommand, KEYMAP,
     KeyChord, PayoffAction, ReplayAction, SurfaceAction, help_bindings, resolve_chain,
-    resolve_global, resolve_payoff, resolve_replay,
+    resolve_global, resolve_payoff, resolve_replay, resolve_surface,
 };
 
 pub use chain::{
