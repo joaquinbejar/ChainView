@@ -14,6 +14,45 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- **Shared neutral dxfeed decode helpers — the v0.4 provider foundation**
+  (`src/providers/dxfeed_decode.rs`, `src/providers/mod.rs`, issue #38;
+  `docs/03-data-providers.md` §3/§7.2/§7.3/§12, `CLAUDE.md` module map). The
+  single, neutral place dxfeed quote/Greeks decode lives, so both the tastytrade
+  adapter (#40) and the standalone dxlink overlay (#42) reuse it **without** an
+  adapter-to-adapter edge — both depend on THIS module, neither on the other (the
+  module-map hard rule). No new crate deps.
+  - **A neutral intermediate view, verified against the real upstream crates.**
+    The spec assumed the two crates carry "the same event shapes"; the real
+    types diverge structurally — `tastytrade` `DxfQuoteT` uses `i64` sizes + a
+    `time` (ms) field, `dxlink` `QuoteEvent` uses `f64` sizes and **no** time
+    (likewise the Greeks events). The module therefore depends on **neither**
+    upstream crate and defines crate-internal `DxQuoteEvent` / `DxGreeksEvent`
+    views both adapters map their raw event onto (exactly the "neutral
+    intermediate" the spec fixes in task 2), so one decode body serves both call
+    sites and no raw `dxfeed::Event` / `MarketEvent` ever crosses the seam.
+  - **The checked `f64` seam (governance deviation 2).** `decode_quote` /
+    `decode_greeks` reject `NaN` / `Inf` / negative before a domain value is
+    built — prices/IV/sizes into `Positive`, Greeks into `Decimal`; `f64` never
+    flows past this module and never touches a money field. Field policy per
+    `docs/03` §3: a real **zero bid is kept** (not absent); a **zero ask on a
+    non-zero bid** or `ask < bid` is **crossed** → the whole update is rejected as
+    a typed `ProviderError::Normalize { OutOfRange("ask") }` (caller keeps prior);
+    a per-field non-finite/negative is dropped to `None` (keeps prior); dxfeed IV
+    is **already decimal**, carried **as-is** (no Deribit-style `/100`); a Greek
+    may be negative and is preserved; the row is tagged `GreeksOrigin::Provider`.
+  - **Redaction-safe + transport-agnostic.** A decode failure names the **field**,
+    never a value; the raw symbol is carried opaque (identity resolution is the
+    adapter's job) and `clamp_symbol` bounds it on a `char` boundary before any
+    tracing echo (the `docs/SECURITY.md` §6 house rule). The module touches no
+    I/O and stamps no wall clock — `received_time` rides on the neutral view, so
+    decode is a pure, deterministic function.
+  - **Tests (+26): unit + property.** Both call-site shapes decode identically for
+    identical data; per-field NaN/Inf/negative rejection; zero-bid kept vs crossed
+    rejection; IV carried as-is (no division); negative Greek preserved; the
+    symbol clamp (incl. multi-byte); and `normalize_total` properties proving an
+    arbitrary event decodes to a typed error or a valid row, never a panic. The
+    arch test already classifies `dxfeed_decode` as the neutral node both future
+    adapters may import (no extension needed).
 - **Replay integration test + render goldens — the v0.3 acceptance gate**
   (`src/tests_replay_integration.rs`, `src/lib.rs`,
   `tests/render/golden/replay/*`, issue #37; `docs/TESTING.md` §4/§7,
