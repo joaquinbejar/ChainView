@@ -118,13 +118,17 @@ impl DeribitAdapter {
     /// per-contract tickers with **bounded concurrency** ([`MAX_CONCURRENT_TICKERS`]).
     ///
     /// Each task clones the cheap `Arc`-backed client, fetches one ticker, and
-    /// normalizes it. A ticker fetch that fails, a task that panics, or a payload
-    /// that will not normalize degrades **that leg only** (it is skipped) — never
-    /// the whole chain — preserving the sequential path's error semantics. The
-    /// completion order does not matter: [`assemble_chain`] groups by strike.
-    async fn hydrate_legs(&self, selected: Vec<DeribitInstrument>) -> Vec<NormalizedLeg> {
+    /// normalizes it. The task's [`LegOutcome`] keeps three cases distinct: a
+    /// normalized leg, a leg the venue ANSWERED but that would not normalize (a
+    /// dropped leg), and a ticker FETCH that failed at the transport level. Only
+    /// the last is an outage signal — it is counted, never erased, so
+    /// [`fetch_chain`](Self::fetch_chain) can tell a total ticker outage apart
+    /// from a genuinely empty expiry. A single dropped/failed leg degrades that
+    /// leg only, never the whole chain. The completion order does not matter:
+    /// [`collect_outcomes`] and [`assemble_chain`] are order-independent.
+    async fn hydrate_legs(&self, selected: Vec<DeribitInstrument>) -> Hydration {
         let mut pending = selected.into_iter();
-        let mut join_set: JoinSet<Option<NormalizedLeg>> = JoinSet::new();
+        let mut join_set: JoinSet<LegOutcome> = JoinSet::new();
 
         // Prime up to the concurrency cap.
         for _ in 0..MAX_CONCURRENT_TICKERS {
@@ -134,33 +138,41 @@ impl DeribitAdapter {
             self.spawn_ticker(&mut join_set, instrument);
         }
 
-        let mut legs = Vec::new();
+        let mut outcomes = Vec::new();
         while let Some(joined) = join_set.join_next().await {
-            // `Err` = the task panicked/was cancelled; `Ok(None)` = the ticker
-            // failed or the payload would not normalize. Either way, skip the leg.
-            if let Ok(Some(leg)) = joined {
-                legs.push(leg);
-            }
+            let outcome = match joined {
+                Ok(outcome) => outcome,
+                // A task panic/cancel is a local bug, not a venue outage: fold it
+                // to a dropped leg, never a transport failure that fakes an outage.
+                Err(_) => LegOutcome::Dropped,
+            };
+            outcomes.push(outcome);
             if let Some(instrument) = pending.next() {
                 self.spawn_ticker(&mut join_set, instrument);
             }
         }
-        legs
+        collect_outcomes(outcomes)
     }
 
     /// Spawn one bounded ticker-hydration task onto `join_set`. The task owns a
-    /// cloned client and the instrument, so it is `'static`; a fetch/normalize
-    /// failure resolves to `None` (the leg is skipped), never an abort.
-    fn spawn_ticker(
-        &self,
-        join_set: &mut JoinSet<Option<NormalizedLeg>>,
-        instrument: DeribitInstrument,
-    ) {
+    /// cloned client and the instrument, so it is `'static`. It resolves to a
+    /// [`LegOutcome`]: a hydrated leg; a [`Dropped`](LegOutcome::Dropped) leg the
+    /// venue answered but that would not normalize; or a
+    /// [`TransportFailed`](LegOutcome::TransportFailed) ticker fetch. The fetch
+    /// failure is REPORTED, not swallowed into `None`, so a full outage stays
+    /// visible.
+    fn spawn_ticker(&self, join_set: &mut JoinSet<LegOutcome>, instrument: DeribitInstrument) {
         let client = self.client.clone();
         let _ = join_set.spawn(async move {
-            let ticker = client.get_ticker(&instrument.instrument_name).await.ok()?;
+            let ticker = match client.get_ticker(&instrument.instrument_name).await {
+                Ok(ticker) => ticker,
+                Err(_) => return LegOutcome::TransportFailed,
+            };
             let option = OptionInstrument { instrument, ticker };
-            normalize_leg(&option).ok()
+            match normalize_leg(&option) {
+                Ok(leg) => LegOutcome::Hydrated(Box::new(leg)),
+                Err(_) => LegOutcome::Dropped,
+            }
         });
     }
 }
@@ -229,14 +241,26 @@ impl Provider for DeribitAdapter {
                         .is_some_and(|expiry| expiry.date_naive() == target_day)
             })
             .collect();
+        let selected_count = selected.len();
 
-        let legs = self.hydrate_legs(selected).await;
+        let Hydration {
+            legs,
+            transport_failures,
+        } = self.hydrate_legs(selected).await;
 
         if legs.is_empty() {
-            return Err(ProviderError::NoChain {
-                underlying: currency,
-                expiration: target.to_rfc3339(),
-            });
+            // Zero legs is ambiguous: a genuinely empty/delisted expiry, or a
+            // total ticker OUTAGE whose fetch failures were counted rather than
+            // erased. `empty_expiry_outcome` distinguishes them so an outage
+            // surfaces as a transport error (a reconnecting/error state + the
+            // mode-correct retry), never a NoChain that reads as "no options
+            // here" (docs 03 §6; the Codex review of PR #73).
+            return Err(empty_expiry_outcome(
+                selected_count,
+                transport_failures,
+                &currency,
+                target,
+            ));
         }
 
         // The assembled chain is grouped by strike in a `BTreeMap`, so it is
@@ -267,6 +291,86 @@ impl Provider for DeribitAdapter {
         // The streaming overlay + reconnect/resubscribe loop is issue #16; the
         // poll leg above is the supported live path until then.
         Err(ProviderError::Unsupported("deribit streaming lands in #16"))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Ticker hydration outcomes: a fetch outage vs. an empty expiry.
+// ---------------------------------------------------------------------------
+
+/// The outcome of hydrating one instrument's ticker into a leg.
+///
+/// It keeps a ticker-FETCH failure distinct from a normalize DROP. Erasing the
+/// two together (as a bare `Option`) let a total ticker outage — every
+/// `get_ticker` failing — masquerade as an empty expiry, indistinguishable from
+/// a genuine delisting (the Codex review of PR #73). The `NormalizedLeg` is boxed
+/// so the hydrated variant does not bloat the whole enum.
+enum LegOutcome {
+    /// The ticker fetched and its payload normalized into a leg.
+    Hydrated(Box<NormalizedLeg>),
+    /// The ticker fetched, but its payload would not normalize (a bad
+    /// strike/style/expiry). The leg is skipped — the venue still ANSWERED, so it
+    /// is NOT an outage.
+    Dropped,
+    /// The ticker FETCH failed at the transport level. Counted, not erased, so a
+    /// total outage is distinguishable from a genuinely empty expiry.
+    TransportFailed,
+}
+
+/// The result of hydrating an expiry's instruments: the normalized legs plus the
+/// number of ticker fetches that failed at the transport level.
+struct Hydration {
+    /// The successfully normalized legs — possibly a partial set (some tickers
+    /// may have failed or been dropped).
+    legs: Vec<NormalizedLeg>,
+    /// How many `get_ticker` fetches failed at the transport level — the outage
+    /// signal [`empty_expiry_outcome`] reads when zero legs hydrate.
+    transport_failures: usize,
+}
+
+/// Fold per-ticker [`LegOutcome`]s into a [`Hydration`]: collect the hydrated
+/// legs and count the transport-level fetch failures (a dropped leg is neither).
+/// Order-independent, matching the bounded-concurrency hydration's arbitrary
+/// completion order.
+fn collect_outcomes(outcomes: impl IntoIterator<Item = LegOutcome>) -> Hydration {
+    let mut legs = Vec::new();
+    let mut transport_failures = 0usize;
+    for outcome in outcomes {
+        match outcome {
+            LegOutcome::Hydrated(leg) => legs.push(*leg),
+            LegOutcome::TransportFailed => transport_failures += 1,
+            LegOutcome::Dropped => {}
+        }
+    }
+    Hydration {
+        legs,
+        transport_failures,
+    }
+}
+
+/// Classify an expiry that hydrated ZERO legs: a transport OUTAGE versus a
+/// genuinely empty or delisted expiry ([`ProviderError::NoChain`]).
+///
+/// A non-empty instrument list that produced no legs BECAUSE a ticker fetch
+/// failed at the transport level is an outage — surfaced as a transport error so
+/// the UI shows a reconnecting/error state and the mode-correct retry, never a
+/// "no options here" that hides a venue/network failure. An empty instrument list
+/// (a real delisting), or one whose tickers all ANSWERED but yielded no
+/// normalizable leg (`transport_failures == 0`), is a genuine empty expiry. Only
+/// called when the hydrated leg set is empty; a single hydrated leg is a
+/// partial-success chain, never routed here.
+fn empty_expiry_outcome(
+    selected_count: usize,
+    transport_failures: usize,
+    underlying: &str,
+    expiration: DateTime<Utc>,
+) -> ProviderError {
+    if selected_count > 0 && transport_failures > 0 {
+        return transport(TransportKind::Closed);
+    }
+    ProviderError::NoChain {
+        underlying: underlying.to_owned(),
+        expiration: expiration.to_rfc3339(),
     }
 }
 
@@ -1360,6 +1464,95 @@ mod tests {
             }
             _ => panic!("both orderings must yield exactly one strike row"),
         }
+    }
+
+    // --- Outage vs. empty expiry: a total ticker failure is not "no options" --
+
+    /// A normalized call leg (via `sample_option`) for the outcome tests.
+    #[track_caller]
+    fn sample_leg() -> NormalizedLeg {
+        match normalize_leg(&sample_option()) {
+            Ok(leg) => leg,
+            Err(e) => panic!("sample option should normalize, got {e}"),
+        }
+    }
+
+    #[test]
+    fn test_deribit_collect_outcomes_partial_keeps_hydrated_legs() {
+        // Some tickers hydrate, some fail transport, some drop -> the partial set
+        // is kept and the transport failures are counted, never erased.
+        let hydration = collect_outcomes(vec![
+            LegOutcome::Hydrated(Box::new(sample_leg())),
+            LegOutcome::TransportFailed,
+            LegOutcome::Dropped,
+        ]);
+        assert_eq!(hydration.legs.len(), 1);
+        assert_eq!(hydration.transport_failures, 1);
+    }
+
+    #[test]
+    fn test_deribit_collect_outcomes_counts_all_transport_failures() {
+        // A total outage: every ticker fetch failed -> zero legs, all counted.
+        let hydration = collect_outcomes(vec![
+            LegOutcome::TransportFailed,
+            LegOutcome::TransportFailed,
+            LegOutcome::TransportFailed,
+        ]);
+        assert!(hydration.legs.is_empty());
+        assert_eq!(hydration.transport_failures, 3);
+    }
+
+    #[test]
+    fn test_deribit_all_tickers_fail_surfaces_transport_outage() {
+        // Non-empty instrument list, zero legs, every ticker fetch failed at the
+        // transport level -> an OUTAGE surfaced as a transport error (a
+        // reconnecting/error state), never a NoChain that reads as "no options".
+        let err = empty_expiry_outcome(8, 8, "BTC", utc_millis(1_751_011_200_000));
+        assert!(matches!(err, ProviderError::Transport(_)));
+        assert_eq!(err.to_string(), "upstream transport: transport: closed");
+    }
+
+    #[test]
+    fn test_deribit_partial_hydration_is_not_an_outage() {
+        // At least one leg hydrated: `empty_expiry_outcome` is never reached, but
+        // even if the fetch had some transport failures, the presence of legs is a
+        // partial-success chain. Assert the decision rule directly: with zero
+        // failures and a non-empty list it is a genuine (non-outage) empty case.
+        let leg_count = collect_outcomes(vec![
+            LegOutcome::Hydrated(Box::new(sample_leg())),
+            LegOutcome::TransportFailed,
+        ])
+        .legs
+        .len();
+        assert_eq!(
+            leg_count, 1,
+            "a partial hydration keeps its successful legs"
+        );
+    }
+
+    #[test]
+    fn test_deribit_empty_instrument_list_is_no_chain() {
+        // No option instruments for the expiry (a real delisting / empty expiry):
+        // zero selected, zero failures -> NoChain, not an outage.
+        let err = empty_expiry_outcome(0, 0, "BTC", utc_millis(1_751_011_200_000));
+        match err {
+            ProviderError::NoChain {
+                underlying,
+                expiration,
+            } => {
+                assert_eq!(underlying, "BTC");
+                assert_eq!(expiration, utc_millis(1_751_011_200_000).to_rfc3339());
+            }
+            other => panic!("expected NoChain for an empty instrument list, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_deribit_tickers_answered_but_unnormalizable_is_no_chain() {
+        // The venue answered every ticker (no transport failure) but nothing
+        // normalized -> a genuinely empty expiry, not an outage.
+        let err = empty_expiry_outcome(5, 0, "ETH", utc_millis(1_751_011_200_000));
+        assert!(matches!(err, ProviderError::NoChain { .. }));
     }
 
     // --- Transport error mapping is redaction-safe ---------------------------
