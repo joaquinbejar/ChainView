@@ -167,6 +167,73 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
     pattern as #29's `serde_json`; ADR-0010). `arrow-schema` stays a dev-dep (only
     the `#[cfg(test)]` writers build schemas). **Supply-chain audit note:** no new
     advisory — the crate was already vetted in the tree.
+- **Bundle validation chain + the equivalence oracle — the second half of `load()`**
+  (`src/replay/validate.rs`, `src/replay/mod.rs`, issue #32;
+  `docs/04-replay-mode.md` §5/§2.3, ADR-0004). Runs the full **post-decode
+  validation chain** (`docs/04` §5 steps 4–10) over the file-order tables #31
+  decodes, so a malformed bundle is a typed `BundleError::Invariant` naming the
+  offending table + row (never a panic, never a partial read); adds the cross-repo
+  **equivalence oracle** IronCondor and ChainView share. New crate deps: none.
+  - **The §5 chain, in documented order** (`run_validation_chain`, run by `load`
+    after decode; a cancellation requested during/after decode still aborts before
+    the O(n) passes): (4) each table **non-decreasing on its stated sort key** with
+    the uniqueness sub-checks (`fills` unique on `(step, order_id, fill_seq)`,
+    `positions` ≤ 1 row per `(position_id, step)`) — non-vacuous because #31
+    preserves file order; (5) the integer **equity identity**
+    `equity_cents == cash_cents + position_value_cents` (tolerance zero); (6) the
+    typed **`CapitalConfig`** projection (present, integer, `>= 0`) + the
+    cross-table **attribution identity** `theta+delta+vega+spread_capture−fees+
+    residual == step_pnl`, with `step_pnl` the producer's own equity delta (step 0
+    vs `capital_cents`) — `|residual|` is **advisory**, never a load failure; (7)
+    the contiguous 0-based **step domain** shared by `equity_curve`/
+    `greeks_attribution`, every `fills`/`positions` step inside it, and per-step
+    `ts_ns` equality across all four tables; (8/9) **referential integrity** —
+    `fills.strategy_run_id == manifest.run_id`, the `contract_id` round-trip against
+    each `fills` row's structured columns, stable `position_id → (trade_id,
+    contract_id, side)`, and the delimiter-safe `UNDERLYING` grammar
+    (`^[A-Z0-9._]{1,32}$`) validated **before** any join-key split; (10, value-domain
+    checks deferred to #32) `quantity > 0` and `drawdown <= 0`.
+  - **`contract_id` parser** (module-private, per the #29 "parsing lives in #32"
+    note) — splits `"v1:{UNDERLYING}:{expiration_ns}:{strike_cents}:{C|P}"` into its
+    five fields, rejecting the wrong field count, an unsupported version prefix, an
+    out-of-grammar `UNDERLYING`, non-numeric `expiration_ns`/`strike_cents`, or a
+    non-`C|P` style. In `fills` the parsed fields must **round-trip** against the
+    row's own `underlying`/`expiration_ns`/`strike_cents`/`style` columns (a mismatch
+    is `Invariant`); `positions` carries no structured columns (§2.2), so the
+    round-trip there degenerates to a well-formedness parse and the contract's
+    consistency is enforced by the `position_id` stability check instead.
+  - **The equivalence oracle** `compare_bundles(a, b) -> Result<(),
+    BundleDivergence>` (**pub**, for the cross-repo agreement check) — money columns
+    compared **exactly** (integer cents); the one analytic float `drawdown` under the
+    combined tolerance `|a−b| ≤ max(ABS_TOL, REL_TOL × max(|a|,|b|))` with signed
+    zero equal, `NaN` never equal, `±∞` equal only to the same infinity; each table
+    compared in its stated sort-key order (copies sorted **only for comparison** —
+    `load` never sorts); the manifest as canonical JSON with `created_utc` and the
+    opaque `metrics` excluded. Reports the **first** divergence as a typed
+    `BundleDivergence { table, column, row, detail }` (bounded, non-secret). The
+    tolerance constants **`ORACLE_ABS_TOL = 1e-9`** / **`ORACLE_REL_TOL = 1e-6`**
+    live beside the oracle and **must match IronCondor's copy exactly** (`docs/04`
+    §5, `docs/TESTING.md` §6).
+  - **Public surface** gains only `compare_bundles`, `BundleDivergence`,
+    `ORACLE_ABS_TOL`, `ORACLE_REL_TOL` — the validation checks and the `contract_id`
+    parser stay module-private, and the reader surface is unchanged (the chain is
+    wired inside `load`). Read-only, `#![forbid(unsafe_code)]`-clean, `tokio`-free
+    (the arch layering test stays green); every echoed dynamic string routes through
+    the shared `clamp_echo` (moved to `replay/mod.rs` so decoders + validation share
+    it); every sum is `checked_*`; no `as` casts. The #31 conformance fixture's
+    `greeks_attribution` residual now absorbs the step-`pnl` remainder so it satisfies
+    the attribution identity end-to-end.
+  - **Tests:** a conformant bundle passes the whole chain; each violation fires its
+    exact typed error (out-of-order/duplicate keys per table, broken equity/
+    attribution identities, missing/non-integer/negative `capital_cents`, step-domain
+    gap + `ts_ns` disagreement + mismatched span, `run_id`/`contract_id` referential
+    failures, colon-bearing `underlying`, unstable `position_id`, zero quantity,
+    positive drawdown); an advisory large-`|residual|` bundle **loads**. Property
+    tests: `attribution_identity_holds` (generated well-formed tables), the
+    `contract_id` round-trip (valid components → parse → equal fields), and the
+    oracle-tolerance symmetry; plus oracle reflexivity, sort-insensitivity, and
+    single-field-mutation detection across tables/types (money, enum, float, string,
+    and the excluded `created_utc`/`metrics`).
 - **v0.2 acceptance gate — payoff goldens, break-even / max-P&L parity, and the
   computed-Greeks tolerance fixture** (`src/ui/payoff.rs`, `src/ui/chain.rs`,
   `src/providers/deribit.rs`, `tests/render/golden/payoff/`, issue #28; docs

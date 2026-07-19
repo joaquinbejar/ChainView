@@ -154,12 +154,21 @@ pub use error::{
 // the cross-table validation chain (#32) is still written against this surface.
 // The public surface gains no new item beyond the `BundleError::Schema` decode
 // variant — the decoders themselves are `pub(crate)`.
+//
+// Issue #32 lands the post-decode validation chain (wired inside `load`, so the
+// reader surface is unchanged) plus the cross-repo equivalence oracle:
+// `compare_bundles` returns `Ok(())` or the first typed `BundleDivergence`, and
+// `ORACLE_ABS_TOL`/`ORACLE_REL_TOL` are the combined-tolerance constants that must
+// match IronCondor's copy exactly (`docs/04-replay-mode.md` §5). The validation
+// checks and the `contract_id` parser stay module-private — only the oracle is
+// public, for the cross-repo agreement check.
 pub use replay::{
-    BundleManifest, BundleReader, CONTRACT_ID_FORMAT, CONTRACT_ID_UNDERLYING_PATTERN,
-    CONTRACT_ID_VERSION_PREFIX, CapitalConfig, DECODED_OVERHEAD_PERMILLE, EquityPoint, ExecMode,
-    Fill, GreeksAttribution, LoadedBundle, MAX_BATCH_BYTES, MAX_BATCH_ROWS, MAX_EXPANSION_RATIO,
-    MAX_MANIFEST_BYTES, MAX_TABLE_BYTES, MAX_TABLE_ROWS, MAX_WORKING_SET, PositionRow,
-    PositionSide, ResourceCeilings, SUPPORTED_SCHEMA,
+    BundleDivergence, BundleManifest, BundleReader, CONTRACT_ID_FORMAT,
+    CONTRACT_ID_UNDERLYING_PATTERN, CONTRACT_ID_VERSION_PREFIX, CapitalConfig,
+    DECODED_OVERHEAD_PERMILLE, EquityPoint, ExecMode, Fill, GreeksAttribution, LoadedBundle,
+    MAX_BATCH_BYTES, MAX_BATCH_ROWS, MAX_EXPANSION_RATIO, MAX_MANIFEST_BYTES, MAX_TABLE_BYTES,
+    MAX_TABLE_ROWS, MAX_WORKING_SET, ORACLE_ABS_TOL, ORACLE_REL_TOL, PositionRow, PositionSide,
+    ResourceCeilings, SUPPORTED_SCHEMA, compare_bundles,
 };
 // The PUBLIC, semver-governed provider port surface (`docs/03-data-providers.md`
 // §2, §11.1): the trait, the capability self-declaration + its builder + every
