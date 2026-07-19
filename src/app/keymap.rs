@@ -582,6 +582,66 @@ pub static KEYMAP: &[Binding] = &[
         help: "Jump to end",
         deferred: None,
     },
+    // -- Replay Payoff-at-head (#49): the same scrub/jump/playback keys as the equity
+    //    screen (the recovery for "flat at this step" is scrubbing to an open step), so
+    //    they are bound in the Payoff context too. The fill drill-down (`,` / `.`) is
+    //    NOT bound here — the payoff panel has no fill list. --
+    Binding {
+        context: Context::Replay(ReplayScreen::Payoff),
+        action: Action::Replay(ReplayAction::PlayPause),
+        chords: &[KeyChord::Char(' ')],
+        keys_label: "Space",
+        help: "Play / pause",
+        deferred: None,
+    },
+    Binding {
+        context: Context::Replay(ReplayScreen::Payoff),
+        action: Action::Replay(ReplayAction::SpeedSlower),
+        chords: &[KeyChord::Char('-')],
+        keys_label: "-",
+        help: "Slower (while playing)",
+        deferred: None,
+    },
+    Binding {
+        context: Context::Replay(ReplayScreen::Payoff),
+        action: Action::Replay(ReplayAction::SpeedFaster),
+        chords: &[KeyChord::Char('+')],
+        keys_label: "+",
+        help: "Faster (while playing)",
+        deferred: None,
+    },
+    Binding {
+        context: Context::Replay(ReplayScreen::Payoff),
+        action: Action::Replay(ReplayAction::StepBack),
+        chords: &[KeyChord::Left, KeyChord::Char('h')],
+        keys_label: "← / h",
+        help: "Step back",
+        deferred: None,
+    },
+    Binding {
+        context: Context::Replay(ReplayScreen::Payoff),
+        action: Action::Replay(ReplayAction::StepForward),
+        chords: &[KeyChord::Right, KeyChord::Char('l')],
+        keys_label: "→ / l",
+        help: "Step forward",
+        deferred: None,
+    },
+    Binding {
+        context: Context::Replay(ReplayScreen::Payoff),
+        action: Action::Replay(ReplayAction::JumpStart),
+        chords: &[KeyChord::Home],
+        keys_label: "Home",
+        help: "Jump to start",
+        deferred: None,
+    },
+    Binding {
+        context: Context::Replay(ReplayScreen::Payoff),
+        action: Action::Replay(ReplayAction::JumpEnd),
+        chords: &[KeyChord::End],
+        keys_label: "End",
+        help: "Jump to end",
+        deferred: None,
+    },
 ];
 
 // ---------------------------------------------------------------------------
@@ -794,10 +854,7 @@ pub(crate) fn help_sections(mode: &Mode) -> Vec<(&'static str, Vec<&'static Bind
             global.retain(|b| b.action != Action::Global(GlobalAction::Reconnect));
             let mut sections = vec![("Global", global)];
             sections.push(("Replay", bindings_in(Context::Replay(ReplayScreen::Replay))));
-            sections.push((
-                "Payoff (v0.5)",
-                bindings_in(Context::Replay(ReplayScreen::Payoff)),
-            ));
+            sections.push(("Payoff", bindings_in(Context::Replay(ReplayScreen::Payoff))));
             sections
         }
     }
@@ -1022,6 +1079,42 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_resolve_replay_payoff_every_chord_resolves_and_is_documented() {
+        // #49: the replay payoff-at-head panel binds the scrub/jump/playback keys in
+        // its own context (the recovery for "flat at this step" is scrubbing), so every
+        // Payoff-context chord resolves for that screen AND appears in the overlay — no
+        // dead key, no drift. The panel binds no fill drill-down (`,` / `.`).
+        let replay = replay_app_on(ReplayScreen::Payoff, false);
+        let documented = help_bindings(&replay.mode);
+        let mut chords_seen = 0usize;
+        for binding in KEYMAP
+            .iter()
+            .filter(|b| b.context == Context::Replay(ReplayScreen::Payoff))
+        {
+            for &chord in binding.chords {
+                chords_seen += 1;
+                assert!(
+                    resolve_replay(chord, ReplayScreen::Payoff).is_some(),
+                    "replay payoff chord {chord:?} does not resolve",
+                );
+                assert!(
+                    documented.iter().any(|b| b.chords.contains(&chord)),
+                    "replay payoff chord {chord:?} is dispatched but not in the overlay",
+                );
+            }
+        }
+        assert!(
+            chords_seen > 0,
+            "the payoff panel binds its scrub/playback keys"
+        );
+        // The fill drill-down is NOT bound on the payoff panel (there is no fill list).
+        assert!(
+            resolve_replay(KeyChord::Char(','), ReplayScreen::Payoff).is_none(),
+            "`,` (prev fill) is inert on the payoff panel",
+        );
     }
 
     #[test]

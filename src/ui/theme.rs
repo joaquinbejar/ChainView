@@ -1088,19 +1088,24 @@ mod tests {
     }
 
     #[test]
-    fn test_help_overlay_lists_deferred_replay_payoff_section() {
-        // Every screen is listed in the overlay (§2): the v0.5 replay Payoff screen
-        // has no bindings yet, so it appears as a titled section with a "not
-        // available" note rather than being dropped (fix SF-04).
-        let app = replay_app_on(ReplayScreen::Replay, true);
-        let text = rendered_frame(&app, 80, 24);
+    fn test_help_overlay_lists_live_replay_payoff_section() {
+        // Every screen is listed in the overlay (§2): the replay Payoff panel is live
+        // from v0.5 (#49), so its section carries the scrub/playback keys it supports
+        // (the recovery for "flat at this step" is scrubbing to an open step) rather
+        // than a "not available" note.
+        let app = replay_app_on(ReplayScreen::Payoff, true);
+        let text = rendered_frame(&app, 100, 40);
         assert!(
             text.contains("Payoff"),
-            "the deferred Payoff screen is listed"
+            "the reachable Payoff screen is listed"
         );
         assert!(
-            text.contains("not available"),
-            "the deferred screen shows a not-available note",
+            text.contains("Step forward"),
+            "the Payoff section lists its scrub keys (no dead 'not available' note)",
+        );
+        assert!(
+            !text.contains("not available"),
+            "no replay overlay section is a dead 'not available' note",
         );
     }
 

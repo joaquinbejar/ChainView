@@ -14,6 +14,38 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- **The replay payoff-at-head panel** (issue #49; `docs/04-replay-mode.md` §6,
+  `docs/05-views-and-ux.md` §5, §2.1, v0.5). The Replay `Payoff` screen becomes the
+  **second reachable replay screen**: it renders the payoff of the **open position at
+  the scrub head** — resolved from `positions.parquet` by the timeline cursor (#33) —
+  as the legs' **expiration** payoff (fully determined via `optionstratlib`
+  `Profit`/`Payoff`, reusing the live payoff geometry #27 and the graph adapter #23),
+  with the current **mark-to-market** reference, the break-even markers, and a zero
+  line. It makes **no claim of bit-exact upstream repricing** — the bundle carries no
+  step spot / IV / rate, so an exact t+0 reprice is not derivable and is never
+  fabricated; the caveat is visible on the panel.
+  - **The off-draw build seam** (`src/app/replay_payoff_build.rs`, new). On load and on
+    every cursor move, the geometry is rebuilt from the cursor's **cached open set**
+    (`open_positions`, resolved at seek time per the #33 contract — never per frame in
+    `draw`) under a monotonic revision the ui view-cache diffs to re-project. Each leg's
+    strike / style / expiry are recovered from the `contract_id` join key
+    (`positions.parquet` carries no structured strike/style columns), reusing the
+    validated #32 `parse_contract_id`. **Money stays integer cents**: the cents→
+    `optionstratlib` `Positive` conversion is a checked `u64 → i64 → Decimal(scale 2)`
+    path with **no `f64` on the money route**, and the net mark P&L is exact integer
+    cents formatted to `$` only at the render edge. The DTE at the head is the
+    deterministic, clock-free `Days` span from the head `ts_ns` to the leg
+    `expiration_ns`.
+  - **The panel + reachability flip** (`src/ui/payoff.rs` `draw_replay`). `ReplayScreen::Payoff`
+    is now reachable (`is_replay_screen_reachable`), the `2 Payoff` number key switches
+    to it, `Tab` cycles onto it, and the keybar/help overlay list it undimmed. The draw
+    is **pure** — it reads only the pre-projected series and the cached header figures,
+    building no `GraphData` and pricing nothing. States render first: the **"flat at this
+    step"** empty state (no open position at the head — recovery is scrubbing to an open
+    step), the honest "payoff unavailable" state (a degenerate/NaN-dropped curve), and
+    the loading note, before the happy-path chart. The panel binds the same
+    scrub/jump/playback keys as the equity screen (its `handle_key_replay`) so the
+    "flat" recovery works in place.
 - **The depth-ladder screen** (issue #48; `docs/05-views-and-ux.md` §2.1, §6,
   `docs/03-data-providers.md` §8, v0.5). The Live `Depth` screen renders the
   order-book bid/ask ladder for the **selected contract** — the chain cursor's

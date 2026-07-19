@@ -29,8 +29,8 @@ mod bundle_gen;
 use std::path::{Path, PathBuf};
 
 use chainview::{
-    BundleError, BundleReader, LoadedBundle, PositionRow, ResourceCeilings, SeekTo, TimelineCursor,
-    compare_bundles,
+    BundleError, BundleReader, LoadedBundle, LoadedReplay, PositionRow, ResourceCeilings, SeekTo,
+    TimelineCursor, compare_bundles,
 };
 
 // --- Fixture locations -------------------------------------------------------
@@ -567,6 +567,42 @@ fn test_ironcondor_conformance_drill_down_closes_the_short_put() {
     for f in &close_fills {
         assert_eq!(f.contract_id, IC_CLOSED_PUT_CID, "close fill contract_id");
     }
+}
+
+#[test]
+fn test_ironcondor_conformance_head_mtm_sums_writer_unrealized() {
+    // Second-pass #108 fix: the payoff-at-head MTM is the SUM of the writer's OWN per-row
+    // `unrealized_cents` — which already applies the SPX 100x contract multiplier and the
+    // writer's fee conventions — never a reader recompute of `(mark − avg) · qty` that
+    // drops the multiplier and reads 100x too small.
+    let loaded = load_ok("ironcondor_conformance");
+
+    // At the load head (step 0) all four condor legs are open; sum the WRITER's field.
+    let cursor = TimelineCursor::new(&loaded);
+    let open = cursor.open_positions(&loaded);
+    let expected = open
+        .iter()
+        .try_fold(0_i64, |acc, p| acc.checked_add(p.unrealized_cents));
+    assert_eq!(
+        expected,
+        Some(-14_000),
+        "four open legs × −3500c = −$140.00 (the writer's multiplier-applied unrealized)"
+    );
+    drop(open);
+
+    // The reader's payoff-at-head, built by `LoadedReplay::new` at the same head, must
+    // equal that writer figure — and must NOT be the 100x-too-small recompute.
+    let replay = LoadedReplay::new(loaded);
+    assert_eq!(
+        replay.payoff_head().mark_pnl_cents(),
+        expected,
+        "the head MTM equals the writer's summed unrealized_cents"
+    );
+    assert_ne!(
+        replay.payoff_head().mark_pnl_cents(),
+        Some(-140),
+        "never the 100x-too-small `(mark − avg) · qty` recompute"
+    );
 }
 
 #[test]
