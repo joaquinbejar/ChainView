@@ -165,6 +165,27 @@ pub(crate) mod dxlink;
 #[cfg(feature = "ig")]
 pub(crate) mod ig;
 
+/// The Interactive Brokers adapter — the TWS/Gateway socket, native-Greeks
+/// poll->stream provider (issue #120, `docs/03-data-providers.md` §7.6). Behind
+/// the DISABLED-by-default `ibkr` Cargo feature — a **dependency-weight** gate
+/// ([ADR-0014]), NOT a credential-logging security gate — so under the feature it
+/// is a **real built-in**: [`with_builtins`](crate::ChainViewAppBuilder::with_builtins)
+/// registers it when its `CHAINVIEW_IBKR_ENDPOINT` is configured (omitting it,
+/// never erroring, when absent, so the zero-config Deribit default is
+/// unaffected). It stays off a default build only to keep the `ibapi` client tree
+/// out. IBKR **assembles** the chain from `reqSecDefOptParams` + contract details
+/// (`ChainCapability::Assemble`), streams **native** model Greeks/IV via
+/// `tickOptionComputation` (`GreeksCapability::Provided`), and carries **no**
+/// ChainView-side credential — the TWS/Gateway holds the session
+/// (`AuthKind::None`). Its market-data lines are PACED, so the subscribe leg is
+/// bounded to an ATM-centered window. Crate-internal: no raw `ibapi` DTO crosses
+/// the port — every upstream struct is normalized to the domain model inside this
+/// module.
+///
+/// [ADR-0014]: https://github.com/joaquinbejar/ChainView/blob/main/docs/adr/0014-ibkr-builtin-packaging.md
+#[cfg(feature = "ibkr")]
+pub(crate) mod ibkr;
+
 /// The seam every adapter implements: one trait, one adapter per provider id
 /// (`docs/03-data-providers.md` §2).
 ///

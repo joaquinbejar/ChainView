@@ -189,6 +189,47 @@ fn test_ig_row_reconciles_with_section_8() {
     assert_row(crate::providers::ig::ig_capabilities(), &row);
 }
 
+// --- IBKR (feature-gated; shippable under --features ibkr, issue #120) --------
+
+#[cfg(feature = "ibkr")]
+#[test]
+fn test_ibkr_row_reconciles_with_section_8() {
+    // Issue #120 shipped the IBKR built-in behind the `ibkr` dependency-weight
+    // feature (ADR-0014), so the §8 row reconciles against a LIVE adapter. The row:
+    // an Assemble chain (`reqSecDefOptParams` + contract details -> strikes/expiries/
+    // multiplier), NO depth (option L2 unverified — no recorded option-epic fixture,
+    // so the honest claim is `false`), Greeks PROVIDED (`tickOptionComputation`
+    // streams native model Greeks + IV), an unverified per-contract ChainQuotes
+    // overlay, NO underlying stream (the subscribe leg carries only option contracts;
+    // no MarketUpdate::UnderlyingQuote is folded - the #40/#41 honesty rule), REST
+    // chain polling, NO public trades tape (no market trade tape on this path), and
+    // None auth (the TWS/Gateway holds the session; ChainView carries no secret).
+    let row = MatrixRow {
+        id: "ibkr",
+        chain: ChainCapability::Assemble,
+        depth: false,
+        greeks: GreeksCapability::Provided,
+        option_stream: OptionStreamCapability::ChainQuotes { verified: false },
+        underlying_stream: false,
+        chain_poll: true,
+        trades_tape: false,
+        auth: AuthKind::None,
+    };
+    assert_row(crate::providers::ibkr::ibkr_capabilities(), &row);
+}
+
+#[test]
+fn test_ibkr_stays_a_reserved_id() {
+    // `ibkr` is a RESERVED built-in id whether or not the `ibkr` feature is
+    // compiled: an external IBKR integration binds a DIFFERENT (non-reserved) id
+    // through the public port. When the feature is on, the built-in owns the
+    // reserved id. Reserved pre-1.0 (issue #120) so the growth was a minor bump.
+    assert!(
+        RESERVED_PROVIDER_IDS.contains(&"ibkr"),
+        "ibkr stays a reserved built-in id"
+    );
+}
+
 #[test]
 fn test_ig_stays_a_reserved_id() {
     // `ig` is a RESERVED built-in id whether or not the `ig` feature is compiled:
@@ -204,15 +245,15 @@ fn test_ig_stays_a_reserved_id() {
 
 #[test]
 fn test_every_reserved_id_is_either_reconciled_or_deferred() {
-    // The five reserved ids partition into: reconciled built-in rows above
-    // (deribit always; tastytrade/alpaca/dxlink when their feature is on) and the
-    // single deferred `ig`. This guards against a reserved id gaining an adapter
-    // without a matrix row landing here.
-    assert_eq!(RESERVED_PROVIDER_IDS.len(), 5);
-    for id in ["deribit", "tastytrade", "dxlink", "ig", "alpaca"] {
+    // The six reserved ids each have a reconciled built-in row above (deribit
+    // always; tastytrade/alpaca/dxlink/ig/ibkr when their feature is on). This
+    // guards against a reserved id gaining an adapter without a matrix row landing
+    // here.
+    assert_eq!(RESERVED_PROVIDER_IDS.len(), 6);
+    for id in ["deribit", "tastytrade", "dxlink", "ig", "alpaca", "ibkr"] {
         assert!(
             RESERVED_PROVIDER_IDS.contains(&id),
-            "{id} is one of the five reserved built-in ids"
+            "{id} is one of the six reserved built-in ids"
         );
     }
 }

@@ -76,6 +76,8 @@ use crate::providers::alpaca::AlpacaAdapter;
 use crate::providers::deribit::DeribitAdapter;
 #[cfg(feature = "dxlink")]
 use crate::providers::dxlink::DxlinkAdapter;
+#[cfg(feature = "ibkr")]
+use crate::providers::ibkr::IbkrAdapter;
 #[cfg(feature = "ig")]
 use crate::providers::ig::IgAdapter;
 #[cfg(feature = "tastytrade")]
@@ -276,7 +278,12 @@ impl ChainViewAppBuilder {
         // when absent, so zero-config Deribit is unaffected (the alpaca #99 pattern).
         #[cfg(feature = "ig")]
         let builder = builder.register_credentialed_builtin(env, ig_builtin_factory);
-        #[cfg(not(any(feature = "alpaca", feature = "ig")))]
+        // IBKR is a REAL built-in under its `ibkr` dependency-weight feature (ADR-0014):
+        // registered when `CHAINVIEW_IBKR_ENDPOINT` is configured, omitted (never an
+        // error) when absent, so zero-config Deribit is unaffected (issue #120).
+        #[cfg(feature = "ibkr")]
+        let builder = builder.register_credentialed_builtin(env, ibkr_builtin_factory);
+        #[cfg(not(any(feature = "alpaca", feature = "ig", feature = "ibkr")))]
         let _ = env;
         builder
     }
@@ -448,7 +455,7 @@ impl ChainViewAppBuilder {
     /// Deribit default is preserved); on any other typed error record it. The reserved
     /// id is EXPECTED here (built-ins own the reserved namespace), so only a duplicate
     /// — never the reserved id itself — is an error.
-    #[cfg(any(feature = "alpaca", feature = "ig"))]
+    #[cfg(any(feature = "alpaca", feature = "ig", feature = "ibkr"))]
     fn register_credentialed_builtin(
         mut self,
         env: &dyn EnvSource,
@@ -501,7 +508,7 @@ impl ChainViewAppBuilder {
 /// `Arc<dyn Provider>`, or [`ConfigError::MissingCredential`] when unconfigured (so
 /// the built-in is simply omitted). Invoked by
 /// [`register_credentialed_builtin`](ChainViewAppBuilder::register_credentialed_builtin).
-#[cfg(any(feature = "alpaca", feature = "ig"))]
+#[cfg(any(feature = "alpaca", feature = "ig", feature = "ibkr"))]
 type CredentialedBuiltinFactory = fn(&dyn EnvSource) -> Result<Arc<dyn Provider>, ConfigError>;
 
 /// The Alpaca credentialed-built-in factory (#99): read its `CHAINVIEW_ALPACA_*`
@@ -527,6 +534,20 @@ fn alpaca_builtin_factory(env: &dyn EnvSource) -> Result<Arc<dyn Provider>, Conf
 #[cfg(feature = "ig")]
 fn ig_builtin_factory(env: &dyn EnvSource) -> Result<Arc<dyn Provider>, ConfigError> {
     Ok(Arc::new(IgAdapter::from_env(env)?) as Arc<dyn Provider>)
+}
+
+/// The IBKR credentialed-built-in factory (#120): read its `CHAINVIEW_IBKR_ENDPOINT`
+/// (+ optional `CHAINVIEW_IBKR_CLIENT_ID`) from `env` and yield a registry-ready
+/// `Arc<dyn Provider>`, or [`ConfigError::MissingCredential`] when the endpoint is
+/// unconfigured (so the built-in is simply omitted). IBKR's `ibkr` feature is a
+/// **dependency-weight** gate (ADR-0014), not a credential-logging security gate, so
+/// — like [`ig_builtin_factory`] — it IS invoked by
+/// [`register_credentialed_builtin`](ChainViewAppBuilder::register_credentialed_builtin)
+/// from [`with_builtins`](ChainViewAppBuilder::with_builtins). IBKR carries no secret
+/// (the TWS/Gateway holds the session), so no credential is ever read or logged.
+#[cfg(feature = "ibkr")]
+fn ibkr_builtin_factory(env: &dyn EnvSource) -> Result<Arc<dyn Provider>, ConfigError> {
+    Ok(Arc::new(IbkrAdapter::from_env(env)?) as Arc<dyn Provider>)
 }
 
 /// Keep every still-security-gated built-in adapter compiled and linted without
@@ -1175,6 +1196,68 @@ mod tests {
                 assert_eq!(id, "ig");
             }
             other => panic!("expected UnknownProvider(ig) when unconfigured, got {other:?}"),
+        }
+        let deribit = ChainViewApp::builder()
+            .with_builtins_from_env(&empty_env())
+            .with_config(live_config("deribit"))
+            .run();
+        assert!(
+            deribit.is_ok(),
+            "the zero-config deribit default is unaffected: {deribit:?}"
+        );
+    }
+
+    /// An environment carrying a valid `CHAINVIEW_IBKR_ENDPOINT`.
+    fn ibkr_endpoint_env() -> TestEnv {
+        let mut env = HashMap::new();
+        let _ = env.insert(
+            "CHAINVIEW_IBKR_ENDPOINT".to_owned(),
+            "127.0.0.1:7497".to_owned(),
+        );
+        TestEnv(env)
+    }
+
+    #[test]
+    fn test_with_builtins_enables_ibkr_when_configured() {
+        // Issue #120: IBKR's `ibkr` feature is a DEPENDENCY-WEIGHT gate (ADR-0014),
+        // NOT a security gate, so with_builtins registers IBKR as a REAL built-in
+        // WHEN its CHAINVIEW_IBKR_ENDPOINT is configured. IBKR has an Assemble chain,
+        // so it resolves as a live source. Under `--features ibkr` a configured IBKR
+        // resolves; without the feature it is not compiled in (clean
+        // UnknownProvider). Zero-config Deribit is unaffected either way.
+        let env = ibkr_endpoint_env();
+        let result = ChainViewApp::builder()
+            .with_builtins_from_env(&env)
+            .with_config(live_config("ibkr"))
+            .run();
+        #[cfg(feature = "ibkr")]
+        assert!(
+            result.is_ok(),
+            "a configured IBKR resolves as a registered built-in under --features ibkr: {result:?}"
+        );
+        #[cfg(not(feature = "ibkr"))]
+        match result {
+            Err(ChainViewError::Config(ConfigError::UnknownProvider(id))) => {
+                assert_eq!(id, "ibkr");
+            }
+            other => panic!("without the ibkr feature the adapter is not compiled in: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_with_builtins_skips_unconfigured_ibkr_preserving_zero_config() {
+        // With NO IBKR endpoint, with_builtins omits IBKR (never a startup error), so
+        // selecting `ibkr` is a clean UnknownProvider and Deribit stays the zero-config
+        // default (the alpaca #99 / ig #39 pattern). Holds in every feature config.
+        let result = ChainViewApp::builder()
+            .with_builtins_from_env(&empty_env())
+            .with_config(live_config("ibkr"))
+            .run();
+        match result {
+            Err(ChainViewError::Config(ConfigError::UnknownProvider(id))) => {
+                assert_eq!(id, "ibkr");
+            }
+            other => panic!("expected UnknownProvider(ibkr) when unconfigured, got {other:?}"),
         }
         let deribit = ChainViewApp::builder()
             .with_builtins_from_env(&empty_env())

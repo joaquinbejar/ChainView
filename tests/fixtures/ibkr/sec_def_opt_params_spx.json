@@ -1,0 +1,16 @@
+{
+  "_comment": "A recorded-shape IBKR reqSecDefOptParams (OptionChain) + contract_details for SPX. Neutral shape (the upstream ibapi OptionChain/ContractDetails do not derive serde), parsed in src/providers/ibkr.rs tests into RawOptionParams + RawContractDetail. Multiplier 100, three near-ATM strikes, one target expiry with an authoritative 16:15 US/Eastern last-trade time.",
+  "params": {
+    "trading_class": "SPX",
+    "multiplier": "100",
+    "exchange": "SMART",
+    "underlying_conid": 416904,
+    "expirations": ["20260717", "20260821"],
+    "strikes": [7400.0, 7500.0, 7600.0]
+  },
+  "contract_detail": {
+    "expiration_ymd": "20260717",
+    "last_trade_time": "16:15:00",
+    "time_zone_id": "US/Eastern"
+  }
+}

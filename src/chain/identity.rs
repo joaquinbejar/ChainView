@@ -13,7 +13,7 @@
 //!   `provider`, native/stream aliases, and `spec`); equality and hashing
 //!   delegate to `key` **only**.
 //! - [`ProviderId`] — an **open, validated** provider identity newtype; the
-//!   five built-in ids in [`RESERVED_PROVIDER_IDS`] are reserved for the
+//!   six built-in ids in [`RESERVED_PROVIDER_IDS`] are reserved for the
 //!   bundled adapters.
 
 use std::hash::{Hash, Hasher};
@@ -145,10 +145,13 @@ impl Hash for Instrument {
     }
 }
 
-/// The provider ids ChainView reserves for its five bundled adapters. An
-/// external registration that reuses one is a typed startup error (the registry
-/// lands in issue #12); [`ProviderId::is_reserved`] reports membership.
-pub const RESERVED_PROVIDER_IDS: [&str; 5] = ["deribit", "tastytrade", "dxlink", "ig", "alpaca"];
+/// The provider ids ChainView reserves for its bundled adapters. An external
+/// registration that reuses one is a typed startup error (the registry lands in
+/// issue #12); [`ProviderId::is_reserved`] reports membership. `ibkr` (issue
+/// #120) was reserved pre-1.0 so the growth is a minor, not a major (SEMVER.md
+/// reserved-id-growth rule).
+pub const RESERVED_PROVIDER_IDS: [&str; 6] =
+    ["deribit", "tastytrade", "dxlink", "ig", "alpaca", "ibkr"];
 
 /// An **open, validated** market-data provider identity — the registry key, the
 /// config namespace segment, and the log label for an adapter
@@ -222,7 +225,7 @@ impl ProviderId {
         &self.0
     }
 
-    /// True for exactly the five ids reserved for the built-in adapters
+    /// True for exactly the six ids reserved for the built-in adapters
     /// ([`RESERVED_PROVIDER_IDS`]).
     #[must_use]
     pub fn is_reserved(&self) -> bool {
@@ -446,9 +449,9 @@ mod tests {
     // --- RESERVED_PROVIDER_IDS -----------------------------------------------
 
     #[test]
-    fn test_reserved_provider_ids_membership_is_exactly_five() {
-        assert_eq!(RESERVED_PROVIDER_IDS.len(), 5);
-        for id in ["deribit", "tastytrade", "dxlink", "ig", "alpaca"] {
+    fn test_reserved_provider_ids_membership_is_exactly_six() {
+        assert_eq!(RESERVED_PROVIDER_IDS.len(), 6);
+        for id in ["deribit", "tastytrade", "dxlink", "ig", "alpaca", "ibkr"] {
             assert!(pid(id).is_reserved(), "`{id}` should be reserved");
         }
     }
