@@ -12,6 +12,28 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+### Added
+
+- **IG provider** (`src/providers/ig.rs`, issue #39), behind a disabled-by-default
+  `ig` Cargo feature (a dependency-weight gate per ADR-0013; a real built-in in
+  `with_builtins()` when the feature is on and `CHAINVIEW_IG_*` is configured, so
+  zero-config Deribit is unaffected). Assembles a `Partial` chain from IG's
+  market-navigation hierarchy, resolves each expiry to an absolute UTC instant at
+  the seam (timestamped field wins; date-only via the market's IANA session close;
+  ambiguous -> `ProviderError::Normalize`), computes Greeks/IV **locally** through
+  the #24 engine (tagged `ComputedLocally`, IG supplies none), and overlays live
+  per-epic quotes over Lightstreamer with an adapter-owned reconnect/resubscribe
+  loop. Env-only credentials via `Config::from_credentials` + `Client::with_config`
+  (never `.env`, never the `IG_*` namespace), never logged. Capabilities are
+  honest: `chain: Partial`, `depth: unverified` (pending the #50 option-epic
+  fixture), `greeks: ComputedLocally`, `option_stream: ChainQuotes` (unverified),
+  `underlying_stream: false` (only option epics stream), `chain_poll: Poll`,
+  `trades_tape: false`, `auth: UserPass`. Consumes `ig-client 0.12` (default
+  features: persistence + streaming); the GPL-3.0-only `lightstreamer-rs`
+  transitive is accepted under a narrow, TEMPORARY `deny.toml` license exception
+  scoped to that one crate (removed when the transport moves to an MIT
+  implementation).
+
 ### Changed
 
 - **MSRV raised from 1.88 to 1.94** (a minor bump per docs/SEMVER.md). The IG

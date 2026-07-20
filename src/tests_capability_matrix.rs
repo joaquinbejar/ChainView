@@ -12,9 +12,10 @@
 //!
 //! It lives in-crate (like `tests_integration`) because it reads each adapter's
 //! crate-private `<id>_capabilities()` — none of which is on the public surface.
-//! The gated adapters (`tastytrade` / `alpaca` / `dxlink`) are asserted only when
-//! their Cargo feature is on; the default build reconciles the always-compiled
-//! `deribit` row and the IG-deferred marker.
+//! The feature-gated adapters (`tastytrade` / `alpaca` / `dxlink` / `ig`) are
+//! asserted only when their Cargo feature is on; the default build reconciles the
+//! always-compiled `deribit` row (plus the IG-id-reserved invariant and the
+//! shape-only IG option-epic depth fixture).
 
 use crate::{
     AuthKind, ChainCapability, ChainPollCapability, GreeksCapability, OptionStreamCapability,
@@ -159,18 +160,43 @@ fn test_dxlink_row_reconciles_with_section_8() {
     assert_row(crate::providers::dxlink::dxlink_capabilities(), &row);
 }
 
-// --- IG: deferred, N/A (issue #39) -------------------------------------------
+// --- IG (feature-gated; shippable under --features ig, issue #39) ------------
+
+#[cfg(feature = "ig")]
+#[test]
+fn test_ig_row_reconciles_with_section_8() {
+    // Issue #39 shipped the IG built-in behind the `ig` dependency-weight feature
+    // (ADR-0013), so the §8 row now reconciles against a LIVE adapter — the flip of
+    // the old "deferred, N/A" marker. The row: a Partial (navigation-assembled)
+    // chain, NO depth (a dated-option epic does not populate the five-level ladder;
+    // #50), Greeks COMPUTED LOCALLY (IG supplies none — the store's Black-Scholes
+    // via optionstratlib), an unverified per-epic ChainQuotes overlay, NO underlying
+    // stream (the subscribe leg carries only option epics; IG exposes no underlying
+    // spot, so nothing folds an underlying quote - the #40/#41 honesty rule), REST
+    // chain polling, NO public trades tape (IG's "trade" stream is the user's own
+    // deal confirmations), and UserPass auth.
+    let row = MatrixRow {
+        id: "ig",
+        chain: ChainCapability::Partial,
+        depth: false,
+        greeks: GreeksCapability::ComputedLocally,
+        option_stream: OptionStreamCapability::ChainQuotes { verified: false },
+        underlying_stream: false,
+        chain_poll: true,
+        trades_tape: false,
+        auth: AuthKind::UserPass,
+    };
+    assert_row(crate::providers::ig::ig_capabilities(), &row);
+}
 
 #[test]
-fn test_ig_row_is_deferred_not_shipped() {
-    // The `ig` §8 row is a **deferred** built-in (docs/03 §7.4/§8): `ig-client`
-    // 0.12.1 exposes no config-injectable constructor, so no adapter ships and
-    // there is no `ig_capabilities()` to reconcile. The id stays RESERVED (an
-    // external IG integration binds it through the public port), so this row is
-    // marked N/A rather than asserted against a live adapter.
+fn test_ig_stays_a_reserved_id() {
+    // `ig` is a RESERVED built-in id whether or not the `ig` feature is compiled:
+    // an external IG integration binds a DIFFERENT (non-reserved) id through the
+    // public port. When the feature is on, the built-in owns the reserved id.
     assert!(
         RESERVED_PROVIDER_IDS.contains(&"ig"),
-        "ig stays a reserved id while the built-in is deferred"
+        "ig stays a reserved built-in id"
     );
 }
 
@@ -193,15 +219,15 @@ fn test_every_reserved_id_is_either_reconciled_or_deferred() {
 
 // --- IG option-epic depth fixture: the evidence-on-file disposition (#50) -----
 //
-// The `ig` §8 depth cell was `unverified` — the client models a five-level ladder,
-// but whether a DATED-OPTION epic populates it was unproven. Issue #50 lands the
-// option-epic depth fixture that answers it. Because the IG built-in adapter is
-// DEFERRED (#39) there is no adapter to drive it through, so the fixture is committed
-// as a DATA artifact (`tests/fixtures/ig/depth/`, see its README) and this shape test
-// is the meaningful check available WITHOUT the adapter: it parses as the documented
-// `ig-client` wire shape and confirms the five-level DOM fields are UNPOPULATED for a
-// dated-option epic — the evidence pointing the depth cell at `no`, on file for when
-// #39 unblocks (`docs/03-data-providers.md` §8, §7.4; `docs/TESTING.md` §5).
+// The `ig` §8 depth cell is `unverified` — the client models a five-level ladder,
+// but whether a DATED-OPTION epic populates it is unproven from a RECORDED live
+// payload. The #39 IG built-in declares `depth: false` on this evidence; issue #50
+// lands the recorded option-epic depth fixture that would flip the cell to a
+// verified `no`. This shape test parses the committed DATA artifact
+// (`tests/fixtures/ig/depth/`, see its README) as the documented `ig-client` wire
+// shape and confirms the five-level DOM fields are UNPOPULATED for a dated-option
+// epic — the evidence backing the adapter's `depth: false`
+// (`docs/03-data-providers.md` §8, §7.4; `docs/TESTING.md` §5).
 
 /// The committed IG option-epic depth fixture, baked in with `include_str!` so the
 /// shape check is byte-stable and needs no I/O.
@@ -315,15 +341,15 @@ fn test_ig_option_epic_depth_fixture_shape_proves_no_populated_ladder() {
 }
 
 #[test]
-fn test_ig_depth_disposition_is_evidence_on_file_pending_39() {
-    // The disposition: `ig` stays a RESERVED id with its built-in adapter DEFERRED
-    // (#39). The option-epic depth fixture is SHAPE-ONLY (hand-authored to the
-    // documented wire shape, not a recorded live payload - it cannot establish
-    // what a live venue populates), so the matrix depth cell stays UNVERIFIED
-    // until a recorded payload or authoritative provider documentation exists;
-    // the definitive flip - either way - lands with the #39 unblock.
+fn test_ig_depth_disposition_is_evidence_on_file() {
+    // The disposition: the IG built-in now ships behind the `ig` feature (#39) and
+    // declares `depth: false` (proven by `test_ig_row_reconciles_with_section_8`
+    // under the feature). The option-epic depth fixture above remains SHAPE-ONLY
+    // (hand-authored to the documented wire shape, not a recorded live payload), so
+    // the matrix depth cell stays `unverified` — the adapter honestly claims no
+    // option order book — until a RECORDED live payload lands (issue #50, v0.5).
     assert!(
         RESERVED_PROVIDER_IDS.contains(&"ig"),
-        "ig stays reserved while the built-in is deferred (#39)",
+        "ig is a reserved built-in id (#39)",
     );
 }

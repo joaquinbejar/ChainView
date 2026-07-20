@@ -147,6 +147,24 @@ pub(crate) mod alpaca;
 #[cfg(feature = "dxlink")]
 pub(crate) mod dxlink;
 
+/// The IG adapter — the navigation-assembled, local-Greeks poll->stream provider
+/// (issue #39, `docs/03-data-providers.md` §7.4). Behind the DISABLED-by-default
+/// `ig` Cargo feature — a **dependency-weight** gate ([ADR-0013]), NOT a
+/// credential-logging security gate — so under the feature it is a **real
+/// built-in**: [`with_builtins`](crate::ChainViewAppBuilder::with_builtins)
+/// registers it when its `CHAINVIEW_IG_*` credentials are configured (omitting it,
+/// never erroring, when absent, so the zero-config Deribit default is unaffected).
+/// It stays off a default build only to keep the heavy `ig-client` tree (sqlx +
+/// the GPL `lightstreamer-rs`) out. IG exposes NEITHER venue Greeks/IV NOR option
+/// depth: the adapter declares `greeks: ComputedLocally` (the store fills them via
+/// `src/chain/greeks.rs`) and `depth: false`. Crate-internal: no raw `ig-client`
+/// DTO crosses the port — every upstream struct is normalized to the domain model
+/// inside this module.
+///
+/// [ADR-0013]: https://github.com/joaquinbejar/ChainView/blob/main/docs/adr/0013-ig-builtin-packaging-and-0122-supply-chain-stop.md
+#[cfg(feature = "ig")]
+pub(crate) mod ig;
+
 /// The seam every adapter implements: one trait, one adapter per provider id
 /// (`docs/03-data-providers.md` §2).
 ///

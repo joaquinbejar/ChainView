@@ -76,6 +76,8 @@ use crate::providers::alpaca::AlpacaAdapter;
 use crate::providers::deribit::DeribitAdapter;
 #[cfg(feature = "dxlink")]
 use crate::providers::dxlink::DxlinkAdapter;
+#[cfg(feature = "ig")]
+use crate::providers::ig::IgAdapter;
 #[cfg(feature = "tastytrade")]
 use crate::providers::tastytrade::TastytradeAdapter;
 use crate::providers::{Provider, SubscriptionRequest};
@@ -269,7 +271,12 @@ impl ChainViewAppBuilder {
         let builder = self.register_builtin(DeribitAdapter::new());
         #[cfg(feature = "alpaca")]
         let builder = builder.register_credentialed_builtin(env, alpaca_builtin_factory);
-        #[cfg(not(feature = "alpaca"))]
+        // IG is a REAL built-in under its `ig` dependency-weight feature (ADR-0013):
+        // registered when `CHAINVIEW_IG_*` is configured, omitted (never an error)
+        // when absent, so zero-config Deribit is unaffected (the alpaca #99 pattern).
+        #[cfg(feature = "ig")]
+        let builder = builder.register_credentialed_builtin(env, ig_builtin_factory);
+        #[cfg(not(any(feature = "alpaca", feature = "ig")))]
         let _ = env;
         builder
     }
@@ -441,7 +448,7 @@ impl ChainViewAppBuilder {
     /// Deribit default is preserved); on any other typed error record it. The reserved
     /// id is EXPECTED here (built-ins own the reserved namespace), so only a duplicate
     /// — never the reserved id itself — is an error.
-    #[cfg(feature = "alpaca")]
+    #[cfg(any(feature = "alpaca", feature = "ig"))]
     fn register_credentialed_builtin(
         mut self,
         env: &dyn EnvSource,
@@ -494,7 +501,7 @@ impl ChainViewAppBuilder {
 /// `Arc<dyn Provider>`, or [`ConfigError::MissingCredential`] when unconfigured (so
 /// the built-in is simply omitted). Invoked by
 /// [`register_credentialed_builtin`](ChainViewAppBuilder::register_credentialed_builtin).
-#[cfg(feature = "alpaca")]
+#[cfg(any(feature = "alpaca", feature = "ig"))]
 type CredentialedBuiltinFactory = fn(&dyn EnvSource) -> Result<Arc<dyn Provider>, ConfigError>;
 
 /// The Alpaca credentialed-built-in factory (#99): read its `CHAINVIEW_ALPACA_*`
@@ -508,6 +515,18 @@ type CredentialedBuiltinFactory = fn(&dyn EnvSource) -> Result<Arc<dyn Provider>
 #[cfg(feature = "alpaca")]
 fn alpaca_builtin_factory(env: &dyn EnvSource) -> Result<Arc<dyn Provider>, ConfigError> {
     Ok(Arc::new(AlpacaAdapter::from_env(env)?) as Arc<dyn Provider>)
+}
+
+/// The IG credentialed-built-in factory (#39): read its `CHAINVIEW_IG_*` credentials
+/// from `env` and yield a registry-ready `Arc<dyn Provider>`, or
+/// [`ConfigError::MissingCredential`] when unconfigured (so the built-in is simply
+/// omitted). IG's `ig` feature is a **dependency-weight** gate (ADR-0013), not a
+/// credential-logging security gate, so — like [`alpaca_builtin_factory`] — it IS
+/// invoked by [`register_credentialed_builtin`](ChainViewAppBuilder::register_credentialed_builtin)
+/// from [`with_builtins`](ChainViewAppBuilder::with_builtins).
+#[cfg(feature = "ig")]
+fn ig_builtin_factory(env: &dyn EnvSource) -> Result<Arc<dyn Provider>, ConfigError> {
+    Ok(Arc::new(IgAdapter::from_env(env)?) as Arc<dyn Provider>)
 }
 
 /// Keep every still-security-gated built-in adapter compiled and linted without
@@ -1095,6 +1114,68 @@ mod tests {
             other => panic!("expected UnknownProvider(alpaca) when unconfigured, got {other:?}"),
         }
         // Deribit still resolves (the zero-config default is unaffected).
+        let deribit = ChainViewApp::builder()
+            .with_builtins_from_env(&empty_env())
+            .with_config(live_config("deribit"))
+            .run();
+        assert!(
+            deribit.is_ok(),
+            "the zero-config deribit default is unaffected: {deribit:?}"
+        );
+    }
+
+    /// An environment carrying valid `CHAINVIEW_IG_*` credentials.
+    fn ig_creds_env() -> TestEnv {
+        let mut env = HashMap::new();
+        let _ = env.insert("CHAINVIEW_IG_USERNAME".to_owned(), "alice".to_owned());
+        let _ = env.insert("CHAINVIEW_IG_PASSWORD".to_owned(), "test-pw".to_owned());
+        let _ = env.insert("CHAINVIEW_IG_API_KEY".to_owned(), "test-key".to_owned());
+        TestEnv(env)
+    }
+
+    #[test]
+    fn test_with_builtins_enables_ig_when_configured() {
+        // Issue #39: IG's `ig` feature is a DEPENDENCY-WEIGHT gate (ADR-0013), NOT a
+        // security gate, so with_builtins registers IG as a REAL built-in WHEN its
+        // CHAINVIEW_IG_* credentials are configured — the flip of the old
+        // "ig is never built / deferred" assertion. IG has a Partial (navigation)
+        // chain, so it resolves as a live source. Under `--features ig` a configured
+        // IG resolves; without the feature it is not compiled in (clean
+        // UnknownProvider). Zero-config Deribit is unaffected either way.
+        let env = ig_creds_env();
+        let result = ChainViewApp::builder()
+            .with_builtins_from_env(&env)
+            .with_config(live_config("ig"))
+            .run();
+        #[cfg(feature = "ig")]
+        assert!(
+            result.is_ok(),
+            "a configured IG resolves as a registered built-in under --features ig: {result:?}"
+        );
+        #[cfg(not(feature = "ig"))]
+        match result {
+            Err(ChainViewError::Config(ConfigError::UnknownProvider(id))) => {
+                assert_eq!(id, "ig");
+            }
+            other => panic!("without the ig feature the adapter is not compiled in: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_with_builtins_skips_unconfigured_ig_preserving_zero_config() {
+        // With NO IG credentials, with_builtins omits IG (never a startup error), so
+        // selecting `ig` is a clean UnknownProvider and Deribit stays the zero-config
+        // default (the alpaca #99 pattern). Holds in every feature configuration.
+        let result = ChainViewApp::builder()
+            .with_builtins_from_env(&empty_env())
+            .with_config(live_config("ig"))
+            .run();
+        match result {
+            Err(ChainViewError::Config(ConfigError::UnknownProvider(id))) => {
+                assert_eq!(id, "ig");
+            }
+            other => panic!("expected UnknownProvider(ig) when unconfigured, got {other:?}"),
+        }
         let deribit = ChainViewApp::builder()
             .with_builtins_from_env(&empty_env())
             .with_config(live_config("deribit"))

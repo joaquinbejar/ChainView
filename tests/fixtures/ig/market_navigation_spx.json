@@ -1,0 +1,70 @@
+{
+  "nodes": [
+    { "id": "195235", "name": "US 500 Options" }
+  ],
+  "markets": [
+    {
+      "epic": "IX.D.SPX.DAILY.IP",
+      "instrumentName": "US 500",
+      "instrumentType": "INDICES",
+      "expiry": "-",
+      "marketStatus": "TRADEABLE",
+      "bid": 7500.0,
+      "offer": 7500.5
+    },
+    {
+      "epic": "OP.D.SPX2.7400C.IP",
+      "instrumentName": "US 500 7400 CALL",
+      "instrumentType": "OPT_INDICES",
+      "expiry": "18-JUL-26",
+      "marketStatus": "TRADEABLE",
+      "bid": 120.0,
+      "offer": 122.0
+    },
+    {
+      "epic": "OP.D.SPX2.7400P.IP",
+      "instrumentName": "US 500 7400 PUT",
+      "instrumentType": "OPT_INDICES",
+      "expiry": "18-JUL-26",
+      "marketStatus": "TRADEABLE",
+      "bid": 18.0,
+      "offer": 20.0
+    },
+    {
+      "epic": "OP.D.SPX2.7500C.IP",
+      "instrumentName": "US 500 7500 CALL",
+      "instrumentType": "OPT_INDICES",
+      "expiry": "18-JUL-26",
+      "marketStatus": "TRADEABLE",
+      "bid": 55.0,
+      "offer": 57.0
+    },
+    {
+      "epic": "OP.D.SPX2.7500P.IP",
+      "instrumentName": "US 500 7500 PUT",
+      "instrumentType": "OPT_INDICES",
+      "expiry": "18-JUL-26",
+      "marketStatus": "TRADEABLE",
+      "bid": 52.0,
+      "offer": 54.0
+    },
+    {
+      "epic": "OP.D.SPX2.7600C.IP",
+      "instrumentName": "US 500 7600 CALL",
+      "instrumentType": "OPT_INDICES",
+      "expiry": "18-JUL-26",
+      "marketStatus": "TRADEABLE",
+      "bid": 16.0,
+      "offer": 18.0
+    },
+    {
+      "epic": "OP.D.SPX2.7600P.IP",
+      "instrumentName": "US 500 7600 PUT",
+      "instrumentType": "OPT_INDICES",
+      "expiry": "18-JUL-26",
+      "marketStatus": "TRADEABLE",
+      "bid": 118.0,
+      "offer": 120.0
+    }
+  ]
+}
