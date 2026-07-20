@@ -25,7 +25,13 @@ use crate::chain::ProviderId;
 /// [`ChainViewError::provider`] helper (the `Provider` variant additionally
 /// carries the `ProviderId`, so the conversion is deliberately not a blanket
 /// `From`). No variant carries a raw upstream string or a credential.
+///
+/// `#[non_exhaustive]` (issue #116): every top-level public error enum carries
+/// the same v1.0 freeze discipline as [`BundleError`] — a future variant lands
+/// as a **source-compatible minor**, never a major, so a downstream match must
+/// carry a wildcard arm. In-crate matches still exhaustiveness-check.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ChainViewError {
     /// A provider adapter failed. Carries the provider identity alongside the
     /// typed, redaction-safe [`ProviderError`]. Built via
@@ -76,6 +82,7 @@ impl ChainViewError {
 /// never a panic or a silent last-writer-wins. Every variant names only a
 /// public provider id — never a credential.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum RegistryError {
     /// An external registration reused one of `RESERVED_PROVIDER_IDS`.
     #[error("provider id `{0}` is reserved for a built-in adapter")]
@@ -182,6 +189,7 @@ pub enum BundleError {
 /// the secret itself — the credential guarantee (`docs/SECURITY.md` §1) is why
 /// no variant here can carry secret material.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ConfigError {
     /// A provider that requires authentication has no credential configured.
     /// Names the provider only — never the missing key or its value.
@@ -217,6 +225,7 @@ pub enum ConfigError {
 /// Error`. Hand-implementing preserves the documented public field names exactly
 /// while still yielding a typed [`std::error::Error`].
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum OverlayError {
     /// A fingerprint dimension (multiplier / settlement / exercise / quote
     /// currency / venue product code) disagreed between the source and overlay
@@ -352,6 +361,7 @@ impl Redacted for TransportDetail {}
 /// cannot reach displayed error text or a log (`docs/03-data-providers.md` §6).
 /// Convert into [`ChainViewError`] via [`ChainViewError::provider`].
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ProviderError {
     /// The provider does not support the requested operation. The message is a
     /// compile-time `&'static str`, never runtime data.
