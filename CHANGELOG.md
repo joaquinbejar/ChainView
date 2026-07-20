@@ -12,6 +12,14 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+### Changed
+
+- All top-level public error enums (`ChainViewError`, `ProviderError`,
+  `ConfigError`, `RegistryError`, `OverlayError`) are now `#[non_exhaustive]`
+  (#116), completing the v1.0 error-surface freeze discipline started with
+  `BundleError`: a future variant addition is a source-compatible minor on
+  every public error enum, and a downstream match must carry a wildcard arm.
+
 ### Added
 
 - **Release packaging and the zero-config headline-acceptance procedure** (issue
