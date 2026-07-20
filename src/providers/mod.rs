@@ -118,13 +118,17 @@ pub(crate) mod dxfeed_decode;
 pub(crate) mod tastytrade;
 
 /// The Alpaca adapter — the composed, completeness-provable poll->stream provider
-/// (issue #41, `docs/03-data-providers.md` §7.5). Behind the DISABLED-by-default
-/// `alpaca` Cargo feature and **excluded from `with_builtins()`**: like tastytrade
-/// it is reachable only through the explicit `with_gated_builtin(id)` opt-in, which
-/// fails with a typed startup error while the gate holds
-/// (`docs/SECURITY.md` §2.4). Crate-internal: no raw `alpaca-http` /
-/// `alpaca-websocket` DTO crosses the port — every upstream struct is normalized to
-/// the domain model inside this module.
+/// (issues #41, #99, `docs/03-data-providers.md` §7.5). Its upstream
+/// credential-logging security gate is **lifted** (`docs/SECURITY.md` §2.4): the
+/// pinned `alpaca-websocket 0.6.0` masks the key and never logs the secret, proven by
+/// a captured-log test at the ChainView boundary
+/// (`alpaca::tests::test_auth_subscribe_cycle_never_logs_credentials`). So under this
+/// feature it is a **real built-in** — `with_builtins()` registers it when its
+/// `CHAINVIEW_ALPACA_*` credentials are configured (omitting it, never erroring, when
+/// absent). It stays behind the DISABLED-by-default `alpaca` Cargo feature only to
+/// keep the heavy upstream deps out of a default build. Crate-internal: no raw
+/// `alpaca-http` / `alpaca-websocket` DTO crosses the port — every upstream struct is
+/// normalized to the domain model inside this module.
 #[cfg(feature = "alpaca")]
 pub(crate) mod alpaca;
 

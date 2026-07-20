@@ -19,6 +19,17 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   (#116), completing the v1.0 error-surface freeze discipline started with
   `BundleError`: a future variant addition is a source-compatible minor on
   every public error enum, and a downstream match must carry a wildcard arm.
+- **The alpaca provider's credential-logging security gate is lifted** (issue
+  #99): `alpaca-websocket 0.6.0` masks the API key/secret in its auth logs
+  (verified by the upstream captured-log test and a new ChainView-boundary
+  captured-log test driving a full connect/auth/subscribe cycle over a local
+  mock socket via the client's public `with_url` seam, asserting only the
+  `****suffix` masked form ever appears). `with_builtins()` now registers
+  `alpaca` as a real credentialed built-in **when `CHAINVIEW_ALPACA_*` is
+  configured** (omitted, never a startup error, when absent — so zero-config
+  Deribit is unchanged); the docs/03 §8 matrix cell flips gated -> shippable.
+  Dev-only proof deps (`tokio-tungstenite`/`tracing`/`tracing-subscriber`) were
+  already in the resolved graph — `Cargo.lock` gained zero new packages.
 
 ### Fixed
 

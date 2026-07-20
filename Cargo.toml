@@ -61,14 +61,18 @@ bench = []
 # does not compile the adapter or pull the `tastytrade` crate at all. `dep:` keeps
 # the optional crate from implicitly defining a same-named feature.
 tastytrade = ["dep:tastytrade"]
-# `alpaca` gates the whole Alpaca adapter (`src/providers/alpaca.rs`, issue #41).
-# It is DISABLED by default and stays off the shippable set: like tastytrade, the
-# adapter is excluded from `with_builtins()` and reachable only via the explicit
-# `with_gated_builtin(id)` opt-in, which fails with a typed startup error while the
-# gate holds (docs/SECURITY.md §2.4). A normal `cargo build` (no `--features
-# alpaca`) does not compile the adapter or pull the `alpaca-http` /
-# `alpaca-websocket` crates at all. `dep:` keeps the optional crates from
-# implicitly defining same-named features.
+# `alpaca` gates the whole Alpaca adapter (`src/providers/alpaca.rs`, issues #41,
+# #99). Its upstream credential-logging SECURITY gate is LIFTED (docs/SECURITY.md
+# §2.4): the pinned `alpaca-websocket 0.6.0` masks the key and never logs the
+# secret, proven by a captured-log test at the ChainView boundary
+# (`test_auth_subscribe_cycle_never_logs_credentials`). So under this feature the
+# adapter is a REAL built-in — `with_builtins()` registers it when its
+# `CHAINVIEW_ALPACA_*` credentials are configured (and omits it, never erroring,
+# when they are absent, so zero-config Deribit is unaffected). The feature stays
+# DISABLED by default only to keep the heavy upstream deps out of a default build:
+# a normal `cargo build` (no `--features alpaca`) does not compile the adapter or
+# pull the `alpaca-http` / `alpaca-websocket` crates at all. `dep:` keeps the
+# optional crates from implicitly defining same-named features.
 alpaca = ["dep:alpaca-http", "dep:alpaca-websocket", "dep:futures-util"]
 # `fuzz` gates the fuzz-only harness surface (`src/fuzz_support.rs` plus the
 # `#[cfg(feature = "fuzz")]` `pub(crate)` Deribit normalize entry points reached
@@ -299,9 +303,36 @@ hdrhistogram = "7"
 # `test-util` enables the controllable virtual clock (`#[tokio::test(start_paused
 # = true)]`, `tokio::time::pause`/`advance`) so the supervisor's 2 s
 # bounded-join-then-abort is asserted with ZERO real wall-clock wait (issue #11).
-# Dev-only, so it never rides in the release binary; the runtime/macros/time
-# features it needs are already in the main `tokio` dependency.
-tokio = { version = "1", default-features = false, features = ["test-util"] }
+# `net` gives the `TcpListener` the Alpaca captured-log redaction proof's local mock
+# WebSocket server binds (issue #99, `src/providers/alpaca.rs`); it is already
+# feature-unified into the tree by `deribit-http`/`reqwest`, so this only names it
+# explicitly for the dev build. Dev-only, so none rides in the release binary; the
+# runtime/macros/time features are already in the main `tokio` dependency.
+tokio = { version = "1", default-features = false, features = [
+    "test-util",
+    "net",
+] }
+# The Alpaca gate-lift captured-log proof (issue #99, `docs/SECURITY.md` §2.4). The
+# redaction test drives the REAL upstream `alpaca-websocket` connect/auth/subscribe
+# cycle over a LOCAL mock WebSocket server (via the published
+# `AlpacaWebSocketClient::with_url` seam) and asserts the captured `tracing` output
+# masks the API key/secret. DEV-ONLY — none rides in the release binary — and all
+# three are a "no new crate" promotion of crates already resolved in the graph, so
+# `cargo audit`/`cargo deny` see NO new surface (the same pattern as #29's
+# `serde_json`): `tokio-tungstenite 0.29` is already pulled by the non-optional
+# `deribit-websocket` (and `alpaca-websocket`); `tracing`/`tracing-subscriber` are
+# already pulled by the non-optional `optionstratlib` (and `deribit`/`tastytrade`).
+# Feature trim keeps only what the test needs: `handshake` for the server-side
+# `accept_async` on a `ws://` (no TLS) mock, and `fmt` for the in-memory capturing
+# subscriber. Explicit-approval addition (CLAUDE.md "Coding Rules") — audit note in
+# CHANGELOG (ADR-0007).
+tokio-tungstenite = { version = "0.29", default-features = false, features = [
+    "handshake",
+] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+    "fmt",
+] }
 # The Parquet test-writer support (issues #30/#31). DEV-ONLY — none rides in the
 # release binary. `arrow-schema` (matched to `parquet` 59's arrow epoch) builds the
 # `Schema`/`Field`/`DataType` values the `#[cfg(test)]` writers use to serialise
