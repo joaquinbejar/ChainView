@@ -93,6 +93,13 @@ fuzz = []
 # not compile the adapter or pull the `dxlink` crate at all. `dep:` keeps the
 # optional crate from implicitly defining a same-named feature.
 dxlink = ["dep:dxlink"]
+# NOTE (issue #39, ADR-0013): the PLANNED `ig` feature — a DEPENDENCY-WEIGHT gate
+# (NOT a credential-logging security gate; the feature-on adapter would be a REAL
+# built-in in `with_builtins()`, never `with_gated_builtin`) — is intentionally
+# ABSENT. Adding it now would require adding `ig-client 0.12.2`, which is a
+# documented STOP (GPL-3.0-only `lightstreamer-rs` + `sqlx 0.9` MSRV 1.94 > 1.88;
+# see the `[dependencies]` note below and ADR-0013). The feature and its `ig-client`
+# optional dep land together only when upstream clears both blockers.
 
 [lib]
 name = "chainview"
@@ -246,6 +253,20 @@ futures-util = { version = "0.3", default-features = false, optional = true }
 # at both 0.2.0 (this direct dep) and 0.1.5 (transitive via the gated tastytrade
 # 0.3.0), a deny.toml `multiple-versions = "warn"` duplicate, never a failure.
 dxlink = { version = "0.2", optional = true }
+# NOTE (issue #39, ADR-0013): `ig-client` is NOT added here — the IG built-in
+# stays DEFERRED. The 0.12.1 injection blocker was cleared by 0.12.2
+# (`Config::from_credentials` + `Client::with_config`), but a REAL audit/deny run
+# surfaced two NEW hard blockers, either alone disqualifying, both traced to
+# `ig-client 0.12.2` having NO Cargo features (it unconditionally pulls its full
+# persistence + streaming stack): (1) `ig-client -> lightstreamer-rs 0.3.3` is
+# `GPL-3.0-only` (copyleft) — `cargo deny check licenses` FAILS; allow-listing it
+# would weaken ChainView's permissive-only license policy AND contaminate the MIT
+# crate; (2) `ig-client -> sqlx 0.9.0` requires Rust 1.94.0, above ChainView's
+# 1.88 MSRV, so the `--all-features` 1.88 non-negotiable build cannot compile.
+# Per the #39-deferral precedent (never weaken a rule to force a dep), IG re-enters
+# only when upstream `ig-client` feature-gates its `sqlx`/`dotenv` persistence
+# layer OFF by default AND resolves the GPL `lightstreamer-rs` (feature-gate the
+# streaming leg or move to a permissively-licensed client). Full ruling: ADR-0013.
 # The Parquet reader for the IronCondor result bundle (issue #30, ADR-0010,
 # `docs/04-replay-mode.md` §2/§3). The bundle's four tables are Parquet; the
 # reader decodes them batch-by-batch under measured resource ceilings. ChainView
