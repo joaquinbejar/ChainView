@@ -110,20 +110,20 @@ name = "chainview"
 path = "src/main.rs"
 
 [dependencies]
-thiserror = "2"
-serde = { version = "1", features = ["derive"] }
+thiserror = "2.0"
+serde = { version = "1.0", features = ["derive"] }
 # The opaque manifest blobs in the replay result-bundle contract
 # (`config`/`strategy`/`data_source`/`metrics` are `serde_json::Value`, issue #29,
 # `docs/04-replay-mode.md` §2.1). Explicit-approval addition (CLAUDE.md "Coding
 # Rules"). Supply-chain: NO new surface — `serde_json` is already in the
 # transitive tree via `deribit-http`/`deribit-websocket`, so this only promotes an
 # existing crate to a direct dependency; audit note in CHANGELOG (ADR-0007).
-serde_json = "1"
-toml = "1"
-humantime = "2"
+serde_json = "1.0"
+toml = "1.0"
+humantime = "2.0"
 clap = { version = "4.5", features = ["derive"] }
 dotenvy = "0.15"
-optionstratlib = { version = "0.18.0", default-features = false }
+optionstratlib = { version = "0.18", default-features = false }
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 async-trait = "0.1"
 # `rt`/`macros`/`time` join the existing `sync` for the task supervisor (issue
@@ -133,7 +133,7 @@ async-trait = "0.1"
 # `tokio::time::timeout`. The `net`/`fs`/`rt-multi-thread` features are not
 # requested here, but `deribit-http` (#15) feature-unifies `tokio` toward `full`
 # transitively; the render loop (#13) still picks the runtime flavor.
-tokio = { version = "1", default-features = false, features = [
+tokio = { version = "1.0", default-features = false, features = [
     "sync",
     "rt",
     "macros",
@@ -167,7 +167,7 @@ crossterm = "0.28"
 # install is needed here — the HTTP client relies on `reqwest`'s default TLS and
 # exposes no `install_default_crypto_provider`; any provider install belongs to
 # the websocket path (#16), and no live TLS handshake runs in the test suite.
-deribit-http = "0.7.1"
+deribit-http = "0.7"
 # The Deribit WebSocket client (issue #16, the streaming overlay + reconnect
 # loop). Wraps the venue's JSON-RPC 2.0 over WebSocket; ChainView never
 # reimplements the protocol (CLAUDE.md "Key Decisions"). Explicit-approval
@@ -182,7 +182,7 @@ deribit-http = "0.7.1"
 # needed no provider install), plus `futures-util`. It shares `tokio`
 # (feature-unified toward `full`), `serde`/`serde_json`, `url`, and `dotenv`
 # with the existing tree. `aws-lc-rs` requires a C/ASM toolchain at build time.
-deribit-websocket = "0.3.1"
+deribit-websocket = "0.3"
 # The tastytrade client (issue #40, the poll->stream merge provider —
 # `docs/03-data-providers.md` §7.2). OPTIONAL and behind the DISABLED-by-default
 # `tastytrade` feature: a normal build never pulls it, and it is reachable only
@@ -222,8 +222,8 @@ tastytrade = { version = "0.3", optional = true }
 # installed once by the crate's own `init_crypto_provider`), `futures-util`,
 # `url`, `serde_urlencoded`, `urlencoding`, `uuid`, and (transitively, never
 # exercised) `dotenv` + `tracing-subscriber`.
-alpaca-http = { version = "0.21.2", optional = true }
-alpaca-websocket = { version = "0.6.0", optional = true }
+alpaca-http = { version = "0.21", optional = true }
+alpaca-websocket = { version = "0.6", optional = true }
 # The Alpaca `MarketDataStream` is consumed through the `futures_core::Stream`
 # trait it implements, so `StreamExt::next` is needed to drain it into the bounded
 # bridge (issue #41). OPTIONAL, behind the `alpaca` feature only. It already rides
@@ -282,7 +282,7 @@ dxlink = { version = "0.2", optional = true }
 # trio is enabled as a contract clarification to settle with IronCondor (ADR-0010).
 # The decode is synchronous, batched, and cancellation-polled on a blocking worker
 # — NO `async` feature, so `tokio` is not pulled into the domain reader.
-parquet = { version = "59", default-features = false, features = [
+parquet = { version = "59.0", default-features = false, features = [
     "arrow",
     "snap",
     "zstd",
@@ -303,10 +303,10 @@ parquet = { version = "59", default-features = false, features = [
 # (schema/`DataType` construction) is needed only by the `#[cfg(test)]` batch
 # writers, so it stays a dev-dependency. Version pinned to `parquet` 59's arrow
 # epoch.
-arrow-array = "59"
+arrow-array = "59.0"
 
 [dev-dependencies]
-proptest = "1"
+proptest = "1.0"
 # The bench harness (issue #21, `benches/*`, `docs/06-performance.md` §4,
 # `docs/TESTING.md` §11). DEV-ONLY — neither crate rides in the release binary,
 # and both are used exclusively by the `required-features = ["bench"]` targets.
@@ -320,7 +320,7 @@ proptest = "1"
 criterion = { version = "0.5", default-features = false, features = [
     "cargo_bench_support",
 ] }
-hdrhistogram = "7"
+hdrhistogram = "7.0"
 # `test-util` enables the controllable virtual clock (`#[tokio::test(start_paused
 # = true)]`, `tokio::time::pause`/`advance`) so the supervisor's 2 s
 # bounded-join-then-abort is asserted with ZERO real wall-clock wait (issue #11).
@@ -329,7 +329,7 @@ hdrhistogram = "7"
 # feature-unified into the tree by `deribit-http`/`reqwest`, so this only names it
 # explicitly for the dev build. Dev-only, so none rides in the release binary; the
 # runtime/macros/time features are already in the main `tokio` dependency.
-tokio = { version = "1", default-features = false, features = [
+tokio = { version = "1.0", default-features = false, features = [
     "test-util",
     "net",
 ] }
@@ -363,8 +363,8 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
 # because the production decoders read its array types. `tempfile` gives each test
 # an auto-cleaned bundle directory (RAII `TempDir`), so no test leaves artifacts
 # behind. All RUSTSEC-clean, well under the 1.88 floor.
-arrow-schema = "59"
-tempfile = "3"
+arrow-schema = "59.0"
+tempfile = "3.0"
 # The compile-fixture harness for the `capabilities_source_compat` source-compat
 # gate (issue #44, `docs/TESTING.md` §3, `docs/SEMVER.md` provider-port
 # versioning). DEV-ONLY — it never rides in the release binary; it compiles the
