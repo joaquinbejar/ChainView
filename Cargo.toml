@@ -116,6 +116,30 @@ dxlink = ["dep:dxlink"]
 # dotenv. `dep:` keeps the optional crate from implicitly defining a same-named
 # feature.
 ig = ["dep:ig-client"]
+# `ibkr` gates the whole Interactive Brokers adapter (`src/providers/ibkr.rs`,
+# issue #120). Like `ig` it is a DEPENDENCY-WEIGHT gate (ADR-0014), NOT a
+# credential-logging security gate: when ON, IBKR is a REAL built-in —
+# `with_builtins()` registers it when its `CHAINVIEW_IBKR_ENDPOINT` is configured
+# (and omits it, never erroring, when absent, so zero-config Deribit is
+# unaffected), never reached through `with_gated_builtin`. It is DISABLED by
+# default to keep the `ibapi` client tree out of a default build: a normal
+# `cargo build` (no `--features ibkr`) does not compile the adapter or pull
+# `ibapi` at all.
+#
+# ADR-0007 audit note: `ibapi 3.3.0` is MIT-licensed (no license exception, unlike
+# `ig`'s GPL `lightstreamer-rs`), async by default (`default = ["async"]`, pulling
+# `tokio`/`tokio-stream`/`futures`/`async-trait`, all already in the tree), and its
+# other deps (`prost`, `time`, `time-tz`, `byteorder`, `serde`/`serde_json`,
+# `thiserror`, `log`) are permissive (MIT/Apache-2.0/ISC) and add no new advisory
+# (go/no-go GREEN, recorded on issue #120; `cargo audit` + `cargo deny check`
+# clean). Auth is injected programmatically: the adapter reads
+# `CHAINVIEW_IBKR_ENDPOINT` (host:port) + `CHAINVIEW_IBKR_CLIENT_ID` from the env
+# and calls `ibapi::Client::connect(endpoint, client_id)` — the TWS/Gateway holds
+# the session, so ChainView carries NO credential (auth: None at the seam). `ibapi`
+# performs no dotenv load, no foreign env namespace read, and installs no global
+# tracing subscriber on construction (verified against the 3.3.0 checkout). `dep:`
+# keeps the optional crate from implicitly defining a same-named feature.
+ibkr = ["dep:ibapi"]
 
 [lib]
 name = "chainview"
@@ -296,6 +320,29 @@ dxlink = { version = "0.2", optional = true }
 # never exercised on the injection path) `dotenv` — covered by the extended
 # RUSTSEC-2021-0141 ignore in deny.toml.
 ig-client = { version = "0.12", optional = true }
+# The Interactive Brokers client (issue #120, the TWS/Gateway socket adapter —
+# `docs/03-data-providers.md` §7.6). OPTIONAL and behind the DISABLED-by-default
+# `ibkr` feature: a normal build never pulls it. Consumed with its DEFAULT
+# features (`async`), so the adapter drives the async `ibapi::Client::connect` +
+# `option_chain` (`reqSecDefOptParams`) + `contract_details` REST path and the
+# `market_data` streaming leg (native `tickOptionComputation` Greeks/IV);
+# ChainView never reimplements the TWS socket protocol (CLAUDE.md "Key
+# Decisions"). Explicit-approval addition (CLAUDE.md "Coding Rules") — ADR-0007
+# audit note in CHANGELOG (`cargo audit` + `cargo deny check`, deny.toml pins
+# `all-features = true`).
+# Auth is injected programmatically at the socket seam: the adapter reads
+# `CHAINVIEW_IBKR_ENDPOINT` (host:port) + `CHAINVIEW_IBKR_CLIENT_ID` (i32) from
+# ChainView-namespaced env vars and calls `Client::connect(endpoint, client_id)`.
+# The TWS/Gateway holds the session, so ChainView carries NO credential (auth:
+# None at the seam) — there is no dotenv load, no foreign env namespace, and no
+# global tracing subscriber installed on construction (verified against the 3.3.0
+# checkout).
+# Supply-chain delta (feature-on only): MIT (no license exception), pulls `prost`
+# (protobuf), `time`/`time-tz`, `byteorder`, `serde`/`serde_json`, `thiserror`,
+# `log`, and (from `async`) `tokio`/`tokio-stream`/`futures`/`async-trait` — the
+# async runtime crates are already in the tree, so a feature-on build adds no new
+# runtime surface beyond the venue codecs. No new advisory (go/no-go GREEN, #120).
+ibapi = { version = "3.3", optional = true }
 # The Parquet reader for the IronCondor result bundle (issue #30, ADR-0010,
 # `docs/04-replay-mode.md` §2/§3). The bundle's four tables are Parquet; the
 # reader decodes them batch-by-batch under measured resource ceilings. ChainView

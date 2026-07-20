@@ -108,8 +108,8 @@
 //!
 //! # Reserved ids and configuration namespacing
 //!
-//! The five built-in ids in [`RESERVED_PROVIDER_IDS`]
-//! (`deribit`/`tastytrade`/`dxlink`/`ig`/`alpaca`) are reserved: an external
+//! The six built-in ids in [`RESERVED_PROVIDER_IDS`]
+//! (`deribit`/`tastytrade`/`dxlink`/`ig`/`alpaca`/`ibkr`) are reserved: an external
 //! registration that reuses one is [`RegistryError::ReservedId`], and a duplicate
 //! id is [`RegistryError::DuplicateId`] — both typed startup errors, never a
 //! panic. Growing the reserved set later is a **major** bump (it can invalidate a

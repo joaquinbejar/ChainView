@@ -14,6 +14,26 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- **Interactive Brokers provider** (`src/providers/ibkr.rs`, issue #120), behind a
+  disabled-by-default `ibkr` Cargo feature (a dependency-weight gate per ADR-0014;
+  a real built-in in `with_builtins()` when the feature is on and
+  `CHAINVIEW_IBKR_*` is configured, so zero-config Deribit is unaffected). Wraps
+  the MIT `ibapi` TWS/IB-Gateway client: assembles a chain from `reqSecDefOptParams`
+  + contract details, resolves each expiry to an absolute UTC instant at the seam,
+  surfaces IBKR's **native** model Greeks + IV (`tickOptionComputation`, tagged
+  `Provided`), and overlays live per-contract quotes over a **pacing-bounded**
+  (ATM-window, <=100 concurrent lines) market-data subscription with an
+  adapter-owned reconnect/resubscribe loop. Auth carries **no secret at the
+  ChainView seam** (the TWS/Gateway holds the session; ChainView passes only
+  `CHAINVIEW_IBKR_ENDPOINT` + `CHAINVIEW_IBKR_CLIENT_ID`, never logged). Honest
+  capabilities: `chain: Assemble`, `depth: false` (option L2 unverified),
+  `greeks: Provided`, `option_stream: ChainQuotes` (unverified),
+  `underlying_stream: false` (only option contracts stream — the #40/#41 honesty
+  rule), `chain_poll: Poll`, `trades_tape: false`, `auth: None`. `ibkr` is reserved
+  in `RESERVED_PROVIDER_IDS` (the sixth built-in id).
+
+### Added
+
 - **IG provider** (`src/providers/ig.rs`, issue #39), behind a disabled-by-default
   `ig` Cargo feature (a dependency-weight gate per ADR-0013; a real built-in in
   `with_builtins()` when the feature is on and `CHAINVIEW_IG_*` is configured, so

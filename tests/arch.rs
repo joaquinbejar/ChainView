@@ -36,7 +36,7 @@ use std::path::{Path, PathBuf};
 /// The reserved built-in adapter ids — each is a concrete adapter module under
 /// `src/providers/<id>.rs`, so an import of one from another provider file is an
 /// adapter→adapter back-edge (`docs/03-data-providers.md` §12).
-const ADAPTER_IDS: [&str; 5] = ["deribit", "tastytrade", "dxlink", "ig", "alpaca"];
+const ADAPTER_IDS: [&str; 6] = ["deribit", "tastytrade", "dxlink", "ig", "alpaca", "ibkr"];
 
 /// The crate `src/` directory, anchored at the manifest so it resolves from any
 /// working directory.
