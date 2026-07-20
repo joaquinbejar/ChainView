@@ -33,7 +33,7 @@
 # pre-cut. The `CRATES_IO_TOKEN` secret must be configured before the first cut.
 #
 # Action pins mirror ci.yml: third-party actions at their major release tag; the
-# toolchain action at `@stable`. The MSRV floor (Rust 1.88) is exercised by the
+# toolchain action at `@stable`. The MSRV floor (Rust 1.94) is exercised by the
 # ci.yml `msrv` job, so "installs on the MSRV" is proven there — this workflow
 # builds the shipped artifact on `@stable`.
 

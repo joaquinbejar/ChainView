@@ -4,7 +4,7 @@
 #   * check    — the FOUR NON-NEGOTIABLES on stable, mirroring `make pre-push`
 #                exactly (docs/TESTING.md §10), plus the `cargo doc` warning gate
 #                and the Spanish-text guard.
-#   * msrv     — a pinned Rust 1.88 build + test on the declared MSRV floor.
+#   * msrv     — a pinned Rust 1.94 build + test on the declared MSRV floor.
 #   * coverage — non-blocking coverage (cargo-llvm-cov), informational only.
 #   * audit    — `cargo audit` fails on any RUSTSEC advisory (docs/SECURITY.md §7).
 #   * deny     — `cargo deny check` (advisories + licenses + bans + sources).
@@ -24,7 +24,7 @@
 #
 # Action pins: third-party actions are pinned to a major release tag; the
 # toolchain action (`dtolnay/rust-toolchain`) is used at its supported
-# `@stable` / `@1.88` refs. Hardening to full commit-SHA action pins is a
+# `@stable` / `@1.94` refs. Hardening to full commit-SHA action pins is a
 # SEPARATE workflow-supply-chain follow-up and is NOT delivered by #54: that
 # issue froze the `cargo audit` / `cargo deny` allow-lists as the reviewed v1.0
 # supply-chain gate and added the root SECURITY.md intake channel (deny.toml,
@@ -95,23 +95,24 @@ jobs:
 
   # --------------------------------------------------------------------------
   # Pinned MSRV job. The toolchain version MUST equal `rust-version` in
-  # Cargo.toml (currently 1.88). A change that needs a newer compiler fails
+  # Cargo.toml (currently 1.94). A change that needs a newer compiler fails
   # here, surfacing an MSRV bump per docs/SEMVER.md (a minor bump with a
   # release-note callout).
   #
-  # MSRV history (#20): raised 1.85 -> 1.88. The `optionstratlib 0.18` -> `zip`
-  # -> `deflate64` path uses `unbounded_shr` (stabilized in Rust 1.87), and
-  # adopting `time >=0.3.47` to patch RUSTSEC-2026-0009 (the DoS) requires 1.88;
-  # both are satisfied at the 1.88 floor. Keep this pin in lockstep with
-  # Cargo.toml `rust-version`.
+  # MSRV history: 1.85 -> 1.88 (#20: `optionstratlib 0.18` -> `zip` -> `deflate64`
+  # uses `unbounded_shr`, stabilized in Rust 1.87, and adopting `time >=0.3.47` to
+  # patch RUSTSEC-2026-0009 (the DoS) requires 1.88) -> 1.94 (#39: adopting
+  # `sqlx 0.9` on the IG provider path, whose declared MSRV is 1.94; the current
+  # tree still compiles on 1.88, so this is a forward floor commitment for that
+  # path). Keep this pin in lockstep with Cargo.toml `rust-version`.
   # --------------------------------------------------------------------------
   msrv:
-    name: msrv (Rust 1.88 — declared floor)
+    name: msrv (Rust 1.94 — declared floor)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Install pinned MSRV toolchain
-        uses: dtolnay/rust-toolchain@1.88
+        uses: dtolnay/rust-toolchain@1.94
       - uses: Swatinem/rust-cache@v2
       - name: build --all-features (MSRV)
         run: cargo build --all-features
@@ -120,7 +121,7 @@ jobs:
       # The `capabilities_source_compat` source-compat gate (issue #44,
       # docs/TESTING.md §3, docs/SEMVER.md provider-port versioning). Its
       # committed `tests/ui/*.stderr` goldens are rustc-version-sensitive, so the
-      # gate is EXECUTED only here — on the pinned 1.88 toolchain that never
+      # gate is EXECUTED only here — on the pinned 1.94 toolchain that never
       # drifts — via CHAINVIEW_TRYBUILD_UI; on the moving `stable` job (and any
       # other toolchain) the test self-skips, so a benign compiler-message change
       # never breaks an unrelated PR. A dropped `#[non_exhaustive]` (or a new
@@ -219,9 +220,9 @@ jobs:
   #      informational, never a regression. The full four-bench absolute
   #      enforcement is `make perf` on baseline-class hardware.
   #
-  # Pinned to the declared MSRV floor (1.88) so the gate and the baseline share
-  # a toolchain (the issue named 1.85; the MSRV was raised to 1.88 at #20 —
-  # docs/SEMVER.md). `timeout-minutes` bounds the informational bench wall-clock.
+  # Pinned to the declared MSRV floor (1.94) so the gate and the baseline share
+  # a toolchain (the issue named 1.85; the MSRV was raised 1.85->1.88 at #20 and
+  # 1.88->1.94 at #39 — docs/SEMVER.md). `timeout-minutes` bounds the informational bench wall-clock.
   # --------------------------------------------------------------------------
   perf-regression:
     name: perf-regression (self-test gate + informational render bench)
@@ -230,7 +231,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install pinned MSRV toolchain
-        uses: dtolnay/rust-toolchain@1.88
+        uses: dtolnay/rust-toolchain@1.94
       - uses: Swatinem/rust-cache@v2
       # BLOCKING — proves the gate detects a regression (never vacuous).
       - name: perf gate self-test (blocking)
