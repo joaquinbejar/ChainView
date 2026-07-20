@@ -14,6 +14,18 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Changed
 
+- **MSRV raised from 1.88 to 1.94** (a minor bump per docs/SEMVER.md). The IG
+  provider path (issue #39) adopts `sqlx 0.9`, whose declared `rust-version` is
+  `1.94.0`; the crate MSRV floor is raised to match so that path is buildable
+  under `--all-features`. The current tree still compiles on 1.88 — this is a
+  forward floor commitment. `rust-version = "1.94"` in Cargo.toml, the CI `msrv`
+  and `perf-regression` jobs pin `@1.94`, and a consumer on a toolchain below
+  1.94 must upgrade. (The GPL-3.0-only `lightstreamer-rs` transitive of
+  `ig-client` remains a separate, still-open blocker for IG — tracked upstream
+  in ig-client#83.)
+
+### Changed
+
 - All top-level public error enums (`ChainViewError`, `ProviderError`,
   `ConfigError`, `RegistryError`, `OverlayError`) are now `#[non_exhaustive]`
   (#116), completing the v1.0 error-surface freeze discipline started with
