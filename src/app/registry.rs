@@ -69,7 +69,7 @@ use tokio::task::AbortHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::chain::{Instrument, ProviderId, StreamHealth};
-use crate::config::{CliOverrides, Config, ModeSelect};
+use crate::config::{CliOverrides, Config, EnvSource, ModeSelect, ProcessEnv};
 use crate::error::{ChainViewError, ConfigError, ProviderError, RegistryError};
 #[cfg(feature = "alpaca")]
 use crate::providers::alpaca::AlpacaAdapter;
@@ -227,21 +227,51 @@ impl ChainViewAppBuilder {
 
     /// Register the bundled adapters whose security gate is **clear** at the
     /// pinned upstream revisions (`docs/SECURITY.md` §2, `docs/03-data-providers.md`
-    /// §9). Gated adapters (tastytrade / Alpaca / standalone dxlink — credential-
-    /// logging upstreams, `docs/SECURITY.md` §2.3–§2.4) are **never** registered
-    /// implicitly; they require the explicit [`with_gated_builtin`](Self::with_gated_builtin)
+    /// §9). Still-gated adapters (tastytrade / standalone dxlink — credential-logging
+    /// upstreams, `docs/SECURITY.md` §2.3–§2.4) are **never** registered implicitly;
+    /// they require the explicit [`with_gated_builtin`](Self::with_gated_builtin)
     /// opt-in.
     ///
-    /// # v0.1: the Deribit adapter
+    /// # The gate-clear built-ins
     ///
-    /// The only gate-clear built-in is **Deribit** (public, no auth) — the
-    /// zero-config default (ADR-0003). Its adapter (issue #15) is registered here
-    /// under the reserved `deribit` id, so `builder().with_builtins().run()`
-    /// resolves the Deribit live source. Gated built-ins stay out of this call by
-    /// construction (`docs/SECURITY.md` §2).
+    /// - **Deribit** (public, no auth) — the zero-config default (ADR-0003), always
+    ///   registered under the reserved `deribit` id, so `builder().with_builtins()`
+    ///   always resolves a live source.
+    /// - **Alpaca** — its credential-logging gate is **lifted** (#99,
+    ///   `docs/SECURITY.md` §2.4, captured-log proof in `src/providers/alpaca.rs`).
+    ///   It is a **credentialed** built-in, so it is registered **only when its
+    ///   `CHAINVIEW_ALPACA_*` credentials are configured** in the environment, and is
+    ///   silently omitted (never a startup error) when they are absent — so the
+    ///   zero-config Deribit default is unaffected. It is compiled in only under the
+    ///   opt-in `alpaca` Cargo feature (the heavy upstream deps stay out of a default
+    ///   build).
+    ///
+    /// The credential probe reads the real process environment; the env-injectable
+    /// `with_builtins_from_env` (a private method) is the same path used
+    /// deterministically in tests.
     #[must_use]
     pub fn with_builtins(self) -> Self {
-        self.register_builtin(DeribitAdapter::new())
+        self.with_builtins_from_env(&ProcessEnv)
+    }
+
+    /// The env-injectable core of [`with_builtins`](Self::with_builtins): register the
+    /// gate-clear built-ins, reading any **credentialed** built-in's credentials from
+    /// `env` (env-only, never logged). Production passes the real [`ProcessEnv`];
+    /// tests inject a map so registration is deterministic and never touches the
+    /// process environment.
+    ///
+    /// A credentialed built-in whose credentials are absent is **omitted**, not an
+    /// error, so a stock startup with no Alpaca credentials keeps the zero-config
+    /// Deribit default and a later `--provider alpaca` is a clean
+    /// [`ConfigError::UnknownProvider`], never a `MissingCredential` startup failure.
+    #[must_use]
+    fn with_builtins_from_env(self, env: &dyn EnvSource) -> Self {
+        let builder = self.register_builtin(DeribitAdapter::new());
+        #[cfg(feature = "alpaca")]
+        let builder = builder.register_credentialed_builtin(env, alpaca_builtin_factory);
+        #[cfg(not(feature = "alpaca"))]
+        let _ = env;
+        builder
     }
 
     /// Opt in to a security-**gated** bundled adapter explicitly. Fails at
@@ -258,13 +288,15 @@ impl ChainViewAppBuilder {
     /// adapter's pinned upstream clears its gate (`docs/ROADMAP.md`).
     #[must_use]
     pub fn with_gated_builtin(mut self, id: ProviderId) -> Self {
-        // A gated built-in is NEVER enabled while its upstream credential-logging
-        // gate holds (`docs/SECURITY.md` §2): record the typed startup error and
-        // never construct the adapter. `note_gated_builtins` names each gated
-        // adapter's factory (never invoked here) purely so the deliberately
-        // unregistered adapter stays compiled + linted in a plain
-        // `--features <gated>` library build.
-        #[cfg(any(feature = "tastytrade", feature = "alpaca", feature = "dxlink"))]
+        // A still-gated built-in (tastytrade / standalone dxlink) is NEVER enabled
+        // while its upstream credential-logging gate holds (`docs/SECURITY.md` §2):
+        // record the typed startup error and never construct the adapter.
+        // `note_gated_builtins` names each still-gated adapter's factory (never
+        // invoked here) purely so the deliberately unregistered adapter stays
+        // compiled + linted in a plain `--features <gated>` library build. (Alpaca is
+        // no longer here — its gate is lifted (#99), so it is a real built-in
+        // registered by `with_builtins`, not reached through this opt-in.)
+        #[cfg(any(feature = "tastytrade", feature = "dxlink"))]
         note_gated_builtins();
         self.record(RegistryError::Gated(id).into());
         self
@@ -402,6 +434,34 @@ impl ChainViewAppBuilder {
         self
     }
 
+    /// Register a **credentialed** gate-clear built-in from its env factory
+    /// (`docs/SECURITY.md` §2.4). On a successful build register it under its reserved
+    /// id (a duplicate is recorded first-error-wins); on a **missing credential**
+    /// silently omit it (the built-in is simply unconfigured, so the zero-config
+    /// Deribit default is preserved); on any other typed error record it. The reserved
+    /// id is EXPECTED here (built-ins own the reserved namespace), so only a duplicate
+    /// — never the reserved id itself — is an error.
+    #[cfg(feature = "alpaca")]
+    fn register_credentialed_builtin(
+        mut self,
+        env: &dyn EnvSource,
+        factory: CredentialedBuiltinFactory,
+    ) -> Self {
+        match factory(env) {
+            Ok(arc) => {
+                let id = arc.id();
+                if self.registry.contains(&id) {
+                    self.record(RegistryError::DuplicateId(id).into());
+                } else {
+                    self.registry.insert(id, arc);
+                }
+            }
+            Err(ConfigError::MissingCredential(_)) => {}
+            Err(other) => self.record(other.into()),
+        }
+        self
+    }
+
     /// Register an already-boxed adapter, rejecting a reserved id and a
     /// collision (both recorded first-error-wins).
     fn register_arc(&mut self, provider: Arc<dyn Provider>) {
@@ -429,7 +489,28 @@ impl ChainViewAppBuilder {
     }
 }
 
-/// Keep every security-gated built-in adapter compiled and linted without
+/// A gate-clear **credentialed** built-in factory: read the provider's credentials
+/// from the environment (env-only, never logged) and yield a registry-ready
+/// `Arc<dyn Provider>`, or [`ConfigError::MissingCredential`] when unconfigured (so
+/// the built-in is simply omitted). Invoked by
+/// [`register_credentialed_builtin`](ChainViewAppBuilder::register_credentialed_builtin).
+#[cfg(feature = "alpaca")]
+type CredentialedBuiltinFactory = fn(&dyn EnvSource) -> Result<Arc<dyn Provider>, ConfigError>;
+
+/// The Alpaca credentialed-built-in factory (#99): read its `CHAINVIEW_ALPACA_*`
+/// credentials from `env` and yield a registry-ready `Arc<dyn Provider>`, or
+/// [`ConfigError::MissingCredential`] when unconfigured. Its credential-logging gate
+/// is **lifted** (`docs/SECURITY.md` §2.4, captured-log proof in
+/// `src/providers/alpaca.rs`), so unlike the still-gated factories in
+/// [`note_gated_builtins`] this one IS invoked — by
+/// [`register_credentialed_builtin`](ChainViewAppBuilder::register_credentialed_builtin)
+/// from [`with_builtins`](ChainViewAppBuilder::with_builtins).
+#[cfg(feature = "alpaca")]
+fn alpaca_builtin_factory(env: &dyn EnvSource) -> Result<Arc<dyn Provider>, ConfigError> {
+    Ok(Arc::new(AlpacaAdapter::from_env(env)?) as Arc<dyn Provider>)
+}
+
+/// Keep every still-security-gated built-in adapter compiled and linted without
 /// enabling it (`docs/SECURITY.md` §2, `docs/03-data-providers.md` §9). A gated
 /// adapter is deliberately **not** registered — [`with_gated_builtin`](ChainViewAppBuilder::with_gated_builtin)
 /// records [`RegistryError::Gated`] and never constructs it — so in a plain
@@ -438,28 +519,23 @@ impl ChainViewAppBuilder {
 /// gated adapter's factory here (behind its own feature) makes the full `Provider`
 /// call graph reachable — the `Arc<dyn Provider>` coercion builds the vtable — WITHOUT
 /// invoking the factory. The factory is invoked only once the gate lifts and the
-/// adapter is registered for real.
+/// adapter is registered for real (as Alpaca now is — see [`alpaca_builtin_factory`],
+/// which is no longer named here).
 /// A gated built-in adapter factory: it reads the provider's credentials from the
 /// environment and yields a registry-ready `Arc<dyn Provider>`. Invoked only once
 /// the adapter's security gate lifts; while the gate holds it is merely *named*
 /// (see [`note_gated_builtins`]).
-#[cfg(any(feature = "tastytrade", feature = "alpaca", feature = "dxlink"))]
+#[cfg(any(feature = "tastytrade", feature = "dxlink"))]
 type GatedBuiltinFactory =
     fn(&dyn crate::config::EnvSource) -> Result<Arc<dyn Provider>, ConfigError>;
 
-#[cfg(any(feature = "tastytrade", feature = "alpaca", feature = "dxlink"))]
+#[cfg(any(feature = "tastytrade", feature = "dxlink"))]
 fn note_gated_builtins() {
     #[cfg(feature = "tastytrade")]
     {
         let _tastytrade: GatedBuiltinFactory =
             |env| Ok(Arc::new(TastytradeAdapter::from_env(env)?) as Arc<dyn Provider>);
         let _ = _tastytrade;
-    }
-    #[cfg(feature = "alpaca")]
-    {
-        let _alpaca: GatedBuiltinFactory =
-            |env| Ok(Arc::new(AlpacaAdapter::from_env(env)?) as Arc<dyn Provider>);
-        let _ = _alpaca;
     }
     #[cfg(feature = "dxlink")]
     {
@@ -675,7 +751,7 @@ pub async fn spawn_supervised_subscription(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -694,7 +770,7 @@ mod tests {
     use crate::chain::{
         ChainFetch, Instrument, MarketUpdate, ProviderId, RESERVED_PROVIDER_IDS, StreamHealth,
     };
-    use crate::config::{Config, ModeSelect, ThemeChoice};
+    use crate::config::{Config, EnvSource, ModeSelect, ThemeChoice};
     use crate::error::{ChainViewError, ConfigError, ProviderError, RegistryError};
     use crate::providers::{
         ChainCapability, GreeksCapability, MarketUpdateSink, Provider, ProviderCapabilities,
@@ -709,6 +785,35 @@ mod tests {
             Ok(p) => p,
             Err(e) => panic!("expected a valid provider id `{id}`, got: {e}"),
         }
+    }
+
+    /// A map-backed [`EnvSource`] so the credentialed-built-in registration is tested
+    /// deterministically, never touching the process environment.
+    struct TestEnv(HashMap<String, String>);
+
+    impl EnvSource for TestEnv {
+        fn get(&self, key: &str) -> Option<String> {
+            self.0.get(key).cloned()
+        }
+    }
+
+    /// An empty environment — no provider credentials configured.
+    fn empty_env() -> TestEnv {
+        TestEnv(HashMap::new())
+    }
+
+    /// An environment carrying valid `CHAINVIEW_ALPACA_*` credentials.
+    fn alpaca_creds_env() -> TestEnv {
+        let mut env = HashMap::new();
+        let _ = env.insert(
+            "CHAINVIEW_ALPACA_API_KEY".to_owned(),
+            "PKTESTKEY0001".to_owned(),
+        );
+        let _ = env.insert(
+            "CHAINVIEW_ALPACA_API_SECRET".to_owned(),
+            "test-secret-value".to_owned(),
+        );
+        TestEnv(env)
     }
 
     fn chainful_caps() -> ProviderCapabilities {
@@ -941,38 +1046,63 @@ mod tests {
     }
 
     #[test]
-    fn test_with_gated_builtin_alpaca_fails_while_gate_holds() {
-        // The Alpaca adapter (issue #41) is reachable only through the gated opt-in,
-        // which fails with a typed startup error while its gate holds — a stock
-        // binary can never enable it (docs/SECURITY.md §2.4).
+    fn test_with_builtins_enables_alpaca_when_configured() {
+        // #99 gate lift (docs/SECURITY.md §2.4): pre-lift, with_builtins NEVER enabled
+        // alpaca (it was reachable only through the gated opt-in). With the
+        // credential-logging gate cleared by the captured-log proof
+        // (src/providers/alpaca.rs `test_auth_subscribe_cycle_never_logs_credentials`,
+        // corroborated by upstream alpaca-websocket/tests/log_redaction.rs),
+        // with_builtins now registers alpaca as a REAL built-in WHEN its
+        // CHAINVIEW_ALPACA_* credentials are configured — the inversion of the old
+        // "never enables alpaca" gate assertion. The `alpaca` Cargo feature still
+        // gates the heavy upstream deps, so the built-in exists only in an
+        // `--features alpaca` build; a default build has no alpaca code to register.
+        let env = alpaca_creds_env();
         let result = ChainViewApp::builder()
-            .with_gated_builtin(pid("alpaca"))
-            .register(FakeProvider::chainful(pid("mybroker")))
-            .with_config(live_config("mybroker"))
+            .with_builtins_from_env(&env)
+            .with_config(live_config("alpaca"))
             .run();
+        #[cfg(feature = "alpaca")]
+        assert!(
+            result.is_ok(),
+            "with the gate lifted, a configured alpaca resolves as a registered built-in: {result:?}"
+        );
+        #[cfg(not(feature = "alpaca"))]
         match result {
-            Err(ChainViewError::Registry(RegistryError::Gated(id))) => {
-                assert_eq!(id.as_str(), "alpaca");
+            // Without the feature the adapter is not compiled in, so it cannot be
+            // registered; selecting it is a clean UnknownProvider.
+            Err(ChainViewError::Config(ConfigError::UnknownProvider(id))) => {
+                assert_eq!(id, "alpaca");
             }
-            other => panic!("expected Gated(alpaca), got {other:?}"),
+            other => panic!("without the alpaca feature the adapter is not compiled in: {other:?}"),
         }
     }
 
     #[test]
-    fn test_with_builtins_never_enables_alpaca() {
-        // The stock builder registers only the gate-clear built-ins (Deribit), so
-        // selecting the gated `alpaca` id resolves to UnknownProvider — proving the
-        // gated adapter is never enabled by `with_builtins` (docs/SECURITY.md §2.4).
+    fn test_with_builtins_skips_unconfigured_alpaca_preserving_zero_config() {
+        // Zero-config is preserved: with NO alpaca credentials, with_builtins does not
+        // register alpaca (never a startup error), so Deribit stays the zero-config
+        // default and selecting alpaca is a clean UnknownProvider. This holds in every
+        // feature configuration (a missing credential simply omits the built-in).
         let result = ChainViewApp::builder()
-            .with_builtins()
+            .with_builtins_from_env(&empty_env())
             .with_config(live_config("alpaca"))
             .run();
         match result {
             Err(ChainViewError::Config(ConfigError::UnknownProvider(id))) => {
                 assert_eq!(id, "alpaca");
             }
-            other => panic!("expected UnknownProvider(alpaca), got {other:?}"),
+            other => panic!("expected UnknownProvider(alpaca) when unconfigured, got {other:?}"),
         }
+        // Deribit still resolves (the zero-config default is unaffected).
+        let deribit = ChainViewApp::builder()
+            .with_builtins_from_env(&empty_env())
+            .with_config(live_config("deribit"))
+            .run();
+        assert!(
+            deribit.is_ok(),
+            "the zero-config deribit default is unaffected: {deribit:?}"
+        );
     }
 
     #[test]

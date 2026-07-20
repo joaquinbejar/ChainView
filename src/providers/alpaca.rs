@@ -1,6 +1,8 @@
-//! The Alpaca adapter — the composed, completeness-provable poll->stream provider,
-//! behind a DISABLED build feature (`docs/03-data-providers.md` §7.5,
-//! `docs/SECURITY.md` §2.4).
+//! The Alpaca adapter — the composed, completeness-provable poll->stream provider.
+//! Its upstream credential-logging security gate is **lifted** (#99,
+//! `docs/SECURITY.md` §2.4); it stays behind the opt-in `alpaca` build feature only
+//! to keep the heavy upstream deps out of a default build
+//! (`docs/03-data-providers.md` §7.5).
 //!
 //! Alpaca has a **native** options-data REST surface but its `get_option_chain`
 //! endpoint takes only an underlying and returns an `OptionSnapshotsResponse` map
@@ -18,24 +20,32 @@
 //!    contract is hydrated, so the UI never sees a half-filled chain as
 //!    authoritative.
 //!
-//! # The gate — credential logging upstream (`docs/SECURITY.md` §2.4)
+//! # The credential-logging gate — LIFTED (#99, `docs/SECURITY.md` §2.4)
 //!
 //! Historically `alpaca-websocket` logged the API key and secret in its auth
-//! `debug!`, so the whole adapter sits behind the DISABLED-by-default `alpaca`
-//! Cargo feature and is **excluded from `with_builtins()`**; it is reachable only
-//! via the explicit `with_gated_builtin`, which returns a typed startup error while
-//! the gate holds. So a stock binary can **never** execute the upstream's logging —
-//! the credential guarantee holds **by construction**, not author discipline
-//! (`docs/SECURITY.md` §3). Lifting the gate (the redaction release + a captured-log
-//! test + the matrix flip) is tracked in `docs/SECURITY.md` §2.4 and is **out of
-//! scope** for this issue.
+//! `debug!`. The pinned `alpaca-websocket 0.6.0` this crate resolves **remediated**
+//! that: its `send_auth` logs only the masked `redact_key(&api_key)` (`****` +
+//! last-4) and never logs the secret (`client.rs` `send_auth`; the historical leak
+//! was commit `e33eb8f`). The gate is lifted by a **captured-log proof, not a source
+//! read** — the "safe by construction, not author discipline" protocol: the `tests`
+//! module below (`test_auth_subscribe_cycle_never_logs_credentials`) installs a
+//! capturing `tracing` subscriber around the REAL upstream connect/auth/subscribe
+//! cycle — driven over a **local mock WebSocket server** through a client THIS
+//! adapter constructs with env-injected credentials (the published public
+//! `AlpacaWebSocketClient::with_url` seam) — and asserts the captured output carries
+//! only the masked `****`+suffix key, never the raw key or secret. That drive is the
+//! same client + cycle [`LiveTransport::connect_and_subscribe`] runs in production.
+//! It is corroborated by the upstream captured-log test
+//! `alpaca-websocket/tests/log_redaction.rs`, which drives the identical masked-only
+//! assertion against its own mock server.
 //!
-//! Provenance note for the lifter: the auth-send site is
-//! `alpaca-websocket/src/client.rs` `send_auth` (the historical leak was commit
-//! `e33eb8f`). The pinned `alpaca-websocket 0.6.0` this crate resolves already
-//! masks the key there (`redact_key`) and never logs the secret; the gate stays in
-//! place until `docs/SECURITY.md` records the captured-log proof and flips the
-//! matrix cell — this adapter does not lift it unilaterally.
+//! With the gate cleared, the adapter is a **real built-in**:
+//! [`with_builtins`](crate::ChainViewAppBuilder::with_builtins) registers it when its
+//! `CHAINVIEW_ALPACA_*` credentials are configured, and simply omits it (never a
+//! startup error) when they are absent, so the zero-config Deribit default is
+//! unaffected (`docs/SECURITY.md` §2.4, `src/app/registry.rs`). The `alpaca` Cargo
+//! feature still gates the heavy upstream deps, so the built-in exists only in an
+//! `--features alpaca` build.
 //!
 //! # Auth is injected programmatically (no dotenv, no foreign env namespace)
 //!
@@ -260,6 +270,14 @@ pub(crate) struct AlpacaAdapter {
     api_key: Secret,
     api_secret: Secret,
     environment: AlpacaEnvironment,
+    /// A **test-only** override for the WebSocket stream URL, so the captured-log
+    /// redaction proof (`test_auth_subscribe_cycle_never_logs_credentials`) can drive
+    /// the real upstream connect/auth/subscribe cycle against a local mock server via
+    /// the published [`AlpacaWebSocketClient::with_url`] seam. It is `None` in
+    /// production, where [`ws_client`](Self::ws_client) uses the venue feed URL; the
+    /// field itself does not exist in a non-test build.
+    #[cfg(test)]
+    ws_url: Option<String>,
 }
 
 impl AlpacaAdapter {
@@ -293,7 +311,18 @@ impl AlpacaAdapter {
             api_key,
             api_secret,
             environment,
+            #[cfg(test)]
+            ws_url: None,
         })
+    }
+
+    /// Point [`ws_client`](Self::ws_client) at an arbitrary stream URL (a local mock
+    /// server) for the captured-log redaction proof. Test-only: the production path
+    /// always uses the venue feed URL.
+    #[cfg(test)]
+    fn with_ws_url(mut self, url: String) -> Self {
+        self.ws_url = Some(url);
+        self
     }
 
     /// Build the upstream `Credentials` from the injected secrets. The secret is
@@ -319,7 +348,19 @@ impl AlpacaAdapter {
 
     /// Build the WebSocket client for the underlying data feed (IEX — the free feed
     /// that works on paper and live), injecting credentials programmatically.
+    ///
+    /// In a test build a [`ws_url`](Self::ws_url) override points the client at a
+    /// local mock server via the published `with_url` seam (the captured-log proof);
+    /// the production path always uses the venue feed URL.
     fn ws_client(&self) -> AlpacaWebSocketClient {
+        #[cfg(test)]
+        if let Some(url) = &self.ws_url {
+            return AlpacaWebSocketClient::with_url(
+                self.credentials(),
+                self.environment.to_upstream(),
+                url.clone(),
+            );
+        }
         AlpacaWebSocketClient::with_feed(
             self.credentials(),
             self.environment.to_upstream(),
@@ -3051,5 +3092,237 @@ mod tests {
         assert!(!store.contains_strike(Positive::ONE));
         assert_eq!(call_bid_at(&store, pos(400.0)), Some(pos(1.5)));
         assert_eq!(call_bid_at(&store, pos(405.0)), Some(pos(1.5)));
+    }
+
+    // === #99 gate lift: the auth/subscribe cycle never logs credentials ==========
+    //
+    // Captured-log proof (docs/SECURITY.md §2.4, "safe by construction, not author
+    // discipline"): drive the REAL upstream connect/auth/subscribe cycle over a LOCAL
+    // mock WebSocket server, through a client THIS adapter builds with env-injected
+    // credentials (the published `AlpacaWebSocketClient::with_url` seam), and assert
+    // the captured tracing output masks the key/secret. Strictly stronger than a
+    // source read, this re-establishes from the ChainView boundary the same
+    // masked-only guarantee proven upstream in
+    // alpaca-websocket/tests/log_redaction.rs.
+
+    use futures_util::SinkExt as _;
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
+    use tokio_tungstenite::{WebSocketStream, accept_async};
+
+    /// The mock-driven key: `redact_key` masks all but the last 4 chars, so the
+    /// captured log must show only [`REDACTION_KEY_MASKED`] — never this full key.
+    const REDACTION_KEY: &str = "PKGATELIFTREDACTZx9Q";
+    /// The masked marker `redact_key` produces for [`REDACTION_KEY`] (`****` + last-4).
+    const REDACTION_KEY_MASKED: &str = "****Zx9Q";
+    /// A throwaway secret that must NEVER appear in the captured log.
+    const REDACTION_SECRET: &str = "do-not-log-this-alpaca-secret";
+    /// A control canary logged directly into the sink, proving it captures debug
+    /// content — so the redaction assertions cannot pass vacuously (merely because
+    /// nothing was logged).
+    const CONTROL_CANARY: &str = "chainview-canary-9c3f-present";
+
+    /// A cloneable in-memory `tracing` sink, mirroring the upstream `alpaca-websocket`
+    /// `tests/common` `LogBuffer`, so the redaction assertions run on captured output
+    /// with no real log file.
+    #[derive(Clone, Default)]
+    struct LogBuffer(Arc<StdMutex<Vec<u8>>>);
+
+    impl LogBuffer {
+        fn contents(&self) -> String {
+            match self.0.lock() {
+                Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+                Err(poisoned) => String::from_utf8_lossy(&poisoned.into_inner()).into_owned(),
+            }
+        }
+    }
+
+    impl std::io::Write for LogBuffer {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if let Ok(mut bytes) = self.0.lock() {
+                bytes.extend_from_slice(buf);
+            }
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuffer {
+        type Writer = LogBuffer;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Read the next text frame the client sends during the handshake, skipping any
+    /// non-text control frame.
+    async fn next_client_text(ws: &mut WebSocketStream<TcpStream>) -> String {
+        loop {
+            match ws.next().await {
+                Some(Ok(WsMessage::Text(text))) => return text.to_string(),
+                Some(Ok(_)) => continue,
+                other => panic!("expected a text frame from the client, got {other:?}"),
+            }
+        }
+    }
+
+    /// The server side of the Alpaca market-data handshake, mirroring the upstream
+    /// `tests/common::server_handshake`: hello, read+ack auth, read+ack subscribe, one
+    /// trade frame, close. Returns the raw auth frame the client sent — which DOES
+    /// carry the credentials on the wire, so the log mask is a genuine logging
+    /// property, not an artifact of the secret never being transmitted.
+    async fn run_mock_alpaca_server(listener: TcpListener) -> String {
+        let (tcp, _) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(e) => panic!("mock server accept: {e}"),
+        };
+        let mut ws = match accept_async(tcp).await {
+            Ok(ws) => ws,
+            Err(e) => panic!("mock server ws handshake: {e}"),
+        };
+        let _ = ws
+            .send(WsMessage::Text(
+                r#"[{"T":"success","msg":"connected"}]"#.into(),
+            ))
+            .await;
+        let auth = next_client_text(&mut ws).await;
+        let _ = ws
+            .send(WsMessage::Text(
+                r#"[{"T":"success","msg":"authenticated"}]"#.into(),
+            ))
+            .await;
+        let _subscribe = next_client_text(&mut ws).await;
+        let _ = ws
+            .send(WsMessage::Text(
+                r#"[{"T":"subscription","trades":["SPY"],"quotes":["SPY"],"bars":[]}]"#.into(),
+            ))
+            .await;
+        let _ = ws
+            .send(WsMessage::Text(
+                r#"[{"T":"t","S":"SPY","t":"2026-03-19T15:00:00Z","p":500.0,"s":1,"x":"V","c":[],"i":1}]"#
+                    .into(),
+            ))
+            .await;
+        let _ = ws.close(None).await;
+        auth
+    }
+
+    #[tokio::test]
+    async fn test_auth_subscribe_cycle_never_logs_credentials() {
+        // Capturing subscriber (TRACE, no color) as this thread's default. A
+        // `#[tokio::test]` is a current-thread runtime, so the client's foreground
+        // `send_auth`/subscription debug lines (and its spawned reader) all run on
+        // this thread and are captured.
+        let logs = LogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .with_writer(logs.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // Control: prove the sink captures debug content, so the redaction assertions
+        // below cannot pass vacuously.
+        tracing::debug!("{CONTROL_CANARY}");
+
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(e) => panic!("bind mock server: {e}"),
+        };
+        let addr = match listener.local_addr() {
+            Ok(addr) => addr,
+            Err(e) => panic!("mock server addr: {e}"),
+        };
+        let server = tokio::spawn(run_mock_alpaca_server(listener));
+
+        // ChainView builds the client from env-injected credentials, pointed at the
+        // mock via the published `with_url` seam — the same client + cycle
+        // `LiveTransport::connect_and_subscribe` drives in production.
+        let mut env = HashMap::new();
+        let _ = env.insert(
+            "CHAINVIEW_ALPACA_API_KEY".to_owned(),
+            REDACTION_KEY.to_owned(),
+        );
+        let _ = env.insert(
+            "CHAINVIEW_ALPACA_API_SECRET".to_owned(),
+            REDACTION_SECRET.to_owned(),
+        );
+        let adapter = match AlpacaAdapter::from_env(&MapEnv(env)) {
+            Ok(adapter) => adapter.with_ws_url(format!("ws://{addr}")),
+            Err(e) => panic!("from_env should succeed with both creds present: {e}"),
+        };
+        let client = adapter.ws_client();
+        let subscription = SubscribeMessage {
+            trades: Some(vec!["SPY".to_owned()]),
+            quotes: Some(vec!["SPY".to_owned()]),
+            bars: None,
+            trade_updates: None,
+        };
+        let config = alpaca_websocket::WebSocketConfig::new().no_reconnect();
+
+        // Drive the full connect/auth/subscribe cycle and drain to end, under a hard
+        // timeout so a protocol drift fails loudly instead of hanging.
+        let saw_update = match tokio::time::timeout(Duration::from_secs(10), async move {
+            let mut stream = match client
+                .subscribe_market_data_with_config(subscription, config)
+                .await
+            {
+                Ok(stream) => stream,
+                Err(e) => panic!("subscribe over the mock should succeed: {e}"),
+            };
+            let mut saw = false;
+            while let Some(event) = stream.next().await {
+                if matches!(event, MarketDataEvent::Update(_)) {
+                    saw = true;
+                }
+            }
+            saw
+        })
+        .await
+        {
+            Ok(saw) => saw,
+            Err(_) => panic!("the mock auth/subscribe cycle timed out"),
+        };
+
+        let auth_frame = match server.await {
+            Ok(auth) => auth,
+            Err(e) => panic!("mock server task: {e}"),
+        };
+
+        // The cycle actually ran end to end.
+        assert!(
+            saw_update,
+            "the mock cycle yields at least one market-data update"
+        );
+        // Sanity: the wire auth frame DOES carry the raw credentials, so the mask
+        // below is a genuine logging property.
+        assert!(
+            auth_frame.contains(REDACTION_KEY) && auth_frame.contains(REDACTION_SECRET),
+            "the wire auth frame carries the real credentials"
+        );
+
+        let output = logs.contents();
+        assert!(!output.is_empty(), "expected captured tracing output");
+        // Non-vacuous: the sink captured our canary, so it would have captured a leak.
+        assert!(
+            output.contains(CONTROL_CANARY),
+            "the capturing sink must record debug content (control):\n{output}"
+        );
+        // The gate assertion: neither the raw key nor the raw secret appears; only the
+        // masked `****`+suffix form does.
+        assert!(
+            !output.contains(REDACTION_SECRET),
+            "the API secret leaked into logs:\n{output}"
+        );
+        assert!(
+            !output.contains(REDACTION_KEY),
+            "the API key leaked into logs:\n{output}"
+        );
+        assert!(
+            output.contains(REDACTION_KEY_MASKED),
+            "expected the masked key marker {REDACTION_KEY_MASKED} in logs:\n{output}"
+        );
     }
 }
