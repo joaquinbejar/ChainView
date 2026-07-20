@@ -20,6 +20,18 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   `BundleError`: a future variant addition is a source-compatible minor on
   every public error enum, and a downstream match must carry a wildcard arm.
 
+### Fixed
+
+- **Unit-aware inverse-contract IV inversion + per-style venue-IV seeding**
+  (issue #83). On the zero-config Deribit path the local Greeks/IV engine priced
+  coin-settled BTC premiums as USD, so the inverse-contract IV inversion returned
+  near-zero garbage and the put leg's IV was absent at the seed frame. A
+  `PremiumNumeraire` on `PricingInputs` now converts a coin premium into the
+  strike numeraire before inversion, and the Deribit adapter seeds each leg's
+  venue `mark_iv` into the style-keyed sidecar at assembly - so both call and put
+  render an honest per-leg IV (and realistic local theta/vega/gamma) at seed. The
+  #25 call-side shared-field IV fallback is removed as redundant.
+
 ### Added
 
 - **Release packaging and the zero-config headline-acceptance procedure** (issue

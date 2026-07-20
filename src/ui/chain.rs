@@ -34,11 +34,12 @@
 //! §7 ([`resolve_leg`]): `delta` prefers the venue per-leg value and falls back to
 //! the local sidecar; `gamma` comes from the style-keyed [`LegGreeks`]
 //! (venue-or-local per its origin); `theta`/`vega` are always locally computed.
-//! `iv` has a three-level precedence ([`resolve_iv`]): a per-style **venue** IV from
-//! the sidecar, then — for the **call leg only** — the shared
-//! [`OptionData::implied_volatility`] (§7 documents this shared field as the
-//! call-side value, so the **put leg gets no shared fallback**, avoiding a call/put
-//! IV collision), then a **locally computed** sidecar IV. A field is `Some` only
+//! `iv` has a two-level precedence ([`resolve_iv`]): a per-style **venue** IV from
+//! the sidecar, then a **locally computed** sidecar IV. Since #83 the Deribit adapter
+//! seeds a per-style venue IV for BOTH legs at assembly, so the #25 interim's
+//! call-only shared `OptionData::implied_volatility` fallback is **gone** — each leg
+//! resolves its OWN IV from the style-keyed sidecar, so there is no call/put IV
+//! collision and the put no longer renders `—` at seed. A field is `Some` only
 //! when a real value resolved — projection never invents one, and a missing value
 //! renders `—` (an em dash), never a fabricated `0` (`docs/01-domain-model.md` §5,
 //! §7, §8).
@@ -102,9 +103,9 @@ use crate::ui::theme::{
 /// Each analytic field is resolved by the per-field precedence of §7 (`resolve_leg`):
 /// `delta` prefers the venue value (`OptionData::delta_call` / `delta_put`) and
 /// falls back to the local sidecar; `gamma` comes from the style-keyed [`LegGreeks`]
-/// (venue-or-local per its origin); `iv` follows the three-level `resolve_iv`
-/// precedence (per-style venue → the call-only shared `OptionData::implied_volatility`
-/// → locally computed); `theta`/`vega` are always locally computed. A field is `Some`
+/// (venue-or-local per its origin); `iv` follows the two-level `resolve_iv`
+/// precedence (per-style venue → locally computed); `theta`/`vega` are always locally
+/// computed. A field is `Some`
 /// only when a real value resolved — projection never invents one, and a `None` field
 /// renders `—`, never a fabricated `0` (`project_iv`/`project_local_iv` also clear the
 /// venue's absent-IV zero sentinel and a sub-plausibility local IV to `None`).
@@ -125,9 +126,8 @@ pub struct LegView {
     /// locally-computed value (`project_local_iv`) — renders `—`, never `0.00%`.
     pub iv: Option<Positive>,
     /// Where the resolved `iv` came from: [`GreeksOrigin::Provider`] for a per-style
-    /// venue IV or the shared call-side field, [`GreeksOrigin::ComputedLocally`] for a
-    /// local inversion. Drives the origin glyph on the IV cell (only when `iv` is
-    /// `Some` and local).
+    /// venue IV, [`GreeksOrigin::ComputedLocally`] for a local inversion. Drives the
+    /// origin glyph on the IV cell (only when `iv` is `Some` and local).
     pub iv_origin: GreeksOrigin,
     /// Delta — the venue per-leg value when present, else the local sidecar
     /// fallback; `None` when neither resolved (renders `—`).
@@ -184,8 +184,8 @@ impl LegView {
     }
 
     /// Whether the **present** resolved `iv` is locally computed — the IV cell's
-    /// origin-glyph predicate. A venue/shared (`Provider`) IV and a `None` IV are
-    /// never badged.
+    /// origin-glyph predicate. A venue (`Provider`) IV and a `None` IV are never
+    /// badged.
     #[must_use]
     fn iv_is_local(&self) -> bool {
         self.iv.is_some() && matches!(self.iv_origin, GreeksOrigin::ComputedLocally)
@@ -213,11 +213,11 @@ pub struct ChainRow {
 
 /// Project the **call** leg from an [`OptionData`] and its style-keyed
 /// [`LegGreeks`], resolving each Greek by the §7 precedence ([`resolve_leg`]). The
-/// venue delta is [`OptionData::delta_call`]; `gamma`/`theta`/`vega` come from the
-/// sidecar. The shared [`OptionData::implied_volatility`] is threaded in as the
-/// call-leg IV fallback (§7 documents the shared field as the **call-side** value),
-/// so a seed-only snapshot with no per-style venue IV yet still shows the honest
-/// venue IV rather than a locally-computed near-zero.
+/// venue delta is [`OptionData::delta_call`]; `iv`/`gamma`/`theta`/`vega` come from
+/// the style-keyed sidecar. Since #83 the Deribit adapter seeds a per-style venue IV
+/// for BOTH legs at assembly, so the call leg reads its own venue IV from the sidecar
+/// — the lossy call-side `OptionData::implied_volatility` fallback is no longer
+/// threaded in.
 #[must_use]
 fn project_call(
     od: &OptionData,
@@ -230,7 +230,6 @@ fn project_call(
         od.call_ask,
         od.call_middle,
         od.delta_call,
-        Some(od.implied_volatility),
         leg,
         (bid_dir, ask_dir),
     )
@@ -239,11 +238,9 @@ fn project_call(
 /// Project the **put** leg from an [`OptionData`] and its style-keyed
 /// [`LegGreeks`]. The venue delta is [`OptionData::delta_put`]; `iv`/`gamma` are the
 /// **put** sidecar entry — split per style, so an unequal call/put iv/gamma both
-/// survive (`docs/01-domain-model.md` §7), unlike the shared upstream fields.
-///
-/// The put passes **no** shared-IV fallback: the shared [`OptionData::implied_volatility`]
-/// is the call-side value (§7), so handing it to the put would reintroduce the exact
-/// call/put IV collision the style-keyed sidecar exists to prevent.
+/// survive (`docs/01-domain-model.md` §7), unlike the shared upstream fields. The put
+/// now reads its own per-style venue IV from the sidecar (seeded at assembly, #83),
+/// so — like the call — it resolves IV through the sidecar alone.
 #[must_use]
 fn project_put(
     od: &OptionData,
@@ -256,7 +253,6 @@ fn project_put(
         od.put_ask,
         od.put_middle,
         od.delta_put,
-        None,
         leg,
         (bid_dir, ask_dir),
     )
@@ -268,14 +264,10 @@ fn project_put(
 ///
 /// - **delta**: the venue per-leg value (origin `Provider`) when present, else the
 ///   local sidecar `delta` (origin `ComputedLocally`).
-/// - **iv**: the three-level [`resolve_iv`] precedence — a per-style venue sidecar
-///   IV, then the call-only `shared_iv` fallback, then a floored local inversion.
+/// - **iv**: the two-level [`resolve_iv`] precedence — a per-style venue sidecar IV,
+///   then a floored local inversion.
 /// - **gamma**: the sidecar `gamma` with its origin (venue-or-local per style).
 /// - **theta/vega**: the sidecar values — always locally computed.
-///
-/// `shared_iv` is the shared [`OptionData::implied_volatility`] for the **call** leg
-/// and `None` for the put (`project_call`/`project_put`), because that shared field
-/// is the call-side value (§7).
 ///
 /// [`greeks_origin`](LegView::greeks_origin) rolls up to
 /// [`GreeksOrigin::ComputedLocally`] when any resolved, present field is local. Each
@@ -287,7 +279,6 @@ fn resolve_leg(
     ask: Option<Positive>,
     mark: Option<Positive>,
     venue_delta: Option<Decimal>,
-    shared_iv: Option<Positive>,
     leg: Option<&LegGreeks>,
     dirs: (TickDir, TickDir),
 ) -> LegView {
@@ -300,8 +291,8 @@ fn resolve_leg(
             None => (None, GreeksOrigin::Provider),
         },
     };
-    // iv: the three-level precedence (sidecar-venue → call-only shared → local floored).
-    let (iv, iv_origin) = resolve_iv(shared_iv, leg);
+    // iv: the two-level precedence (per-style sidecar-venue → local floored).
+    let (iv, iv_origin) = resolve_iv(leg);
     // gamma: the style-keyed sidecar, venue-or-local per its origin.
     let (gamma, gamma_origin) = match leg.and_then(|g| g.gamma.map(|value| (value, g.gamma_origin)))
     {
@@ -339,25 +330,23 @@ fn resolve_leg(
     }
 }
 
-/// Resolve one leg's IV by the three-level §7 precedence, returning the value and its
+/// Resolve one leg's IV by the two-level §7 precedence, returning the value and its
 /// resolved [`GreeksOrigin`] (a **pure** read — no pricing):
 ///
 /// 1. **per-style venue IV** from the sidecar ([`LegGreeks::iv`] with origin
 ///    `Provider`), routed through [`project_iv`] (only the exact-zero absent sentinel
 ///    clears a venue IV — it is never floored);
-/// 2. **`shared_iv`** — the shared [`OptionData::implied_volatility`] the **call** leg
-///    passes and the put passes `None` (§7 call-side field), origin `Provider`;
-/// 3. **locally computed** sidecar IV ([`LegGreeks::iv`] with origin
+/// 2. **locally computed** sidecar IV ([`LegGreeks::iv`] with origin
 ///    `ComputedLocally`), routed through [`project_local_iv`] so a sub-plausibility
 ///    near-zero degrades to `None`, origin `ComputedLocally`.
 ///
-/// The sidecar IV carries exactly one origin, so levels 1 and 3 are mutually
-/// exclusive; the shared fallback sits between them, above the floored local value.
+/// The sidecar IV carries exactly one origin, so the two levels are mutually
+/// exclusive. Since #83 the Deribit adapter seeds a per-style venue IV for BOTH legs
+/// at assembly, so the call-only shared `OptionData::implied_volatility` fallback the
+/// #25 interim used is gone — each leg resolves its OWN IV from the sidecar (no more
+/// call/put IV collision, and the put no longer renders `—` at seed).
 #[must_use]
-fn resolve_iv(
-    shared_iv: Option<Positive>,
-    leg: Option<&LegGreeks>,
-) -> (Option<Positive>, GreeksOrigin) {
+fn resolve_iv(leg: Option<&LegGreeks>) -> (Option<Positive>, GreeksOrigin) {
     if let Some((value, origin)) = leg.and_then(|g| g.iv.map(|v| (v, g.iv_origin))) {
         match origin {
             // A per-style VENUE IV wins outright (only the absent-zero sentinel clears).
@@ -365,21 +354,13 @@ fn resolve_iv(
                 if let Some(iv) = project_iv(value) {
                     return (Some(iv), GreeksOrigin::Provider);
                 }
-                // exact-zero venue sentinel: fall through to the shared field.
+                // exact-zero venue sentinel: no usable IV -> `—`.
             }
-            // A LOCAL sidecar IV ranks below the shared venue fallback (call only) and
-            // is subject to the plausibility floor.
+            // A LOCAL sidecar IV is subject to the plausibility floor.
             GreeksOrigin::ComputedLocally => {
-                if let Some(iv) = shared_iv.and_then(project_iv) {
-                    return (Some(iv), GreeksOrigin::Provider);
-                }
                 return (project_local_iv(value), GreeksOrigin::ComputedLocally);
             }
         }
-    }
-    // No usable sidecar IV: the call-only shared field (the put passes `None`).
-    if let Some(iv) = shared_iv.and_then(project_iv) {
-        return (Some(iv), GreeksOrigin::Provider);
     }
     (None, GreeksOrigin::Provider)
 }
@@ -1111,14 +1092,39 @@ fn fmt_iv(value: Option<Positive>) -> String {
     }
 }
 
-/// Format a greek to four decimals, or `—` when absent. A [`Decimal`] is
-/// fixed-point, so it carries no `NaN`/`Inf` to guard.
+/// The widest a formatted greek may be so it still fits the [`NUM_W`]-wide numeric
+/// cell **with** the trailing `~` origin glyph a locally-computed greek carries
+/// (`NUM_W - 1`). A signed multi-integer-digit greek at a fixed 4 dp (e.g. a
+/// long-dated theta `-12.1322`, 8 chars) would otherwise overflow the cell and the
+/// right-aligned line would clip its leading **sign**, rendering a negative theta as
+/// a misleadingly positive number (surfaced by the #83 venue-IV-priced Greeks, which
+/// are of realistic magnitude rather than the pre-#83 near-zero garbage that always
+/// fit). `fmt_greek` scales precision down to fit, so the sign is never dropped.
+const GREEK_MAX_CHARS: usize = (NUM_W as usize) - 1;
+
+/// Format a greek to fit the numeric cell **without ever dropping its sign**, or `—`
+/// when absent. A [`Decimal`] is fixed-point, so it carries no `NaN`/`Inf` to guard.
+///
+/// Small greeks (delta, gamma) keep the full four decimals; a larger-magnitude greek
+/// (a long-dated theta/vega) trims fractional precision until the whole formatted
+/// number fits [`GREEK_MAX_CHARS`], so the integer part and the leading `-` always
+/// render — an honest value is never shown with the wrong sign at the render edge
+/// (issue #83). This is a formatter concern the chain matrix owns; see `tui-expert`
+/// for the column-width budget it complements.
 #[must_use]
 fn fmt_greek(value: Option<Decimal>) -> String {
-    match value {
-        Some(greek) => format!("{greek:.4}"),
-        None => EM_DASH.to_owned(),
+    let Some(greek) = value else {
+        return EM_DASH.to_owned();
+    };
+    // Prefer the most precise form that fits; fall back to the least precise (which,
+    // for an implausibly huge greek, is still the best sign-preserving effort).
+    for decimals in (0..=4usize).rev() {
+        let formatted = format!("{greek:.decimals$}");
+        if formatted.len() <= GREEK_MAX_CHARS {
+            return formatted;
+        }
     }
+    format!("{greek:.0}")
 }
 
 /// Format an absolute-UTC expiry as a bare calendar date (`2025-06-27`) for the
@@ -1586,9 +1592,10 @@ mod tests {
         };
         od.set_mid_prices();
         // No sidecar entry: the price sides project verbatim, the venue delta wins,
-        // gamma/theta/vega are absent (render `—`), and the call iv falls back to the
-        // shared od.implied_volatility as a Provider-origin value (the call-leg
-        // shared fallback), not a fabricated one.
+        // and gamma/theta/vega/iv are absent (render `—`). Since #83 dropped the
+        // call-side shared `od.implied_volatility` fallback, a call with NO sidecar IV
+        // shows `—`, never the shared field — the per-style venue IV is seeded into the
+        // sidecar at assembly instead of borrowed from the lossy shared slot.
         let call = project_call(&od, None, TickDir::Flat, TickDir::Flat);
         assert_eq!(call.bid, Some(pos(1.0)), "present bid projects Some");
         assert_eq!(call.ask, None, "absent ask projects None (renders em dash)");
@@ -1596,19 +1603,12 @@ mod tests {
         assert_eq!(call.delta, Some(dec(5, 1)), "venue delta_call wins");
         assert_eq!(call.gamma, None, "no sidecar entry -> gamma None");
         assert_eq!(
-            call.iv,
-            Some(pos(0.5)),
-            "no sidecar -> call iv falls back to the shared od.implied_volatility"
-        );
-        assert_eq!(
-            call.iv_origin,
-            GreeksOrigin::Provider,
-            "the shared od IV fallback is Provider-origin (no local glyph)"
+            call.iv, None,
+            "no sidecar IV -> `—` (the #25 shared od.implied_volatility fallback is gone)"
         );
         assert_eq!(call.theta, None, "no sidecar entry -> theta None");
         assert_eq!(call.vega, None, "no sidecar entry -> vega None");
-        // The shared IV is Provider-origin and no local field resolved, so the row is
-        // Provider-origin (no glyph).
+        // No local field resolved (venue delta only), so the row is Provider-origin.
         assert_eq!(call.greeks_origin, GreeksOrigin::Provider);
     }
 
@@ -1690,7 +1690,6 @@ mod tests {
             Some(pos(1.2)),
             Some(pos(1.1)),
             Some(dec(6, 1)),
-            None,
             Some(&leg),
             (TickDir::Flat, TickDir::Flat),
         );
@@ -1704,7 +1703,6 @@ mod tests {
         // No venue delta -> the local sidecar delta is used, and it badges the row.
         let leg = mk_leg(None, Some(dec(-9, 1)), None, Some(dec(-5, 2)), None);
         let v = resolve_leg(
-            None,
             None,
             None,
             None,
@@ -1735,7 +1733,6 @@ mod tests {
             None,
             None,
             Some(dec(5, 1)),
-            None,
             Some(&venue),
             (TickDir::Flat, TickDir::Flat),
         );
@@ -1759,7 +1756,6 @@ mod tests {
             None,
             None,
             Some(dec(5, 1)),
-            None,
             Some(&local),
             (TickDir::Flat, TickDir::Flat),
         );
@@ -1778,7 +1774,6 @@ mod tests {
             None,
             None,
             Some(dec(6, 1)),
-            None,
             Some(&leg),
             (TickDir::Flat, TickDir::Flat),
         );
@@ -1795,15 +1790,7 @@ mod tests {
     fn test_resolve_leg_absent_fields_stay_none_render_em_dash() {
         // No venue delta and no sidecar entry: every analytic is None and renders
         // `—`, never a fabricated 0.
-        let v = resolve_leg(
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            (TickDir::Flat, TickDir::Flat),
-        );
+        let v = resolve_leg(None, None, None, None, None, (TickDir::Flat, TickDir::Flat));
         assert_eq!(v.delta, None);
         assert_eq!(v.iv, None);
         assert_eq!(v.gamma, None);
@@ -1814,7 +1801,7 @@ mod tests {
         assert_eq!(v.greeks_origin, GreeksOrigin::Provider);
     }
 
-    // --- IV precedence: shared call-side fallback + the local plausibility floor ---
+    // --- IV precedence: per-style venue sidecar IV + the local plausibility floor --
 
     #[test]
     fn test_resolve_iv_local_below_floor_clears_to_none() {
@@ -1828,9 +1815,8 @@ mod tests {
             None,
             None,
         );
-        // No shared IV (put-like), so the sub-floor local value is not rescued.
+        // The sub-floor local value is floored to `—` (there is no shared fallback).
         let v = resolve_leg(
-            None,
             None,
             None,
             None,
@@ -1854,7 +1840,6 @@ mod tests {
             None,
         );
         let v = resolve_leg(
-            None,
             None,
             None,
             None,
@@ -1884,7 +1869,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             Some(&leg),
             (TickDir::Flat, TickDir::Flat),
         );
@@ -1898,10 +1882,38 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_iv_call_shared_fallback_is_provider_origin() {
-        // (d) The sidecar holds only a near-zero LOCAL IV, but the call passes its
-        // shared od.implied_volatility -> the honest venue call-side value wins as a
-        // Provider-origin IV (not the floored local garbage).
+    fn test_resolve_iv_call_reads_per_style_venue_sidecar_not_shared_field() {
+        // (d) #83: the call reads its OWN per-style venue IV from the sidecar (seeded
+        // at assembly), NOT the shared `od.implied_volatility`. A per-style Provider IV
+        // wins outright.
+        let od = OptionData {
+            strike_price: pos(60_000.0),
+            implied_volatility: pos(0.4922),
+            delta_call: Some(dec(6, 1)),
+            ..Default::default()
+        };
+        let venue_leg = mk_leg(
+            Some((pos(0.55), GreeksOrigin::Provider)),
+            None,
+            None,
+            Some(dec(-1, 1)),
+            None,
+        );
+        let call = project_call(&od, Some(&venue_leg), TickDir::Flat, TickDir::Flat);
+        assert_eq!(
+            call.iv,
+            Some(pos(0.55)),
+            "the per-style venue sidecar IV wins (not the shared od field's 0.4922)"
+        );
+        assert_eq!(call.iv_origin, GreeksOrigin::Provider);
+        assert!(!call.iv_is_local(), "no local glyph on the venue IV");
+    }
+
+    #[test]
+    fn test_resolve_iv_call_no_longer_uses_shared_field_fallback() {
+        // (d.2) #83 DROPPED the #25 call-side shared-`od.implied_volatility` fallback.
+        // A call whose sidecar holds only a near-zero LOCAL IV — with the shared field
+        // SET — now shows `—` (the floored local), never the shared field's value.
         let od = OptionData {
             strike_price: pos(60_000.0),
             implied_volatility: pos(0.4922),
@@ -1917,24 +1929,17 @@ mod tests {
         );
         let call = project_call(&od, Some(&leg), TickDir::Flat, TickDir::Flat);
         assert_eq!(
-            call.iv,
-            Some(pos(0.4922)),
-            "the shared od IV wins over the near-zero local"
+            call.iv, None,
+            "the near-zero local is floored to `—` (the shared fallback is gone)"
         );
-        assert_eq!(
-            call.iv_origin,
-            GreeksOrigin::Provider,
-            "the shared od IV fallback is Provider-origin"
-        );
-        assert!(!call.iv_is_local(), "no local glyph on the shared venue IV");
+        assert_eq!(super::fmt_iv(call.iv), super::EM_DASH);
     }
 
     #[test]
     fn test_resolve_iv_put_ignores_shared_field_no_collision() {
-        // (e) The shared od.implied_volatility is the CALL-side value (§7). A strike
-        // whose shared field is set but whose PUT sidecar has no per-style venue IV
-        // shows put IV `—`, never the call's value — the call/put collision the
-        // style-keyed sidecar exists to prevent.
+        // (e) Both legs ignore the shared `od.implied_volatility` (#83): a PUT whose
+        // sidecar has only a floored local IV shows `—`, never the call-side shared
+        // field's value — the call/put IV collision the style-keyed sidecar prevents.
         let od = OptionData {
             strike_price: pos(60_000.0),
             implied_volatility: pos(0.4922),
@@ -1950,10 +1955,7 @@ mod tests {
             None,
         );
         let put = project_put(&od, Some(&leg), TickDir::Flat, TickDir::Flat);
-        assert_eq!(
-            put.iv, None,
-            "the put never inherits the call-side shared IV"
-        );
+        assert_eq!(put.iv, None, "the put never inherits the shared IV");
         assert_eq!(super::fmt_iv(put.iv), super::EM_DASH);
     }
 
@@ -1968,7 +1970,6 @@ mod tests {
             None,
             None,
             Some(dec(6, 1)),
-            None,
             Some(&mixed),
             (TickDir::Flat, TickDir::Flat),
         );
@@ -1984,7 +1985,6 @@ mod tests {
         // where the old delta-gated glyph would have shown nothing.
         let no_delta = mk_leg(None, None, None, Some(dec(-5, 2)), None);
         let w = resolve_leg(
-            None,
             None,
             None,
             None,
@@ -2019,7 +2019,6 @@ mod tests {
             None,
             None,
             Some(dec(5, 1)),
-            None,
             Some(&venue),
             (TickDir::Flat, TickDir::Flat),
         );
@@ -2052,9 +2051,10 @@ mod tests {
         assert!(row.call.theta.is_some(), "local theta populated");
         assert!(row.call.vega.is_some(), "local vega populated");
         assert!(row.call.gamma.is_some(), "local gamma populated");
-        // The call iv resolves — the shared od.implied_volatility fallback outranks
-        // the local inversion at seed, so it is Some regardless.
-        assert!(row.call.iv.is_some(), "call iv resolves");
+        // The call iv resolves to the LOCAL inversion at seed (a plausible ATM premium
+        // clears the floor); #83 dropped the shared od.implied_volatility fallback, so
+        // the sidecar's own local IV is what shows.
+        assert!(row.call.iv.is_some(), "call iv resolves (local inversion)");
         // Venue delta is present, so delta resolves to it, but the local theta/vega
         // make the row ComputedLocally (a mixed-origin row).
         assert_eq!(row.call.delta, od.delta_call);
@@ -2820,10 +2820,13 @@ mod tests {
             text.contains('~'),
             "the `~` origin glyph badges a ComputedLocally field (local theta)",
         );
-        // The badged value renders as a real number with the glyph, never a bare `~`.
+        // The badged value renders as a real, SIGNED number with the glyph, never a
+        // bare `~` and never a sign-clipped positive-looking value (issue #83): at the
+        // golden's ~590-DTE as-of the venue-IV-priced theta is a genuine `-12.13`-ish
+        // decay, width-fitted so the leading `-` survives.
         assert!(
-            text.contains("0.0000~") || text.contains("-0.0003~"),
-            "a computed theta renders as a number followed by the origin glyph",
+            text.contains("-12.132~"),
+            "a computed theta renders as a signed number followed by the origin glyph",
         );
     }
 

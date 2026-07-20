@@ -290,9 +290,9 @@ pub use chain::{
     DepthBook, DepthLadder, DepthLevel, DepthStatus, DepthStore, ExerciseStyle, ExpirySource,
     FEED_DELAY_WARN, Freshness, GREEKS_STALE_AFTER, GreeksOrigin, GreeksRow, GreeksSidecar,
     Instrument, InstrumentKey, LegGreeks, LegStatus, MAX_DEPTH_BOOKS, MAX_PENDING, MarketUpdate,
-    MergeOutcome, PricingInputs, PricingModel, ProviderId, QUOTE_STALE_AFTER, QuoteClocks,
-    QuoteSelect, QuoteUpdate, RESERVED_PROVIDER_IDS, SettlementStyle, StreamHealth, TickDir,
-    chain_stale_after, compute_leg_greeks, depth_continues, pending_ttl,
+    MergeOutcome, PremiumNumeraire, PricingInputs, PricingModel, ProviderId, QUOTE_STALE_AFTER,
+    QuoteClocks, QuoteSelect, QuoteUpdate, RESERVED_PROVIDER_IDS, SettlementStyle, StreamHealth,
+    TickDir, chain_stale_after, compute_leg_greeks, depth_continues, pending_ttl,
 };
 pub use config::{CliOverrides, Config, ModeSelect, ProviderSettings, ThemeChoice};
 pub use error::{

@@ -100,7 +100,7 @@ use super::{
 use crate::chain::{
     AliasCatalog, ChainFetch, ChainSnapshot, ChainSource, ContractSpecFingerprint, DepthLadder,
     DepthLevel, ExerciseStyle, ExpirySource, GreeksOrigin, GreeksRow, Instrument, InstrumentKey,
-    MarketUpdate, ProviderId, QuoteUpdate, SettlementStyle, StreamHealth,
+    MarketUpdate, PremiumNumeraire, ProviderId, QuoteUpdate, SettlementStyle, StreamHealth,
 };
 use crate::error::{NormalizeKind, ProviderError, TransportDetail, TransportKind};
 
@@ -781,6 +781,12 @@ struct NormalizedLeg {
     open_interest: Option<u64>,
     underlying_price: Option<Positive>,
     style: OptionStyle,
+    /// True for an inverse ("reversed") contract whose premium is quoted in the
+    /// underlying COIN while the strike is in the quote currency (issue #83). The
+    /// chain's [`PremiumNumeraire`](crate::chain::PremiumNumeraire) is derived from
+    /// this so the store's local IV inversion converts the coin premium to the
+    /// strike currency (`premium_coin * spot`) before inverting.
+    inverse: bool,
 }
 
 /// Normalize one upstream `OptionInstrument` (instrument + ticker) into a
@@ -838,7 +844,20 @@ fn normalize_leg(option: &OptionInstrument) -> Result<NormalizedLeg, NormalizeKi
         open_interest,
         underlying_price,
         style,
+        inverse: is_inverse_contract(instrument),
     })
+}
+
+/// True when a Deribit option is an **inverse** ("reversed") contract: its premium
+/// settles in the underlying COIN (`settlement_currency`, e.g. `BTC`) while the
+/// strike is quoted in a different `quote_currency` (`USD`) — the standard Deribit
+/// crypto-option convention (issue #83). When either currency is absent the
+/// contract is treated as vanilla (no conversion), the conservative default.
+fn is_inverse_contract(instrument: &DeribitInstrument) -> bool {
+    match (&instrument.settlement_currency, &instrument.quote_currency) {
+        (Some(settlement), Some(quote)) => !settlement.eq_ignore_ascii_case(quote),
+        _ => false,
+    }
 }
 
 /// The Deribit economic-equivalence fingerprint: options are **cash-settled,
@@ -932,7 +951,10 @@ fn assemble_chain(
     for (strike, pair) in by_strike {
         // `add_option` requires a single IV per strike; prefer the call's, fall
         // back to the put's, and default a fabricated-free zero when neither feed
-        // supplied one (a valid zero IV per the normalization table).
+        // supplied one (a valid zero IV per the normalization table). This shared
+        // slot is lossy (it holds only one style's IV), so the AUTHORITATIVE
+        // per-style venue IV rides the `greeks_seed` rows below and is folded into
+        // the store's style-keyed sidecar — both legs keep their own IV (issue #83).
         let iv = pair
             .call
             .and_then(|leg| leg.iv)
@@ -960,11 +982,64 @@ fn assemble_chain(
         );
     }
 
+    // Seed the store's style-keyed analytics sidecar with EACH leg's venue mark_iv
+    // (and venue gamma) as a per-style `Provider` value, so both the call and the put
+    // carry an honest per-style venue IV at seed — not just the call side that the
+    // single shared `OptionData.implied_volatility` can hold (issue #83, §7-lossy).
+    // `apply_venue_greeks` reads only key/iv/gamma/origin, so `received_time` is a
+    // deterministic placeholder (the chain expiry) it never consults.
+    let greeks_seed = venue_greeks_seed(legs, expiration_utc, provider);
+
+    // A Deribit crypto option is an inverse ("reversed") contract: its premium is
+    // quoted in the coin, so the local IV inversion must convert `premium * spot`
+    // into the strike currency (issue #83). Uniform per chain, so any leg decides it.
+    let premium_numeraire = if legs.iter().any(|leg| leg.inverse) {
+        PremiumNumeraire::UnderlyingCoin
+    } else {
+        PremiumNumeraire::QuoteCurrency
+    };
+
     ChainFetch::new(
         chain,
         ExpirySource::new(underlying, expiration_utc, provider.clone()),
         aliases,
     )
+    .with_greeks_seed(greeks_seed)
+    .with_premium_numeraire(premium_numeraire)
+}
+
+/// Build the per-style venue-IV/gamma seed rows the store folds into its sidecar at
+/// seed (issue #83): one [`GreeksRow`] per leg that carries a venue `iv` or `gamma`,
+/// tagged [`GreeksOrigin::Provider`]. Delta/theta/vega/rho are `None` (the sidecar
+/// keeps only per-style venue iv/gamma from a seed; delta lives on `OptionData` and
+/// theta/vega/rho are computed locally). `received_time` is the deterministic chain
+/// expiry — a placeholder `apply_venue_greeks` never reads (no wall clock).
+fn venue_greeks_seed(
+    legs: &[NormalizedLeg],
+    expiration_utc: DateTime<Utc>,
+    provider: &ProviderId,
+) -> Vec<GreeksRow> {
+    legs.iter()
+        .filter(|leg| leg.iv.is_some() || leg.gamma.is_some())
+        .map(|leg| GreeksRow {
+            instrument: Instrument {
+                key: leg.key.clone(),
+                provider: provider.clone(),
+                native_symbol: leg.native_symbol.clone(),
+                stream_symbol: None,
+                spec: leg.spec.clone(),
+            },
+            iv: leg.iv,
+            delta: None,
+            gamma: leg.gamma,
+            theta: None,
+            vega: None,
+            rho: None,
+            origin: GreeksOrigin::Provider,
+            event_time: None,
+            received_time: expiration_utc,
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -4645,8 +4720,8 @@ mod tests {
 
         use crate::chain::{
             ContractSpecFingerprint, ExerciseStyle, GreeksOrigin, GreeksRow, GreeksSidecar,
-            Instrument, InstrumentKey, PricingInputs, ProviderId, SettlementStyle,
-            compute_leg_greeks,
+            Instrument, InstrumentKey, PremiumNumeraire, PricingInputs, ProviderId, QuoteClocks,
+            SettlementStyle, compute_leg_greeks,
         };
 
         /// The committed Deribit ticker fixture — a hand-authored fixture in the
@@ -4683,19 +4758,20 @@ mod tests {
         /// (issue #28).
         const GAMMA_TOLERANCE: f64 = 0.00001;
 
-        // THETA / VEGA are DELIBERATELY NOT asserted for VENUE parity (issue #28,
-        // pending issue #83). Fed the correct venue IV, the local engine's
-        // currency-denominated Greeks do not reproduce this fixture's theta / vega
-        // (local theta -125.3 vs fixture -9.9, local vega 30.5 vs fixture 8.8). The
-        // fixture's hand-authored values are not reproduced by the vanilla-USD #24
-        // engine, and the gap does not decompose into a single documented inverse-
-        // contract transform — venue theta/vega parity on BTC-settled contracts is
-        // PENDING the #83 unit-aware fix. Two things ARE verified here: the ~12.7x on
-        // theta is NOT a per-year/per-day (365x) confusion (optionstratlib's theta is
-        // already per-day, its vega already per-1%-IV — both checked in source), and
-        // the LOCAL values themselves are pinned by the magnitude bands below so an
-        // engine regression is caught — never a fabricated wide venue tolerance that
-        // would hide #83.
+        // THETA / VEGA are DELIBERATELY NOT asserted for VENUE parity (issue #28).
+        // Fed the correct venue IV, the local engine's local theta/vega are QUOTE-
+        // CURRENCY (USD) denominated (local theta -125.3, local vega 30.5), whereas the
+        // fixture's venue theta/vega are COIN-denominated (-9.9, 8.8) — the two are in
+        // different numeraires and legitimately differ by roughly the spot scale, so
+        // venue theta/vega parity on a BTC-settled contract is not expected. #83 makes
+        // the IV INVERSION unit-aware (a coin premium is priced in the strike currency
+        // before inverting), but it does NOT convert the resulting Greeks into the coin
+        // numeraire — the local Greeks stay honest USD analytics, badged `~` in the UI.
+        // Two things ARE verified here: the theta gap is NOT a per-year/per-day (365x)
+        // confusion (optionstratlib's theta is already per-day, its vega already
+        // per-1%-IV — both checked in source), and the LOCAL values are pinned by the
+        // magnitude bands below so an engine regression is caught — never a fabricated
+        // wide venue tolerance.
 
         #[track_caller]
         fn pos(value: f64) -> Positive {
@@ -4871,12 +4947,81 @@ mod tests {
             assert!(
                 (-200.0..-50.0).contains(&local_theta),
                 "local theta within the engine's magnitude band (finite, negative, \
-                 ~-125 at this snapshot; venue parity pending #83): {local_theta}",
+                 ~-125 at this snapshot; USD-denominated, no venue-coin parity): {local_theta}",
             );
             assert!(
                 (10.0..60.0).contains(&local_vega),
                 "local vega within the engine's magnitude band (finite, positive, \
-                 ~30.5 at this snapshot; venue parity pending #83): {local_vega}",
+                 ~30.5 at this snapshot; USD-denominated, no venue-coin parity): {local_vega}",
+            );
+        }
+
+        /// The reference instant for the inverse-contract IV-inversion check: ~25
+        /// days before the fixture's 2025-06-27 18:30 UTC expiry (1751049000). At
+        /// this DTE the fixture's `mark_price` (0.0552 BTC) and `mark_iv` (49.22%)
+        /// are jointly Black-Scholes-consistent, so the LOCAL inversion of the mid
+        /// premium recovers a value close to the venue `mark_iv` — the direct proof
+        /// the unit-aware inversion works (a different DTE would still recover a
+        /// plausible IV, but not one comparable to this fixture's `mark_iv`).
+        const AS_OF_25D: i64 = 1_748_889_000;
+
+        /// A documented, tight tolerance for the inverse-contract IV parity, as an IV
+        /// fraction. The engine inverts the fixture's MID premium (0.055 BTC), a hair
+        /// below the `mark_price` (0.0552 BTC) the `mark_iv` was struck at, so the
+        /// locally inverted IV lands just under 49.22% (MEASURED 48.85%, a 0.37pp gap
+        /// entirely explained by the mid-vs-mark spread). The `0.01` tolerance covers
+        /// that gap with margin while still catching a real regression — a genuine
+        /// agreement, NOT the near-zero (~0.003%) garbage the pre-#83 USD pricing
+        /// produced.
+        const INVERSE_IV_TOLERANCE: f64 = 0.01;
+
+        #[test]
+        fn test_deribit_inverse_contract_local_iv_matches_venue_mark_iv() {
+            // The #83 deep fix: with the chain's premium numeraire declared
+            // `UnderlyingCoin`, the LOCAL IV inversion of a Deribit inverse contract's
+            // coin-quoted premium (~0.055 BTC) recovers an IV close to the venue
+            // `mark_iv` (49.22%) — NOT the near-zero garbage the pre-#83 USD pricing
+            // produced. No venue IV is seeded, so the local inversion path is exercised.
+            let ticker: Value = match FIXTURE_TICKER.parse() {
+                Ok(v) => v,
+                Err(e) => panic!("fixture ticker must parse: {e}"),
+            };
+            let mark_iv = f64_field(&ticker, "mark_iv") / 100.0;
+
+            let mut ctx = PricingInputs::new(pos(SPOT), utc(AS_OF_25D), 1);
+            ctx.premium_numeraire = PremiumNumeraire::UnderlyingCoin;
+            let chain = fixture_chain();
+            let clocks = QuoteClocks::new();
+            let mut sink = GreeksSidecar::new();
+            match compute_leg_greeks(&chain, &ctx, &clocks, &mut sink) {
+                Ok(()) => {}
+                Err(e) => panic!("compute_leg_greeks failed: {e}"),
+            }
+
+            let leg = match sink.get(&call_instrument().key) {
+                Some(g) => *g,
+                None => panic!("expected a sidecar entry for the 60000 call"),
+            };
+            assert_eq!(
+                leg.iv_origin,
+                GreeksOrigin::ComputedLocally,
+                "the IV was inverted locally (no venue seed), exercising the #83 path",
+            );
+            let local_iv = match leg.iv.map(|iv| iv.to_f64()) {
+                Some(iv) => iv,
+                None => panic!("expected a locally inverted IV for the inverse contract"),
+            };
+            assert!(
+                (local_iv - mark_iv).abs() <= INVERSE_IV_TOLERANCE,
+                "local inverse-contract IV {local_iv} vs venue mark_iv {mark_iv} \
+                 (tol {INVERSE_IV_TOLERANCE}) — the coin premium was priced in the \
+                 strike currency, not near-zero USD garbage",
+            );
+            // Belt-and-suspenders: the recovered IV is comfortably above the
+            // sub-plausibility floor, so it is a real quote, never floored to `—`.
+            assert!(
+                local_iv > 0.005,
+                "the inverted IV clears the plausibility floor: {local_iv}",
             );
         }
     }
