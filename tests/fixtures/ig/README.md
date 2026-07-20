@@ -42,25 +42,24 @@ same PR that lands the fixture").
 
 ### Why this is evidence-on-file, not a live adapter capture
 
-The IG **built-in adapter is deferred** (issue #39; `docs/03-data-providers.md`
-§7.4 banner, §8 note 3): `ig-client` 0.12.1 exposes no config-injectable
-constructor, so no IG adapter ships and there is no `ig_capabilities()` /
-`ig`-adapter depth path to drive this fixture through. This fixture is therefore
-committed as a **DATA artifact** — the recorded wire shape and the observed reality
-that a dated-option epic does not populate the DOM ladder — resolving the matrix's
-`unverified-pending-fixture` footnote into a documented SHAPE-ONLY artifact:
+The IG **built-in adapter now ships** behind the `ig` Cargo feature (issue #39;
+`docs/03-data-providers.md` §7.4 banner, §8 note 3) and declares `depth: false` on
+this evidence. But this fixture is HAND-AUTHORED to the documented `ig-client` wire
+shape, not a RECORDED live payload, so it cannot on its own establish what a live
+venue populates. It is therefore committed as a **DATA artifact** — the documented
+wire shape plus the observed reality that a dated-option epic does not populate the
+DOM ladder — that BACKS the adapter's `depth: false` and keeps the matrix cell
+`unverified` (shape-only) until a recorded payload lands:
 
 - Now: the fixture parses as the documented IG DOM wire shape and confirms the
-  five-level fields are unpopulated (see `src/tests_capability_matrix.rs`), pointing
-  the depth cell at `unverified` until a RECORDED payload or authoritative
-  provider documentation exists (the definitive flip - either way - lands with
-  the #39 unblock).
-- When #39 unblocks (upstream adds a `Client::with_config`-style constructor and the
-  built-in adapter lands), this on-file fixture drives the real IG adapter's depth
-  path to confirm the `no` — the definitive flip.
+  five-level fields are unpopulated (see `src/tests_capability_matrix.rs`), backing
+  the shipped adapter's `depth: false` while the cell stays `unverified` (shape-only)
+  pending a RECORDED live payload.
+- Issue #50 (v0.5) lands the recorded option-epic payload that flips the cell to a
+  verified `no`, driven through the shipped IG adapter's depth path.
 
 The fixture is **not** a live capture from a production IG account (that needs
-credentials the zero-config test suite does not carry, and the deferred adapter);
+credentials the zero-config test suite does not carry);
 it is faithful to `ig-client`'s models and to IG's documented depth-of-market
 availability, and it exists precisely to end the `unverified` ambiguity with a
 committed artifact.

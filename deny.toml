@@ -54,7 +54,7 @@ all-features = true
 # ignored — the three entries below are all unmaintained/unsound with no
 # in-MSRV fix.
 ignore = [
-    { id = "RUSTSEC-2021-0141", reason = "dotenv 0.15.0 unmaintained. Transitive via deribit-http 0.7.1, deribit-websocket 0.3.1, (only under the disabled-by-default `tastytrade` feature, #40) tastytrade 0.3.0, and (only under the disabled-by-default `alpaca` feature, #41) alpaca-base 0.26.0 -> alpaca-http 0.21.2 / alpaca-websocket 0.6.0. ChainView uses the MAINTAINED `dotenvy` directly; `dotenv` is pulled only by these upstream clients. No env-file load runs on the public no-auth Deribit zero-config path; the gated tastytrade adapter never calls the upstream `TastyTradeConfig::from_env`; and the gated Alpaca adapter never calls the crates' `Credentials::from_env` (the only path that loads a `.env`) — both inject credentials via `Credentials::new`/a struct literal from CHAINVIEW_<ID>_* env vars. Re-evaluate when deribit-http/deribit-websocket/tastytrade/alpaca-* drop dotenv upstream." },
+    { id = "RUSTSEC-2021-0141", reason = "dotenv 0.15.0 unmaintained. Transitive via deribit-http 0.7.1, deribit-websocket 0.3.1, (only under the disabled-by-default `tastytrade` feature, #40) tastytrade 0.3.0, (only under the disabled-by-default `alpaca` feature, #41) alpaca-base 0.26.0 -> alpaca-http 0.21.2 / alpaca-websocket 0.6.0, and (only under the disabled-by-default `ig` feature, #39) ig-client 0.12.3. ChainView uses the MAINTAINED `dotenvy` directly; `dotenv` is pulled only by these upstream clients. No env-file load runs on the public no-auth Deribit zero-config path; the gated tastytrade adapter never calls the upstream `TastyTradeConfig::from_env`; the gated Alpaca adapter never calls the crates' `Credentials::from_env`; and the gated IG adapter uses the env-free `Config::from_credentials(..)` + `Client::with_config(..)` (built from CHAINVIEW_IG_* env vars) and NEVER `Config::new`/`Config::default`/`Client::try_new` — the only paths that load a `.env` (all inject credentials via `Credentials::new`/a struct literal from CHAINVIEW_<ID>_* env vars). Re-evaluate when deribit-http/deribit-websocket/tastytrade/alpaca-*/ig-client drop dotenv upstream." },
     { id = "RUSTSEC-2024-0436", reason = "paste 1.0.15 unmaintained (archived). Build-time proc-macro only, transitive via simba->nalgebra->statrs->optionstratlib 0.18.0 and via ratatui 0.29.0. No known vulnerability and no maintained drop-in at the pinned upstream versions. Re-evaluate when optionstratlib and ratatui drop the paste dependency." },
     { id = "RUSTSEC-2026-0002", reason = "lru 0.12.5 unsound (IterMut violates Stacked Borrows). Transitive via ratatui 0.29.0 only, which pins `lru = ^0.12`; 0.12.5 is the newest 0.12.x, and the fixed line (lru >= 0.16.3) is only reachable by upgrading to ratatui 0.30 — a separate breaking migration, not an in-place patch. The unsound `IterMut` path is never invoked (ChainView renders through ratatui's public draw API). This is audit-gated (cargo-deny's default config does not gate `unsound` informational advisories, so this ignore is a forward-defense no-op there); re-evaluate when ratatui is upgraded to 0.30." },
 ]
@@ -91,6 +91,23 @@ allow = [
     "bzip2-1.0.6",
 ]
 confidence-threshold = 0.8
+# Per-crate license EXCEPTION (issue #39, owner decision). The global allow-list
+# above stays permissive-only — GPL is NOT added to it. The single copyleft crate
+# ChainView tolerates is scoped here to exactly one crate:
+#   lightstreamer-rs 0.3.3 — `GPL-3.0-only`, pulled ONLY as a transitive of
+#   `ig-client 0.12.3` under the disabled-by-default `ig` feature (#39), as the
+#   live-quote Lightstreamer transport. The project OWNER has decided (#39) to
+#   ACCEPT this GPL-3.0-only transitive for the `ig` feature's streaming leg; the
+#   copyleft implication is acknowledged and the exception is deliberately NARROW
+#   (one named crate, not a global GPL allow), so a default build (no `--features
+#   ig`) never pulls it and the permissive-only policy is otherwise unchanged.
+#   TEMPORARY: the owner is reimplementing the Lightstreamer transport under an
+#   MIT license; when ig-client depends on that MIT crate instead, this exception
+#   is REMOVED (no adapter change — src/providers/ig.rs uses ig-client's streaming
+#   API, agnostic to the transport crate's license). Re-evaluate then.
+exceptions = [
+    { name = "lightstreamer-rs", allow = ["GPL-3.0-only"] },
+]
 
 # ---------------------------------------------------------------------------
 # bans — `cargo deny check bans`

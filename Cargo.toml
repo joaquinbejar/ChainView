@@ -93,16 +93,29 @@ fuzz = []
 # not compile the adapter or pull the `dxlink` crate at all. `dep:` keeps the
 # optional crate from implicitly defining a same-named feature.
 dxlink = ["dep:dxlink"]
-# NOTE (issue #39, ADR-0013): the PLANNED `ig` feature — a DEPENDENCY-WEIGHT gate
-# (NOT a credential-logging security gate; the feature-on adapter would be a REAL
-# built-in in `with_builtins()`, never `with_gated_builtin`) — is intentionally
-# ABSENT. Adding it now would require adding `ig-client 0.12.2`. Of its two
-# blockers, the `sqlx 0.9` MSRV (1.94) is now ACCEPTED — the crate MSRV was raised
-# to 1.94 for exactly this path — but the GPL-3.0-only `lightstreamer-rs` transitive
-# license STILL blocks (`cargo deny check licenses` fails against the permissive-only
-# allow-list; see the `[dependencies]` note below and ADR-0013). The feature and its
-# `ig-client` optional dep land only when upstream clears the GPL blocker
-# (ig-client#83: feature-gate the GPL streaming leg off by default).
+# `ig` gates the whole IG adapter (`src/providers/ig.rs`, issue #39). It is a
+# DEPENDENCY-WEIGHT gate per ADR-0013 (NOT a credential-logging security gate): when
+# ON, IG is a REAL built-in — `with_builtins()` registers it when its
+# `CHAINVIEW_IG_*` credentials are configured (and omits it, never erroring, when
+# they are absent, so zero-config Deribit is unaffected), never reached through
+# `with_gated_builtin`. It is DISABLED by default to keep the heavy upstream deps
+# out of a default build: a normal `cargo build` (no `--features ig`) does not
+# compile the adapter or pull `ig-client` at all.
+#
+# ADR-0007 audit note: `ig-client 0.12.3` ships Cargo features
+# `default = ["persistence","streaming"]`; ChainView consumes BOTH legs (default
+# features), so the adapter can drive the env-free `Config::from_credentials` +
+# `Client::with_config` REST path AND the Lightstreamer streaming leg
+# (`StreamerClient::with_client`). This pulls `sqlx 0.9` (MSRV 1.94 — already the
+# crate floor, raised for exactly this path) and `lightstreamer-rs 0.3.3` (the
+# live-quote transport). `lightstreamer-rs 0.3.3` is GPL-3.0-only: the project
+# OWNER has decided to ACCEPT it (issue #39), scoped to this optional feature via a
+# per-crate license exception in `deny.toml` (never a global GPL allow). The
+# transitive `dotenv 0.15` is covered by the extended RUSTSEC-2021-0141 ignore in
+# `deny.toml` — ChainView uses the env-free `Config::from_credentials`, never
+# dotenv. `dep:` keeps the optional crate from implicitly defining a same-named
+# feature.
+ig = ["dep:ig-client"]
 
 [lib]
 name = "chainview"
@@ -256,19 +269,33 @@ futures-util = { version = "0.3", default-features = false, optional = true }
 # at both 0.2.0 (this direct dep) and 0.1.5 (transitive via the gated tastytrade
 # 0.3.0), a deny.toml `multiple-versions = "warn"` duplicate, never a failure.
 dxlink = { version = "0.2", optional = true }
-# NOTE (issue #39, ADR-0013): `ig-client` is NOT added here — the IG built-in
-# stays DEFERRED. The 0.12.1 injection blocker was cleared by 0.12.2
-# (`Config::from_credentials` + `Client::with_config`), but a REAL audit/deny run
-# surfaced two hard blockers from `ig-client 0.12.2` having NO Cargo features (it
-# unconditionally pulls its full persistence + streaming stack): (1) `ig-client ->
-# lightstreamer-rs 0.3.3` is `GPL-3.0-only` (copyleft) — `cargo deny check licenses`
-# FAILS; allow-listing it would weaken ChainView's permissive-only license policy
-# AND contaminate the MIT crate; (2) `ig-client -> sqlx 0.9.0` required Rust 1.94.0,
-# above the former 1.88 MSRV. Blocker (2) is RESOLVED — the crate MSRV was raised to
-# 1.94 to adopt `sqlx 0.9` on this path. Blocker (1) STILL stands: per the
-# #39-deferral precedent (never weaken a rule to force a dep), IG re-enters only when
-# upstream `ig-client` feature-gates the GPL `lightstreamer-rs` streaming leg OFF by
-# default (or moves to a permissively-licensed client). Full ruling: ADR-0013.
+# The IG client (issue #39, the navigation-assembled poll->stream provider —
+# `docs/03-data-providers.md` §7.4). OPTIONAL and behind the DISABLED-by-default
+# `ig` feature: a normal build never pulls it. Consumed with its DEFAULT features
+# (`persistence` + `streaming`), so the adapter can drive BOTH the env-free REST
+# path (`Config::from_credentials` + `Client::with_config`, `MarketService`) and
+# the Lightstreamer streaming leg (`StreamerClient::with_client`); ChainView never
+# reimplements the JSON-RPC/Lightstreamer protocols (CLAUDE.md "Key Decisions").
+# Explicit-approval addition (CLAUDE.md "Coding Rules") — ADR-0007 audit note in
+# CHANGELOG (`cargo audit` + `cargo deny check` (deny.toml pins `all-features = true`)).
+# Auth is injected programmatically: the adapter builds `Credentials::new(..)` from
+# ChainView-namespaced `CHAINVIEW_IG_*` env vars, wraps it in
+# `Config::from_credentials(..)` + `Client::with_config(..)`, and NEVER calls
+# `Config::new()` / `Config::default()` / `Client::try_new()` (which would load a
+# `.env` via `dotenv` and read the foreign `IG_*` namespace). Session v2
+# (CST/X-SECURITY-TOKEN) or v3 (OAuth) auto-refresh is handled by the client. It
+# uses `StreamerClient::with_client(&injected_client)` — NOT `DynamicMarketStreamer`,
+# whose `start_internal` builds its own `StreamerClient::new()` via the `.env`/`IG_*`
+# path — so the env-only credential rule holds end to end. Verified against the
+# 0.12.3 checkout.
+# Supply-chain delta (feature-on only): pulls `sqlx 0.9` (MSRV 1.94 — the crate
+# floor, raised for this path; `persistence` is never exercised), `lightstreamer-rs
+# 0.3.3` (the streaming transport — `GPL-3.0-only`, ACCEPTED by owner decision for
+# this optional feature, scoped via a per-crate exception in deny.toml, issue #39),
+# `governor`, `nanoid`, `regex`, `lazy_static`, `prettytable-rs`, and (transitively,
+# never exercised on the injection path) `dotenv` — covered by the extended
+# RUSTSEC-2021-0141 ignore in deny.toml.
+ig-client = { version = "0.12", optional = true }
 # The Parquet reader for the IronCondor result bundle (issue #30, ADR-0010,
 # `docs/04-replay-mode.md` §2/§3). The bundle's four tables are Parquet; the
 # reader decodes them batch-by-batch under measured resource ceilings. ChainView
