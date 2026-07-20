@@ -59,7 +59,8 @@ use super::events::{
 };
 use super::fetch::{AliasCatalog, ChainFetch};
 use super::greeks::{
-    GreeksSidecar, LegGreeks, PricingInputs, QuoteClocks, compute_dirty_legs, compute_leg_greeks,
+    GreeksSidecar, LegGreeks, PremiumNumeraire, PricingInputs, QuoteClocks, compute_dirty_legs,
+    compute_leg_greeks,
 };
 use super::identity::{InstrumentKey, ProviderId};
 
@@ -275,6 +276,12 @@ pub struct ChainStore {
     /// timestamp — the sidecar prices time-to-expiry from. Never `Utc::now()`, so
     /// the local analytics stay reproducible (`docs/01` §7, issue #24).
     analytics_as_of: DateTime<Utc>,
+    /// The numeraire this chain's contract premiums are quoted in — set once from
+    /// the seeding [`ChainFetch`] and threaded into every [`PricingInputs`] so the
+    /// local IV inversion prices a coin-quoted (Deribit inverse) premium in the
+    /// strike currency (issue #83). Contract conventions are invariant per
+    /// `(provider, underlying, expiry)`, so a re-poll never changes it.
+    premium_numeraire: PremiumNumeraire,
 }
 
 impl ChainStore {
@@ -293,6 +300,8 @@ impl ChainStore {
             chain,
             expiry_source,
             aliases,
+            greeks_seed,
+            premium_numeraire,
         } = fetch;
         // On the (structurally impossible) overflow, fall back to the strike
         // count rather than `usize::MAX` — a checked op with a non-MAX fallback,
@@ -322,7 +331,13 @@ impl ChainStore {
             sidecar: GreeksSidecar::new(),
             input_generation: 1,
             analytics_as_of: now,
+            premium_numeraire,
         };
+        // Seed the style-keyed sidecar with the venue's per-style IV/gamma BEFORE the
+        // first analytics pass, so BOTH legs of a strike carry an honest per-style
+        // venue IV at seed — not just the call side (issue #83). `apply_venue_greeks`
+        // reads only key/iv/gamma/origin, so a seed row needs no stream clock.
+        store.apply_greeks_seed(&greeks_seed);
         // Fill the local analytics for the seeded chain so the first frame renders
         // Greeks/IV before any stream update arrives (the initial poll is data).
         store.recompute_sidecar();
@@ -340,6 +355,12 @@ impl ChainStore {
             chain,
             expiry_source,
             aliases,
+            greeks_seed,
+            // The premium numeraire is a per-chain contract invariant fixed at seed;
+            // a re-poll (or a reconnect backfill lowered from a `ChainSnapshot`, which
+            // carries no numeraire) never changes it, so it is deliberately ignored
+            // here rather than reset to the fetch default (issue #83).
+            premium_numeraire: _,
         } = fetch;
 
         let new_strikes: HashSet<Positive> = chain.options.iter().map(|o| o.strike_price).collect();
@@ -378,6 +399,11 @@ impl ChainStore {
         self.last_full_poll = Some(now);
 
         self.drain_pending(now);
+        // Re-seed the style-keyed sidecar with the fresh poll's per-style venue IV/gamma
+        // so both legs keep an honest venue IV after a re-poll (issue #83). A backfill
+        // lowered from a `ChainSnapshot` carries no seed rows (empty), and the prior
+        // sidecar venue IV persists — `apply_venue_greeks` overwrites only present fields.
+        self.apply_greeks_seed(&greeks_seed);
         // A fresh structure (and any drained venue Greeks) is a data change: refresh
         // the local analytics once, deterministically, from the poll instant.
         self.on_option_data_changed(now);
@@ -906,11 +932,7 @@ impl ChainStore {
     ///
     /// [`StaleQuote`]: super::greeks::LegStatus::StaleQuote
     fn recompute_leg(&mut self, key: &InstrumentKey) {
-        let ctx = PricingInputs::new(
-            self.chain.underlying_price,
-            self.analytics_as_of,
-            self.input_generation,
-        );
+        let ctx = self.pricing_inputs();
         // Only the dirty leg's own quote clock can gate its inversion, so snapshot
         // just that one clock (keyed exactly as the full pass keys it — by the
         // instrument's own key), never the whole `instruments` map.
@@ -946,6 +968,34 @@ impl ChainStore {
         self.analytics_as_of
     }
 
+    /// Fold each per-style venue-IV/gamma seed row into the style-keyed sidecar
+    /// (issue #83). `apply_venue_greeks` reads only key/iv/gamma/origin — never a
+    /// stream clock — so a POLL-seeded venue IV is recorded as `Provider` without
+    /// registering a stream-quote receipt (a poll-seeded leg stays ungated by the
+    /// freshness kernel, mirroring the #24 convention). An empty seed set (a
+    /// non-Deribit provider, or a reconnect backfill) is a no-op that leaves any
+    /// prior sidecar venue IV in place.
+    fn apply_greeks_seed(&mut self, greeks_seed: &[GreeksRow]) {
+        for row in greeks_seed {
+            self.sidecar.apply_venue_greeks(row);
+        }
+    }
+
+    /// The pricing inputs for an analytics pass at the current spot / reference
+    /// instant / generation, carrying the chain's [`PremiumNumeraire`] so the local
+    /// IV inversion prices an inverse (coin-quoted) premium in the strike currency
+    /// (issue #83). One constructor, shared by the full and dirty-leg passes, so
+    /// they price identically.
+    fn pricing_inputs(&self) -> PricingInputs {
+        let mut ctx = PricingInputs::new(
+            self.chain.underlying_price,
+            self.analytics_as_of,
+            self.input_generation,
+        );
+        ctx.premium_numeraire = self.premium_numeraire;
+        ctx
+    }
+
     /// Recompute the style-keyed local analytics for the whole chain via the #24
     /// engine, cached by the pricing `input_generation`. `compute_leg_greeks` records every
     /// per-leg outcome in the leg's status and returns `Ok(())` (a malformed,
@@ -953,11 +1003,7 @@ impl ChainStore {
     /// the fallible result is deliberately discarded — there is no error to surface
     /// and no credential/panic path here.
     fn recompute_sidecar(&mut self) {
-        let ctx = PricingInputs::new(
-            self.chain.underlying_price,
-            self.analytics_as_of,
-            self.input_generation,
-        );
+        let ctx = self.pricing_inputs();
         // Hand the engine a read-only snapshot of the per-instrument stream-quote
         // receipt clocks (#24): a leg whose quote went stale beyond the documented
         // threshold is NOT locally inverted (it becomes the honest `StaleQuote`

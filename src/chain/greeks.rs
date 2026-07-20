@@ -29,6 +29,18 @@
 //! [`Options::calculate_implied_volatility`]. ChainView never hand-rolls the
 //! options math (`CLAUDE.md` "Key Decisions").
 //!
+//! # Unit-aware IV inversion for inverse contracts (issue #83)
+//!
+//! A Deribit inverse ("reversed") option quotes its premium in the underlying
+//! COIN (`~0.05` BTC) while the strike/spot are in the quote currency (`60000` /
+//! `60500` USD). Pricing the coin premium AS a USD premium drove the IV inversion
+//! to a near-zero garbage value. The engine carries the contract's
+//! [`PremiumNumeraire`] on [`PricingInputs`] and converts a coin premium into the
+//! strike numeraire — `premium_quote = premium_coin * spot` — BEFORE the
+//! inversion, so the inverted IV matches the venue `mark_iv`. The conversion is
+//! deterministic (spot is a `PricingInputs` datum) and touches only the
+//! IV-inversion premium; a venue-supplied IV bypasses it entirely.
+//!
 //! # Verified `optionstratlib` 0.18.0 API (deviations from the §7 v0.17.2 sketch)
 //!
 //! - The Greeks free functions are `optionstratlib::greeks::{delta, gamma, theta,
@@ -98,9 +110,13 @@ const SECONDS_PER_DAY: i64 = 86_400;
 /// economically plausible enough to feed a display analytic.
 ///
 /// A live listed option quoting real premium with a sub-0.5% IV is almost always
-/// a mispriced/garbage **local** inversion — e.g. a Deribit inverse, BTC-settled
-/// contract whose premium is denominated in the wrong currency (issue #83) — not a
-/// real quote; the same reasoning as the exact-zero absent-IV sentinel. This is the
+/// a mispriced/garbage **local** inversion — not a real quote; the same reasoning
+/// as the exact-zero absent-IV sentinel. It is retained as belt-and-suspenders
+/// (issue #83 deliverable 4): the unit-aware inversion ([`PremiumNumeraire`]) now
+/// prices a Deribit inverse (coin-settled) premium in the strike currency, so the
+/// near-zero garbage that motivated the floor no longer arises from the currency
+/// confusion — but the floor still guards any OTHER degenerate local inversion.
+/// This is the
 /// **domain** home of that floor so both IV consumers share one definition: the
 /// chain matrix (`src/ui/chain.rs`, #25) clears a sub-floor `ComputedLocally` IV to
 /// `—`, and the payoff t+0 curve (`src/app/payoff_build.rs`, #27) treats a sub-floor
@@ -143,6 +159,37 @@ pub enum QuoteSelect {
     Last,
     /// The recomputed `(bid + ask) / 2` of the two-sided, uncrossed quote.
     BidAsk,
+}
+
+/// Which numeraire a contract's **premium** is quoted in, so the IV inversion
+/// prices the premium in the SAME currency as the strike/spot
+/// (`docs/01-domain-model.md` §7, `docs/03-data-providers.md` §3, issue #83).
+///
+/// A vanilla listed option quotes its premium in the strike's quote currency
+/// ([`QuoteCurrency`](PremiumNumeraire::QuoteCurrency) — the default): the premium
+/// and the strike are already the same numeraire, so no conversion happens.
+///
+/// A Deribit **inverse / "reversed"** contract quotes its premium in the
+/// underlying COIN (`~0.05` BTC) while the strike and spot are in the quote
+/// currency (`60000`, `60500` USD) — [`UnderlyingCoin`](PremiumNumeraire::UnderlyingCoin).
+/// Pricing the coin premium AS a USD premium against a USD strike drives the IV
+/// inversion to a near-zero garbage value (the #83 landmine: call `~0.003%`), so
+/// the engine first converts the coin premium into the strike numeraire by the
+/// standard Deribit inverse convention — `premium_quote = premium_coin * spot` —
+/// BEFORE the inversion. The conversion is deterministic (spot is a
+/// [`PricingInputs`] datum, never a wall-clock or venue read) and touches only the
+/// IV-inversion premium; the resulting Greeks are the ordinary Black-Scholes
+/// Greeks in the quote numeraire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum PremiumNumeraire {
+    /// The premium is quoted in the strike's quote currency (vanilla listed
+    /// options) — no conversion (the default).
+    #[default]
+    QuoteCurrency,
+    /// The premium is quoted in the underlying coin (Deribit inverse/reversed) —
+    /// multiply by spot to reach the strike's quote currency before inverting IV.
+    UnderlyingCoin,
 }
 
 /// The outcome recorded per leg after a local fill, surfaced later as the
@@ -196,6 +243,9 @@ pub enum LegStatus {
 ///   the inputs. It is also the **deterministic reference instant** the engine
 ///   measures time-to-expiry from, so the kernel never reads the wall clock.
 /// - `quote_for_iv` — the [`QuoteSelect`] policy for the IV-inversion premium.
+/// - `premium_numeraire` — the [`PremiumNumeraire`] the contract's premium is
+///   quoted in, so the IV inversion prices the premium in the strike's currency
+///   (Deribit inverse contracts convert `premium_coin * spot`, issue #83).
 /// - `input_generation` — the cache key; it bumps whenever any input above
 ///   changes, so an unchanged generation does no recompute work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -214,6 +264,10 @@ pub struct PricingInputs {
     pub as_of: DateTime<Utc>,
     /// Which premium the IV inversion prices against.
     pub quote_for_iv: QuoteSelect,
+    /// The numeraire the contract's premium is quoted in — an inverse (Deribit
+    /// coin-settled) premium is converted into the strike currency before the IV
+    /// inversion (issue #83). Defaults to [`PremiumNumeraire::QuoteCurrency`].
+    pub premium_numeraire: PremiumNumeraire,
     /// The cache key; bumps on any input change.
     pub input_generation: u64,
 }
@@ -224,8 +278,9 @@ impl PricingInputs {
     /// `European`, the rate/dividend to the documented [`DEFAULT_RISK_FREE_RATE`]
     /// / [`DEFAULT_DIVIDEND_YIELD`], and the IV-quote policy to [`QuoteSelect::Mid`].
     ///
-    /// The public fields let a caller override `rate`, `dividend`, `model`, or
-    /// `quote_for_iv` after construction.
+    /// The public fields let a caller override `rate`, `dividend`, `model`,
+    /// `quote_for_iv`, or `premium_numeraire` after construction (the chain store
+    /// sets `premium_numeraire` for an inverse-contract chain, issue #83).
     #[must_use]
     pub fn new(spot: Positive, as_of: DateTime<Utc>, input_generation: u64) -> Self {
         Self {
@@ -235,6 +290,7 @@ impl PricingInputs {
             dividend: DEFAULT_DIVIDEND_YIELD,
             as_of,
             quote_for_iv: QuoteSelect::Mid,
+            premium_numeraire: PremiumNumeraire::QuoteCurrency,
             input_generation,
         }
     }
@@ -642,14 +698,16 @@ fn compute_one_leg(
                 return;
             }
             QuotePick::Premium(premium) => {
-                match invert_iv(
-                    symbol.to_owned(),
-                    od.strike_price,
-                    days,
-                    style,
-                    premium,
-                    ctx,
-                ) {
+                // Convert an inverse (coin-quoted) premium into the strike numeraire
+                // BEFORE the inversion, so a Deribit BTC premium is not priced as USD
+                // (issue #83). A vanilla premium passes through unchanged.
+                let Some(priced) = premium_in_quote_currency(premium, ctx) else {
+                    let _ = sink
+                        .by_key
+                        .insert(key, cleared_entry(existing, LegStatus::SolverError));
+                    return;
+                };
+                match invert_iv(symbol.to_owned(), od.strike_price, days, style, priced, ctx) {
                     Some(iv) => (iv, GreeksOrigin::ComputedLocally),
                     None => {
                         let _ = sink
@@ -761,6 +819,30 @@ fn select_iv_premium(
         QuoteSelect::BidAsk => recomputed,
     };
     QuotePick::Premium(premium)
+}
+
+/// Convert an IV-inversion premium into the strike's quote numeraire per the
+/// contract's [`PremiumNumeraire`] (issue #83).
+///
+/// A [`QuoteCurrency`](PremiumNumeraire::QuoteCurrency) premium is already in the
+/// strike currency and passes through unchanged. An
+/// [`UnderlyingCoin`](PremiumNumeraire::UnderlyingCoin) premium (a Deribit inverse
+/// contract, quoted in the coin) is scaled by spot — `premium_quote =
+/// premium_coin * spot` — the standard Deribit inverse convention, so the coin
+/// premium is priced in the same currency as the strike/spot. The multiply is
+/// **checked** (`Decimal` `Mul` panics on overflow); a non-finite/overflowing
+/// product yields `None`, so the caller clears the leg rather than pricing a
+/// fabricated premium. Deterministic — `spot` is a [`PricingInputs`] datum, never
+/// a wall-clock or venue read.
+#[must_use]
+fn premium_in_quote_currency(premium: Positive, ctx: &PricingInputs) -> Option<Positive> {
+    match ctx.premium_numeraire {
+        PremiumNumeraire::QuoteCurrency => Some(premium),
+        PremiumNumeraire::UnderlyingCoin => {
+            let converted = premium.to_dec().checked_mul(ctx.spot.to_dec())?;
+            Positive::new_decimal(converted).ok()
+        }
+    }
 }
 
 /// Invert IV from a market premium via the deterministic
@@ -1572,6 +1654,129 @@ mod tests {
             leg(&a, 60_000.0, OptionStyle::Put),
             leg(&b, 60_000.0, OptionStyle::Put)
         );
+    }
+
+    // --- Unit-aware inversion for inverse (coin-quoted) contracts (issue #83) --
+
+    #[test]
+    fn test_pricing_inputs_default_numeraire_is_quote_currency() {
+        let ctx = inputs(AS_OF_BEFORE, 1);
+        assert_eq!(ctx.premium_numeraire, PremiumNumeraire::QuoteCurrency);
+    }
+
+    #[test]
+    fn test_premium_numeraire_default_is_quote_currency() {
+        assert_eq!(PremiumNumeraire::default(), PremiumNumeraire::QuoteCurrency);
+    }
+
+    #[test]
+    fn test_premium_in_quote_currency_passthrough_when_quote_currency() {
+        let ctx = inputs(AS_OF_BEFORE, 1); // spot 60000, QuoteCurrency
+        assert_eq!(
+            premium_in_quote_currency(pos(3_000.0), &ctx),
+            Some(pos(3_000.0)),
+            "a vanilla premium is priced as-is (no conversion)",
+        );
+    }
+
+    #[test]
+    fn test_premium_in_quote_currency_scales_coin_premium_by_spot() {
+        let mut ctx = inputs(AS_OF_BEFORE, 1); // spot 60000
+        ctx.premium_numeraire = PremiumNumeraire::UnderlyingCoin;
+        // A 0.05 BTC premium at a 60000 USD spot is 3000 USD in the strike currency.
+        assert_eq!(
+            premium_in_quote_currency(pos(0.05), &ctx),
+            Some(pos(3_000.0)),
+        );
+    }
+
+    #[test]
+    fn test_coin_numeraire_inverts_to_a_plausible_iv_not_near_zero() {
+        // The #83 landmine: a Deribit inverse call with a ~0.05 BTC premium against
+        // a 60000 USD strike. Priced as USD (QuoteCurrency) the local inversion is
+        // near-zero garbage; priced as coin (UnderlyingCoin) it recovers a plausible
+        // IV. A one-strike, deep-quote chain so the inversion converges.
+        let chain = chain_of(&[od(60_000.0, Some(0.05), Some(0.06), Some(0.04), Some(0.05))]);
+        // Spot 60000, ~25 days to the 2025-06-27 expiry.
+        let mut ctx = PricingInputs::new(pos(60_000.0), utc(1_748_889_000), 1);
+        ctx.premium_numeraire = PremiumNumeraire::UnderlyingCoin;
+
+        let mut sink = GreeksSidecar::new();
+        compute(&chain, &ctx, &mut sink);
+
+        let call = leg_at(
+            &sink,
+            60_000.0,
+            OptionStyle::Call,
+            utc(1_748_889_000),
+            &chain,
+        );
+        assert_eq!(call.status, LegStatus::Computed);
+        assert_eq!(call.iv_origin, GreeksOrigin::ComputedLocally);
+        let iv = match call.iv {
+            Some(iv) => iv.to_dec(),
+            None => panic!("expected a locally inverted IV for the inverse contract"),
+        };
+        // Far above the sub-plausibility floor (0.5%) and in a believable band for a
+        // BTC option, NOT the ~0.003% garbage the USD-priced inversion produced.
+        assert!(
+            iv >= Decimal::new(3, 1) && iv <= Decimal::new(8, 1),
+            "the coin-aware inversion recovers a plausible IV (~0.3..0.8), got {iv}",
+        );
+    }
+
+    #[test]
+    fn test_quote_currency_numeraire_reproduces_the_near_zero_garbage() {
+        // The counter-proof: the SAME coin-quoted premium priced as QuoteCurrency
+        // (the pre-#83 behaviour) inverts to a sub-floor near-zero value — the exact
+        // landmine the numeraire fix removes.
+        let chain = chain_of(&[od(60_000.0, Some(0.05), Some(0.06), Some(0.04), Some(0.05))]);
+        let ctx = PricingInputs::new(pos(60_000.0), utc(1_748_889_000), 1);
+        // Default numeraire is QuoteCurrency (no conversion).
+        let mut sink = GreeksSidecar::new();
+        compute(&chain, &ctx, &mut sink);
+
+        let call = leg_at(
+            &sink,
+            60_000.0,
+            OptionStyle::Call,
+            utc(1_748_889_000),
+            &chain,
+        );
+        if let Some(iv) = call.iv {
+            assert!(
+                iv.to_dec() < MIN_PLAUSIBLE_LOCAL_IV,
+                "priced as USD, the coin premium inverts to sub-floor garbage: {iv}",
+            );
+        }
+        // (A `SolverError`/absent IV is equally acceptable proof it did not recover a
+        // plausible value — the point is it is NEVER a trustworthy ~49%.)
+    }
+
+    /// A sidecar read for `(strike, style)` at an explicit expiry — the coin-numeraire
+    /// tests seed their own chain/as-of, so they re-derive the key against that chain.
+    #[track_caller]
+    fn leg_at(
+        sink: &GreeksSidecar,
+        strike: f64,
+        style: OptionStyle,
+        _as_of: DateTime<Utc>,
+        chain: &OptionChain,
+    ) -> LegGreeks {
+        let expiration_utc = match chain.get_expiration() {
+            Some(ExpirationDate::DateTime(dt)) => dt,
+            other => panic!("expected an absolute-UTC chain expiry, got {other:?}"),
+        };
+        let k = InstrumentKey {
+            underlying: chain.symbol.clone(),
+            expiration_utc,
+            strike: pos(strike),
+            style,
+        };
+        match sink.get(&k) {
+            Some(g) => *g,
+            None => panic!("expected a sidecar entry for strike {strike} {style:?}"),
+        }
     }
 
     mod prop {

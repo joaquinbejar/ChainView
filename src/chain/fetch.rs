@@ -24,6 +24,8 @@ use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 use optionstratlib::chains::chain::OptionChain;
 
+use super::events::GreeksRow;
+use super::greeks::PremiumNumeraire;
 use super::identity::{
     ContractSpecFingerprint, ExerciseStyle, Instrument, InstrumentKey, ProviderId, SettlementStyle,
 };
@@ -49,18 +51,60 @@ pub struct ChainFetch {
     /// The per-leg native+stream symbol index — for subscribe/resubscribe/join
     /// (`docs/03-data-providers.md` §4).
     pub aliases: AliasCatalog,
+    /// Per-style venue-IV/gamma seed rows the store folds into its style-keyed
+    /// analytics sidecar at seed, so BOTH legs of a strike carry an honest
+    /// per-style venue IV before any stream update arrives (issue #83). Empty for
+    /// a provider that supplies no venue Greeks (the sidecar then computes IV
+    /// locally). The `OptionChain`'s single shared `implied_volatility` field can
+    /// hold only ONE style's IV per strike, so the per-style values would collide
+    /// there — they ride here as [`GreeksRow`]s (origin [`Provider`], applied via
+    /// `GreeksSidecar::apply_venue_greeks`, which reads only key/iv/gamma/origin).
+    ///
+    /// [`Provider`]: super::events::GreeksOrigin::Provider
+    pub greeks_seed: Vec<GreeksRow>,
+    /// The numeraire the chain's contract premiums are quoted in, so the store's
+    /// local IV inversion prices a coin-quoted (Deribit inverse) premium in the
+    /// strike currency (issue #83). Defaults to
+    /// [`PremiumNumeraire::QuoteCurrency`] for vanilla contracts.
+    pub premium_numeraire: PremiumNumeraire,
 }
 
 impl ChainFetch {
     /// Construct a fetch artifact from a normalized chain, its expiry/source
     /// identity, and its per-leg alias catalog.
+    ///
+    /// The venue-IV seed rows default to empty and the premium numeraire to
+    /// [`PremiumNumeraire::QuoteCurrency`]; an adapter that assembles inverse
+    /// contracts or carries per-style venue IV opts in via
+    /// [`with_greeks_seed`](Self::with_greeks_seed) /
+    /// [`with_premium_numeraire`](Self::with_premium_numeraire) (issue #83).
     #[must_use]
     pub fn new(chain: OptionChain, expiry_source: ExpirySource, aliases: AliasCatalog) -> Self {
         Self {
             chain,
             expiry_source,
             aliases,
+            greeks_seed: Vec::new(),
+            premium_numeraire: PremiumNumeraire::QuoteCurrency,
         }
+    }
+
+    /// Attach the per-style venue-IV/gamma [`greeks_seed`](Self::greeks_seed) rows
+    /// the store folds into its sidecar at seed (issue #83, builder-style so the
+    /// existing 3-arg [`new`](Self::new) callers are unaffected).
+    #[must_use]
+    pub fn with_greeks_seed(mut self, greeks_seed: Vec<GreeksRow>) -> Self {
+        self.greeks_seed = greeks_seed;
+        self
+    }
+
+    /// Set the chain's [`premium_numeraire`](Self::premium_numeraire) — an adapter
+    /// assembling inverse (coin-settled) contracts declares
+    /// [`PremiumNumeraire::UnderlyingCoin`] here (issue #83).
+    #[must_use]
+    pub fn with_premium_numeraire(mut self, premium_numeraire: PremiumNumeraire) -> Self {
+        self.premium_numeraire = premium_numeraire;
+        self
     }
 }
 
