@@ -18,9 +18,12 @@
 //!
 //! Authentication happens INSIDE the operator's own TWS/IB Gateway; ChainView
 //! only opens a local socket to it. [`from_env`](IbkrAdapter::from_env) reads the
-//! ChainView-namespaced `CHAINVIEW_IBKR_ENDPOINT` (host:port, e.g.
-//! `127.0.0.1:7497`) and the optional `CHAINVIEW_IBKR_CLIENT_ID` (an `i32`, default
-//! [`DEFAULT_CLIENT_ID`]) and connects via
+//! ChainView-namespaced `CHAINVIEW_IBKR_ENDPOINT` — either `host:port` or the
+//! absolute-URL form `scheme://host:port` the shared provider-settings layer
+//! requires of a SELECTED provider's endpoint, so `tcp://127.0.0.1:7497` is the form
+//! that works under `--provider ibkr` ([`normalize_endpoint`] strips the scheme back
+//! to the socket address) — and the optional `CHAINVIEW_IBKR_CLIENT_ID` (an `i32`,
+//! default [`DEFAULT_CLIENT_ID`]) and connects via
 //! [`Client::connect`](ibapi::Client::connect). There is **no** secret at the seam
 //! ([`AuthKind::None`]): the endpoint/client-id are non-secret config, read
 //! env-only, never logged, and never echoed in a [`ProviderError`] (the error
@@ -110,8 +113,8 @@ use crate::error::{ConfigError, NormalizeKind, ProviderError, TransportDetail, T
 /// ([`RESERVED_PROVIDER_IDS`](crate::chain::RESERVED_PROVIDER_IDS)).
 const IBKR_ID: &str = "ibkr";
 
-/// The required non-secret endpoint (host:port) key; its absence omits the
-/// built-in (the alpaca/ig omit-on-missing pattern).
+/// The required non-secret endpoint (`host:port` or `scheme://host:port`) key; its
+/// absence omits the built-in (the alpaca/ig omit-on-missing pattern).
 const ENDPOINT_KEY: &str = "ENDPOINT";
 
 /// The optional non-secret client-id key (an `i32`); absent -> [`DEFAULT_CLIENT_ID`].
@@ -220,6 +223,10 @@ impl IbkrAdapter {
     /// absence disables IBKR, even though IBKR carries no secret.
     /// [`ConfigError::InvalidValue`] for a malformed endpoint or client-id (a
     /// present-but-bad value fails startup loudly, never silently omits).
+    ///
+    /// The endpoint is accepted in either the bare socket form (`127.0.0.1:7497`)
+    /// or the absolute-URL form (`tcp://127.0.0.1:7497`) and is stored normalized to
+    /// `host:port` — see [`normalize_endpoint`] for why both are read.
     pub(crate) fn from_env(env: &dyn EnvSource) -> Result<Self, ConfigError> {
         let id = ibkr_provider_id();
         let endpoint = env
@@ -229,13 +236,14 @@ impl IbkrAdapter {
         let Some(endpoint) = endpoint else {
             return Err(ConfigError::MissingCredential(id));
         };
-        if !is_valid_endpoint(&endpoint) {
+        let Some(endpoint) = normalize_endpoint(&endpoint) else {
             return Err(ConfigError::InvalidValue {
                 field: "ibkr endpoint".to_owned(),
-                reason: "CHAINVIEW_IBKR_ENDPOINT must be host:port (e.g. 127.0.0.1:7497)"
+                reason: "CHAINVIEW_IBKR_ENDPOINT must be host:port or scheme://host:port \
+                     (e.g. tcp://127.0.0.1:7497)"
                     .to_owned(),
             });
-        }
+        };
         let client_id = match env
             .get(&provider_env_var(id.as_str(), CLIENT_ID_KEY))
             .map(|value| value.trim().to_owned())
@@ -366,12 +374,41 @@ pub(crate) fn ibkr_capabilities() -> ProviderCapabilities {
 
 /// Validate a `host:port` endpoint shape (bounded): a non-empty host, a `:`, and a
 /// `u16` port. Rejects anything else so a malformed endpoint fails startup rather
-/// than reaching [`Client::connect`](ibapi::Client::connect).
+/// than reaching [`Client::connect`](ibapi::Client::connect). A trailing path or a
+/// non-numeric port lands in the port half and is rejected there.
 fn is_valid_endpoint(endpoint: &str) -> bool {
     let Some((host, port)) = endpoint.rsplit_once(':') else {
         return false;
     };
     !host.is_empty() && !port.is_empty() && port.parse::<u16>().is_ok()
+}
+
+/// Normalize a configured endpoint to the bare `host:port` [`Client::connect`](ibapi::Client::connect)
+/// wants, accepting the absolute-URL form (`tcp://127.0.0.1:7497`) the shared
+/// config layer requires of *any* selected provider's endpoint
+/// ([`validate_endpoint`](crate::config)) as well as the bare socket form.
+///
+/// Both grammars are read here because a single env var — `CHAINVIEW_IBKR_ENDPOINT`
+/// — feeds two consumers: the provider-settings layer, which validates the SELECTED
+/// provider's endpoint as `scheme://host`, and this adapter, which needs a socket
+/// address. Stripping the scheme here lets one value satisfy both, so
+/// `--provider ibkr` starts (issue #120 follow-up). Returns `None` for a malformed
+/// value (bad scheme, empty authority, non-`u16` port, trailing path).
+fn normalize_endpoint(raw: &str) -> Option<String> {
+    let socket = match raw.split_once("://") {
+        Some((scheme, authority)) => {
+            let scheme_ok = matches!(scheme.chars().next(), Some(c) if c.is_ascii_alphabetic())
+                && scheme
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+            if !scheme_ok {
+                return None;
+            }
+            authority
+        }
+        None => raw,
+    };
+    is_valid_endpoint(socket).then(|| socket.to_owned())
 }
 
 /// Whether an underlying is treated as a cash-settled index option.
@@ -2027,6 +2064,59 @@ mod tests {
         assert!(!is_valid_endpoint("host:"));
         assert!(!is_valid_endpoint("host:notaport"));
         assert!(!is_valid_endpoint("host:99999999"));
+    }
+
+    #[test]
+    fn test_normalize_endpoint_accepts_both_grammars() {
+        // The absolute-URL form is what the shared config layer demands of the
+        // SELECTED provider's endpoint; the scheme is stripped back to the socket
+        // address ibapi::Client::connect takes, so one value satisfies both.
+        assert_eq!(
+            normalize_endpoint("tcp://127.0.0.1:7497").as_deref(),
+            Some("127.0.0.1:7497")
+        );
+        assert_eq!(
+            normalize_endpoint("ibkr+tws://gateway.local:4002").as_deref(),
+            Some("gateway.local:4002")
+        );
+        // The bare socket form still works (an unselected but configured IBKR
+        // never reaches the config layer's URL validator).
+        assert_eq!(
+            normalize_endpoint("127.0.0.1:7497").as_deref(),
+            Some("127.0.0.1:7497")
+        );
+        // An IPv6 authority survives both paths (rsplit_once takes the port).
+        assert_eq!(
+            normalize_endpoint("tcp://[::1]:7497").as_deref(),
+            Some("[::1]:7497")
+        );
+    }
+
+    #[test]
+    fn test_normalize_endpoint_rejects_malformed() {
+        assert_eq!(normalize_endpoint("tcp://"), None);
+        assert_eq!(normalize_endpoint("://127.0.0.1:7497"), None);
+        assert_eq!(normalize_endpoint("1tcp://127.0.0.1:7497"), None);
+        assert_eq!(normalize_endpoint("tcp://127.0.0.1"), None);
+        assert_eq!(normalize_endpoint("tcp://127.0.0.1:7497/path"), None);
+        assert_eq!(normalize_endpoint("tcp://host:notaport"), None);
+        assert_eq!(normalize_endpoint("no-port"), None);
+    }
+
+    #[test]
+    fn test_from_env_accepts_absolute_url_endpoint() {
+        // Issue #120 follow-up: `--provider ibkr` routes CHAINVIEW_IBKR_ENDPOINT
+        // through the config layer's `scheme://host` validator first, so the
+        // adapter must read that form and hand ibapi the bare socket address.
+        let mut env = StdHashMap::new();
+        let _ = env.insert(
+            "CHAINVIEW_IBKR_ENDPOINT".to_owned(),
+            "tcp://127.0.0.1:7497".to_owned(),
+        );
+        match IbkrAdapter::from_env(&MapEnv(env)) {
+            Ok(adapter) => assert_eq!(adapter.endpoint, "127.0.0.1:7497"),
+            Err(e) => panic!("from_env should accept the absolute-URL form: {e}"),
+        }
     }
 
     // === Captured-log proof: no secret-shaped material is logged ==============

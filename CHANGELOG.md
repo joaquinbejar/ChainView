@@ -87,6 +87,20 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- **`--provider ibkr` could never start** (issue #120 follow-up). A single env var,
+  `CHAINVIEW_IBKR_ENDPOINT`, feeds two consumers with contradictory grammars: the
+  shared provider-settings layer validates the **selected** provider's endpoint as
+  an absolute URL (`scheme://host`), while `IbkrAdapter::from_env` required a bare
+  `host:port` socket address for `ibapi::Client::connect`. No value satisfied both,
+  so selecting IBKR failed at startup with
+  `InvalidValue { field: "endpoint", reason: "must be an absolute URL (scheme://host)" }`.
+  The adapter now accepts **either** grammar and normalizes to the socket address,
+  so `CHAINVIEW_IBKR_ENDPOINT=tcp://127.0.0.1:7497` passes the config layer and
+  still reaches the gateway. A malformed scheme, empty authority, non-`u16` port, or
+  trailing path is still a loud `InvalidValue`. The gap escaped review because the
+  registry tests inject a pre-built `Config`, bypassing the settings layer; a
+  config-layer regression test now covers the selected-provider path.
+
 - **Unit-aware inverse-contract IV inversion + per-style venue-IV seeding**
   (issue #83). On the zero-config Deribit path the local Greeks/IV engine priced
   coin-settled BTC premiums as USD, so the inverse-contract IV inversion returned

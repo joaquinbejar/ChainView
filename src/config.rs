@@ -1265,6 +1265,34 @@ mod tests {
     }
 
     #[test]
+    fn test_config_accepts_socket_endpoint_in_absolute_url_form() {
+        // Issue #120 follow-up: IBKR's endpoint is a TWS/Gateway SOCKET, but this
+        // layer validates the SELECTED provider's endpoint as `scheme://host` for
+        // every provider alike. The socket-in-URL form is what reconciles the two —
+        // `IbkrAdapter::from_env` strips the scheme back to `host:port` — so
+        // `--provider ibkr` starts. A bare `host:port` is still rejected here (it
+        // is scheme-less), which is exactly what broke `--provider ibkr` before.
+        let url_env = env(&[("CHAINVIEW_IBKR_ENDPOINT", "tcp://127.0.0.1:7497")]);
+        let cli = CliOverrides {
+            provider: Some("ibkr".to_owned()),
+            ..Default::default()
+        };
+        let config = assembled(cli, &url_env, None);
+        let settings = match config.providers.get(&pid("ibkr")) {
+            Some(s) => s,
+            None => panic!("expected ibkr provider settings"),
+        };
+        assert_eq!(settings.endpoint.as_deref(), Some("tcp://127.0.0.1:7497"));
+
+        let bare = env(&[("CHAINVIEW_IBKR_ENDPOINT", "127.0.0.1:7497")]);
+        let cli = CliOverrides {
+            provider: Some("ibkr".to_owned()),
+            ..Default::default()
+        };
+        assert!(is_invalid_value(&Config::assemble(cli, &bare, None)));
+    }
+
+    #[test]
     fn test_config_per_provider_env_refresh_override() {
         let env = env(&[("CHAINVIEW_DERIBIT_REFRESH", "45s")]);
         let config = assembled(CliOverrides::default(), &env, None);
