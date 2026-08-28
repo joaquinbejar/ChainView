@@ -12,6 +12,44 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+### Changed
+
+- **Terminal stack upgraded to `ratatui` 0.30 + `crossterm` 0.29** (issue #130).
+  ratatui 0.30 splits into `ratatui-core` / `ratatui-widgets` /
+  `ratatui-crossterm` behind the same `ratatui` facade, so no ChainView source
+  change was needed; `ratatui-crossterm` defaults to the `crossterm_0_29`
+  backend, and the direct `crossterm` pin moves with it so cargo still unifies to
+  a SINGLE crossterm instance (the one ChainView calls is the one ratatui
+  drives). Nine chart-bearing render goldens were regenerated: 0.30 maps a
+  dataset point to a slightly different braille sub-cell, which also puts the
+  payoff break-even and spot markers exactly ON the zero-P&L line instead of one
+  row above it. Every golden keeps identical text, labels and line count — only
+  plot glyphs moved. The MSRV is unchanged (ratatui 0.30 needs 1.88; ours is
+  1.94).
+
+- **`tests/common/sha256.rs` uses `as_chunks::<64>()`** (issue #130). clippy 1.98
+  added `clippy::chunks_exact_to_as_chunks`, which fires on the `chunks_exact(64)`
+  loop in the bundle-fixture hash helper and failed the `check` job on every PR,
+  on a file untouched since #56.
+
+### Security
+
+- **Four supply-chain advisories cleared, the ignore set shrunk by one**
+  (issue #130). CI had been red on `main` since 2026-08-03 because the advisory
+  database moved: `h2 0.4.15` (RUSTSEC-2026-0258), `event-listener 5.4.1`
+  (RUSTSEC-2026-0221), `lru 0.12.5` (RUSTSEC-2026-0253) and a yanked
+  `chacha20 0.10.1`. Three were PATCHED by a lockfile update (h2 -> 0.4.19,
+  event-listener -> 5.4.2, chacha20 -> 0.10.2) with no manifest or MSRV change;
+  the fourth was patched by the ratatui 0.30 bump above, which moves `lru` from
+  the `^0.12` line ratatui 0.29 pinned to `^0.18` (0.18.3) — past the patched
+  floor of RUSTSEC-2026-0253 **and** of RUSTSEC-2026-0002, so that lru ignore is
+  DELETED from `deny.toml` and the CI audit flags rather than joined by a second
+  one. One entry is added: `rkyv 0.7.46` (RUSTSEC-2026-0235), which lives in
+  `Cargo.lock` only — an optional `rust_decimal` dependency no ChainView feature
+  enables, invisible to `cargo deny` (which resolves features) and never
+  compiled, linked or reached. `cargo audit` and `cargo deny check` are both
+  clean again.
+
 ### Added
 
 - **Interactive Brokers provider** (`src/providers/ibkr.rs`, issue #120), behind a
