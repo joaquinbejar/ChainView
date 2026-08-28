@@ -312,6 +312,42 @@ fn contained_panic_active() -> bool {
     CONTAINED_PANIC_DEPTH.with(|d| d.get() > 0)
 }
 
+/// Run `op` inside a contained-panic boundary: `Some(value)` when it returns
+/// normally, `None` when it **panics**.
+///
+/// This is the single implementation of the containment policy every caller
+/// shares. Two seams need it, both for the same reason — an upstream crate
+/// `panic!`s on an input a `Result` cannot express, and a panic escaping into the
+/// render loop would take the whole terminal down:
+///
+/// * the Parquet/Arrow decode of a malformed replay bundle
+///   ([`catch_decode_panic`](crate::replay), issue #53), and
+/// * the `optionstratlib` pricing math behind a payoff curve
+///   (`src/app/payoff_build.rs`, `src/app/replay_payoff_build.rs`, issue #131),
+///   where the caller renders an explicit "curve unavailable" state instead.
+///
+/// Three properties the callers depend on, all of them the reason this lives in
+/// one place rather than being written twice:
+///
+/// * [`std::panic::catch_unwind`] needs **no** `unsafe`, so
+///   `#![forbid(unsafe_code)]` holds.
+/// * The thread-local [`ContainedPanicGuard`] is held **across** the call, so the
+///   process panic hook stays silent on this thread: it neither restores the
+///   terminal under a live TUI nor prints into the alternate screen. An
+///   uncontained panic on any other thread still runs the full hook.
+/// * The panic payload is **dropped**, never returned or interpolated into a
+///   message, so a hostile bundle or a pathological quote cannot steer any
+///   user-visible string. The caller names the operation itself.
+///
+/// [`std::panic::AssertUnwindSafe`] is the caller's contract: the value `op`
+/// borrows must be abandoned on the panic path, never observed again in its
+/// partially-updated state. Both seams satisfy it by returning an error or an
+/// empty state and dropping the work in progress.
+pub(crate) fn contained<T>(op: impl FnOnce() -> T) -> Option<T> {
+    let _contained = ContainedPanicGuard::new();
+    panic::catch_unwind(panic::AssertUnwindSafe(op)).ok()
+}
+
 /// Install a panic hook that restores the terminal **before** chaining to the
 /// previously installed hook.
 ///
@@ -606,6 +642,54 @@ mod tests {
         assert!(
             !should_hook_restore(true),
             "a supervisor owns the ordered restore: the hook defers"
+        );
+    }
+
+    // --- The contained-panic boundary (#53 decode, #131 payoff curves) -------
+    //
+    // These three drive REAL panics through `contained`. The process panic hook is
+    // not installed in a unit test, so the libtest default hook prints the caught
+    // panic to the captured stderr — expected noise, never a failure.
+
+    #[test]
+    fn test_contained_returns_some_when_the_operation_returns() {
+        // The happy path is transparent: the value passes straight through.
+        assert_eq!(contained(|| 7_u8), Some(7));
+        assert_eq!(contained(|| "curve".to_owned()), Some("curve".to_owned()));
+    }
+
+    #[test]
+    fn test_contained_returns_none_when_the_operation_panics() {
+        // A panic is CONTAINED and reported as `None` — the caller maps it to its own
+        // typed error / honest empty state, and the payload is dropped (never returned,
+        // so no hostile input can steer a user-visible string).
+        let caught: Option<u8> = contained(|| panic!("upstream blew up"));
+        assert_eq!(caught, None, "a panicking op yields None, not an unwind");
+    }
+
+    #[test]
+    fn test_contained_nests_and_restores_the_guard_depth() {
+        // Nesting is counted, an inner panic does not disarm the outer boundary, and
+        // the depth is back to zero afterwards — so a later, UNCONTAINED panic on this
+        // thread still runs the full hook (terminal restore + chained print).
+        assert!(
+            !contained_panic_active(),
+            "no boundary is active before the test"
+        );
+        let outer = contained(|| {
+            assert!(contained_panic_active(), "the outer boundary is active");
+            let inner: Option<()> = contained(|| panic!("inner"));
+            assert_eq!(inner, None, "the inner panic is contained");
+            assert!(
+                contained_panic_active(),
+                "the outer boundary survives the inner panic"
+            );
+            "done"
+        });
+        assert_eq!(outer, Some("done"));
+        assert!(
+            !contained_panic_active(),
+            "the guard depth is restored, so an uncontained panic still runs the hook"
         );
     }
 

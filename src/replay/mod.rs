@@ -693,13 +693,14 @@ fn catch_decode_panic<T>(
     file: &str,
     op: impl FnOnce() -> Result<T, BundleError>,
 ) -> Result<T, BundleError> {
-    let _contained = crate::terminal::ContainedPanicGuard::new();
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(op)) {
-        Ok(inner) => inner,
-        Err(_) => Err(parquet_err(format!(
+    // The guard + `catch_unwind` pair lives in ONE place
+    // ([`crate::terminal::contained`]), shared with the payoff-build seam (#131),
+    // so the hook-silencing and the payload-dropping are not written twice.
+    crate::terminal::contained(op).unwrap_or_else(|| {
+        Err(parquet_err(format!(
             "{file}: upstream Parquet/Arrow decoder panicked on malformed input"
-        ))),
-    }
+        )))
+    })
 }
 
 /// Build a [`BundleError::MissingTable`] on the cold absent-file path.
