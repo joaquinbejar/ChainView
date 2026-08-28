@@ -96,6 +96,7 @@ const ENTRY_IV_PLACEHOLDER: Positive = Positive::ONE;
 /// The projected geometry for a committed strategy: the shared price grid, the
 /// **frozen** commit-time entry positions, the two curve series (expiration + t+0),
 /// and the break-even points — all built off the draw path.
+#[derive(Debug)]
 pub(crate) struct PayoffGeometry {
     /// The shared underlying-price x-grid both series and the tick refresh reuse.
     pub(crate) grid: Vec<Positive>,
@@ -119,13 +120,104 @@ pub(crate) fn empty_series() -> GraphData {
     GraphData::Series(Series2D::default())
 }
 
-/// Build the full payoff geometry for `legs` against the `store` snapshot, or
-/// `None` when the legs cannot be priced for **expiration** (a missing mark or a
-/// non-future expiry). The t+0 curve requires a plausible IV per leg on top of that
-/// and degrades to an empty series when one is missing — the expiration curve still
+/// The outcome of the off-draw payoff-geometry build ([`build_geometry`], #131).
+///
+/// Three states the screen keeps **distinguishable**, because each one means a
+/// different thing to a trader:
+///
+/// * [`Priced`](Self::Priced) — the geometry sampled; the curves render.
+/// * [`NotPriceable`](Self::NotPriceable) — the legs cannot be priced at all (a
+///   missing mark, a non-absolute or past expiry, a degenerate grid). This is the
+///   pre-existing, already-honest "needs marks and a future expiry" state.
+/// * [`ComputeFailed`](Self::ComputeFailed) — the upstream `optionstratlib` pricing
+///   math **panicked** mid-build and the panic was contained
+///   ([`crate::terminal::contained`], #131). A different fact with its own message:
+///   the inputs were fine, the model blew up.
+///
+/// Collapsing the last two would tell a trader to go fix marks that are already
+/// there, so they never share a variant.
+#[derive(Debug)]
+pub(crate) enum GeometryBuild {
+    /// The sampled geometry — boxed so the "no curve" variants stay cheap
+    /// (`clippy::large_enum_variant`).
+    Priced(Box<PayoffGeometry>),
+    /// The legs could not be priced (the honest "needs marks and a future expiry").
+    NotPriceable,
+    /// The upstream pricing math panicked; the panic was contained (#131).
+    ComputeFailed,
+}
+
+/// The outcome of the off-draw t+0 reprice ([`rebuild_tplus0`], #131).
+///
+/// The t+0 curve has a legitimate **empty** series — the "t+0 unavailable — no
+/// reliable IV" state (#27 SF-2) — so a contained panic cannot be reported as
+/// "another empty series"; it is its own variant with its own message.
+#[derive(Debug)]
+pub(crate) enum TPlus0Build {
+    /// The repriced t+0 series, possibly the deliberate empty "no reliable IV" one.
+    Series(GraphData),
+    /// The upstream pricing math panicked; the panic was contained (#131).
+    ComputeFailed,
+}
+
+/// The curve name the contained-panic `WARN` carries for the full geometry build.
+const GEOMETRY_CURVE: &str = "live payoff geometry";
+
+/// The curve name the contained-panic `WARN` carries for the t+0 reprice.
+const TPLUS0_CURVE: &str = "live payoff t+0";
+
+/// Emit the single `WARN` for a contained curve-build panic, naming `curve` (#131).
+///
+/// The panic payload is deliberately **unavailable** here — [`crate::terminal::contained`]
+/// drops it — so no venue- or bundle-controlled string can steer this line
+/// (`docs/SECURITY.md`, terminal-escape hygiene at the log edge); the curve name is a
+/// crate constant. `tracing` only, to the file sink: the TUI owns stdout. Cold, and
+/// emitted once per failed **build**, never per grid sample.
+#[cold]
+#[inline(never)]
+pub(crate) fn warn_curve_compute_failed(curve: &'static str) {
+    tracing::warn!(
+        curve,
+        "upstream pricing math panicked; the payoff curve is unavailable"
+    );
+}
+
+/// Build the full payoff geometry for `legs` against the `store` snapshot: the
+/// geometry, the honest [`NotPriceable`](GeometryBuild::NotPriceable) state when the
+/// legs cannot be priced for **expiration** (a missing mark or a non-future expiry),
+/// or [`ComputeFailed`](GeometryBuild::ComputeFailed) when the upstream pricing math
+/// panicked. The t+0 curve requires a plausible IV per leg on top of that and
+/// degrades to an empty series when one is missing — the expiration curve still
 /// renders. Off the draw path — invoked only from `commit`.
+///
+/// # Contained panics (#131)
+///
+/// `optionstratlib`'s pricing math can `panic!` on a pathological input that no
+/// `Result` expresses (a cost basis that overflows the `Positive`/`Decimal` range),
+/// and a trader's terminal must degrade to an honest "curve unavailable" state rather
+/// than die because one curve could not be computed. The **whole** build runs inside
+/// [`crate::terminal::contained`], not each grid sample: a panic part-way through
+/// invalidates that curve anyway, and a per-sample `catch_unwind` would sit in the hot
+/// sampling loop. This runs **off** the draw path, so the boundary is never inside
+/// `terminal.draw`, and the containment leaves the terminal-restore ownership
+/// untouched (the hook stays silent only for this contained call, on this thread).
 #[must_use]
-pub(crate) fn build_geometry(legs: &[BuilderLeg], store: &ChainStore) -> Option<PayoffGeometry> {
+pub(crate) fn build_geometry(legs: &[BuilderLeg], store: &ChainStore) -> GeometryBuild {
+    match crate::terminal::contained(|| build_geometry_inner(legs, store)) {
+        Some(Some(geometry)) => GeometryBuild::Priced(Box::new(geometry)),
+        Some(None) => GeometryBuild::NotPriceable,
+        None => {
+            warn_curve_compute_failed(GEOMETRY_CURVE);
+            GeometryBuild::ComputeFailed
+        }
+    }
+}
+
+/// The geometry build itself — the body [`build_geometry`] runs inside the
+/// contained-panic boundary. `None` is the honest "these legs cannot be priced"
+/// state; a panic is the caller's concern, never expressed here.
+#[must_use]
+fn build_geometry_inner(legs: &[BuilderLeg], store: &ChainStore) -> Option<PayoffGeometry> {
     let chain = store.chain();
     // Freeze the entry premiums (P0) at commit; both curves share this cost basis.
     let entry_positions = build_entry_positions(legs, store)?;
@@ -152,14 +244,27 @@ pub(crate) fn build_geometry(legs: &[BuilderLeg], store: &ChainStore) -> Option<
 /// state). Constructs **no** `CustomStrategy` and touches neither the expiration
 /// series nor the break-evens — the tick-path refresh that never runs the break-even
 /// scan (#27 SF-1).
+///
+/// # Contained panics (#131)
+///
+/// Like [`build_geometry`], the **whole** reprice runs inside
+/// [`crate::terminal::contained`], off the draw path, and a contained panic returns
+/// [`TPlus0Build::ComputeFailed`] — deliberately NOT another empty series, which
+/// already means "t+0 unavailable — no reliable IV".
 #[must_use]
 pub(crate) fn rebuild_tplus0(
     legs: &[BuilderLeg],
     store: &ChainStore,
     grid: &[Positive],
     entry_positions: &[Position],
-) -> GraphData {
-    tplus0_curve(entry_positions, legs, store, grid)
+) -> TPlus0Build {
+    match crate::terminal::contained(|| tplus0_curve(entry_positions, legs, store, grid)) {
+        Some(series) => TPlus0Build::Series(series),
+        None => {
+            warn_curve_compute_failed(TPLUS0_CURVE);
+            TPlus0Build::ComputeFailed
+        }
+    }
 }
 
 /// Build the **frozen** commit-time `optionstratlib` positions for `legs` from the
@@ -563,8 +668,9 @@ mod tests {
     use optionstratlib::{ExpirationDate, OptionStyle, OptionType, Options, Side as OptionSide};
 
     use super::{
-        BuilderLeg, GreeksOrigin, MIN_PLAUSIBLE_LOCAL_IV, Side, break_even_points, build_geometry,
-        expiration_series, plausible_leg_iv, rebuild_tplus0, tplus0_series,
+        BuilderLeg, GeometryBuild, GreeksOrigin, MIN_PLAUSIBLE_LOCAL_IV, PayoffGeometry, Side,
+        TPlus0Build, break_even_points, build_geometry, expiration_series, plausible_leg_iv,
+        rebuild_tplus0, tplus0_series,
     };
     use crate::chain::{
         AliasCatalog, ChainFetch, ChainSource, ChainStore, ContractSpecFingerprint, ExerciseStyle,
@@ -578,6 +684,32 @@ mod tests {
         match Positive::new(value) {
             Ok(p) => p,
             Err(e) => panic!("invalid test positive `{value}`: {e}"),
+        }
+    }
+
+    /// The priced geometry of a [`build_geometry`] outcome — every fixture below is
+    /// priceable, so the other two outcomes are test failures with distinct messages
+    /// (a contained pricing panic is NOT "unpriceable legs", #131).
+    #[track_caller]
+    fn priced(build: GeometryBuild) -> PayoffGeometry {
+        match build {
+            GeometryBuild::Priced(geometry) => *geometry,
+            GeometryBuild::NotPriceable => panic!("expected a priceable geometry"),
+            GeometryBuild::ComputeFailed => {
+                panic!("expected a priceable geometry, the pricing math panicked")
+            }
+        }
+    }
+
+    /// The repriced t+0 series of a [`rebuild_tplus0`] outcome — a contained pricing
+    /// panic is a test failure here, never silently read as an empty series (#131).
+    #[track_caller]
+    fn repriced(build: TPlus0Build) -> GraphData {
+        match build {
+            TPlus0Build::Series(series) => series,
+            TPlus0Build::ComputeFailed => {
+                panic!("expected a t+0 series, the pricing math panicked")
+            }
         }
     }
 
@@ -930,20 +1062,17 @@ mod tests {
         let early_store = store_at(spot, AS_OF_EARLY);
         let late_store = store_at(spot, AS_OF_LATE);
 
-        let geometry = match build_geometry(&legs, &early_store) {
-            Some(g) => g,
-            None => panic!("the ATM call geometry prices at the early instant"),
-        };
+        let geometry = priced(build_geometry(&legs, &early_store));
         // The early t+0 curve (larger DTE) is the one `build_geometry` cached.
         let (early,) = xy(&geometry.tplus0);
         let (exp,) = xy(&geometry.expiration);
         // Reprice the SAME frozen positions at the later instant (smaller DTE).
-        let late = rebuild_tplus0(
+        let late = repriced(rebuild_tplus0(
             &legs,
             &late_store,
             &geometry.grid,
             &geometry.entry_positions,
-        );
+        ));
         let (late,) = xy(&late);
 
         assert_eq!(
@@ -996,10 +1125,7 @@ mod tests {
         let early_store = store_at(spot, AS_OF_EARLY);
         let late_store = store_at(spot, AS_OF_LATE);
 
-        let geometry = match build_geometry(&legs, &early_store) {
-            Some(g) => g,
-            None => panic!("the ATM call geometry prices at the early instant"),
-        };
+        let geometry = priced(build_geometry(&legs, &early_store));
         let commit_mark = legs
             .first()
             .and_then(|leg| leg.mark_in(early_store.chain()));
@@ -1012,12 +1138,12 @@ mod tests {
 
         // Rebuild at the later instant (fresh DTE) — the frozen basis is borrowed
         // read-only, so a reprice can never re-base it.
-        let _ = rebuild_tplus0(
+        let _ = repriced(rebuild_tplus0(
             &legs,
             &late_store,
             &geometry.grid,
             &geometry.entry_positions,
-        );
+        ));
         let p_after: Vec<Positive> = geometry.entry_positions.iter().map(|p| p.premium).collect();
         assert_eq!(
             p0, p_after,
@@ -1033,25 +1159,178 @@ mod tests {
         let spot = 100.0;
         let legs = atm_call_leg(spot);
         let late_store = store_at(spot, AS_OF_LATE);
-        let geometry = match build_geometry(&legs, &store_at(spot, AS_OF_EARLY)) {
-            Some(g) => g,
-            None => panic!("the ATM call geometry prices at the early instant"),
-        };
-        let first = rebuild_tplus0(
+        let geometry = priced(build_geometry(&legs, &store_at(spot, AS_OF_EARLY)));
+        let first = repriced(rebuild_tplus0(
             &legs,
             &late_store,
             &geometry.grid,
             &geometry.entry_positions,
-        );
-        let second = rebuild_tplus0(
+        ));
+        let second = repriced(rebuild_tplus0(
             &legs,
             &late_store,
             &geometry.grid,
             &geometry.entry_positions,
-        );
+        ));
         assert_eq!(
             first, second,
             "identical inputs yield an identical t+0 series"
         );
+    }
+
+    // --- #131: a contained upstream pricing panic, not a dead terminal ---------
+    //
+    // The injection is a REAL upstream panic reached through the production call
+    // chain, not a test hook: a mark at `Decimal::MAX` with a quantity of 2 makes
+    // `Position::total_cost` (inside `optionstratlib`'s `pnl_at_expiration`) evaluate
+    // `Positive * Positive` past the `Decimal` range, and `positive`'s `Mul` panics
+    // (`Positive arithmetic overflow in mul`) where no `Result` exists. That is an
+    // absurd-but-reachable provider mark, and exactly the class of upstream panic the
+    // boundary exists for. The process panic hook is not installed in a unit test, so
+    // the libtest default hook prints the caught panic to the captured stderr —
+    // expected noise, never a failure.
+
+    /// An absurd but **finite** `Positive` mark — half of `Decimal::MAX`, so three
+    /// contracts of it overflow the upstream cost basis. Deliberately NOT
+    /// `Positive::INFINITY` (which IS `Decimal::MAX`): the mark-honesty filter treats
+    /// that sentinel as "no mark", which would test the unpriceable path instead.
+    #[track_caller]
+    fn huge_positive() -> Positive {
+        let half = match Decimal::MAX.checked_div(Decimal::from(2)) {
+            Some(d) => d,
+            None => panic!("Decimal::MAX / 2 is representable"),
+        };
+        match Positive::new_decimal(half) {
+            Ok(p) => p,
+            Err(e) => panic!("half of Decimal::MAX is a valid Positive: {e}"),
+        }
+    }
+
+    /// The leg quantity that tips `premium * quantity` past `Decimal::MAX` for a
+    /// [`huge_positive`] premium — the overflow the upstream `Positive` `Mul` panics on.
+    const OVERFLOW_QTY: u32 = 3;
+
+    /// A one-strike chain at `spot` whose CALL mark is [`max_positive`] — the mid is
+    /// set directly (never through `set_mid_prices`, whose own `bid + ask` would
+    /// overflow in the fixture rather than in the code under test).
+    fn overflow_mark_chain(spot: f64) -> OptionChain {
+        let mut chain = OptionChain::new("BTC", pos(spot), CHAIN_EXPIRY.to_owned(), None, None);
+        let _ = chain.options.insert(OptionData {
+            strike_price: pos(spot),
+            call_middle: Some(huge_positive()),
+            put_middle: Some(huge_positive()),
+            implied_volatility: pos(0.5),
+            ..Default::default()
+        });
+        chain
+    }
+
+    /// A store over [`overflow_mark_chain`], with a venue IV row so the t+0 leg-IV
+    /// resolution succeeds and the reprice reaches the pricing math too.
+    fn overflow_store(spot: f64) -> ChainStore {
+        let mut store = ChainStore::seed(
+            ChainFetch::new(
+                overflow_mark_chain(spot),
+                ExpirySource::new("BTC", resolved_expiry(), pid("deribit")),
+                AliasCatalog::new(),
+            ),
+            ChainSource::Merged,
+            Duration::from_secs(2),
+            utc(AS_OF_EARLY),
+        );
+        let _ = store.apply_greeks(&venue_iv_row(spot, 0.5, AS_OF_EARLY));
+        store
+    }
+
+    /// The same absurd basis as an already-frozen entry position (a
+    /// [`huge_positive`] premium at [`OVERFLOW_QTY`]), for the t+0 reprice path — which starts from
+    /// frozen positions rather than from the chain.
+    fn overflow_entry_position(spot: f64) -> Position {
+        let option = Options::new(
+            OptionType::European,
+            OptionSide::Long,
+            "BTC".to_owned(),
+            pos(spot),
+            ExpirationDate::Days(pos(30.0)),
+            pos(0.5),
+            pos(f64::from(OVERFLOW_QTY)),
+            pos(spot),
+            Decimal::ZERO,
+            OptionStyle::Call,
+            Positive::ZERO,
+            None,
+        );
+        Position::new(
+            option,
+            huge_positive(),
+            utc(AS_OF_EARLY),
+            Positive::ZERO,
+            Positive::ZERO,
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn test_build_geometry_contains_an_upstream_pricing_panic() {
+        // The upstream math panics mid-build; the boundary maps it to the DISTINCT
+        // ComputeFailed outcome instead of unwinding into the render loop.
+        let spot = 100.0;
+        let legs = vec![BuilderLeg {
+            strike: pos(spot),
+            style: OptionStyle::Call,
+            side: Side::Buy,
+            // The quantity that tips `premium * quantity` past `Decimal::MAX`.
+            qty: OVERFLOW_QTY,
+        }];
+        match build_geometry(&legs, &overflow_store(spot)) {
+            GeometryBuild::ComputeFailed => {}
+            GeometryBuild::Priced(_) => panic!("the absurd mark cannot price"),
+            GeometryBuild::NotPriceable => {
+                panic!("a PANIC must not be reported as unpriceable legs (#131)")
+            }
+        }
+    }
+
+    #[test]
+    fn test_build_geometry_keeps_unpriceable_distinct_from_compute_failed() {
+        // The same legs whose marks are ABSENT are `NotPriceable`, not
+        // `ComputeFailed` — the two states never collapse, so the screen can tell a
+        // trader which one happened.
+        let legs = atm_call_leg(100.0);
+        let bare = ChainStore::seed(
+            ChainFetch::new(
+                OptionChain::new("BTC", pos(100.0), CHAIN_EXPIRY.to_owned(), None, None),
+                ExpirySource::new("BTC", resolved_expiry(), pid("deribit")),
+                AliasCatalog::new(),
+            ),
+            ChainSource::Merged,
+            Duration::from_secs(2),
+            utc(AS_OF_EARLY),
+        );
+        match build_geometry(&legs, &bare) {
+            GeometryBuild::NotPriceable => {}
+            GeometryBuild::Priced(_) => panic!("an empty chain has no mark to price"),
+            GeometryBuild::ComputeFailed => panic!("nothing panicked; the legs just lack marks"),
+        }
+    }
+
+    #[test]
+    fn test_rebuild_tplus0_contains_an_upstream_pricing_panic() {
+        // The tick-path reprice runs the same pricing math over the FROZEN positions,
+        // so it carries the same boundary: a panic yields ComputeFailed, deliberately
+        // NOT another empty series (which already means "t+0 unavailable — no reliable
+        // IV").
+        let spot = 100.0;
+        let legs = atm_call_leg(spot);
+        let store = overflow_store(spot);
+        let grid = vec![pos(80.0), pos(100.0), pos(120.0)];
+        let entry_positions = vec![overflow_entry_position(spot)];
+        match rebuild_tplus0(&legs, &store, &grid, &entry_positions) {
+            TPlus0Build::ComputeFailed => {}
+            TPlus0Build::Series(series) => {
+                panic!("the absurd basis cannot reprice, got {series:?}")
+            }
+        }
     }
 }

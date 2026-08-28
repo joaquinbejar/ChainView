@@ -12,7 +12,46 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A payoff curve can no longer take the terminal down** (issue #131). The
+  `optionstratlib` pricing math behind a payoff curve can `panic!` on an input no
+  `Result` expresses (the reported signature is `Positive invariant broken in sub`
+  from a `Positive` subtraction), and that panic would unwind out of the payoff
+  build and kill the TUI. All three curve builds — the live geometry, the live t+0
+  reprice, and the replay payoff-at-head — now run inside the **same**
+  contained-panic boundary the Parquet decode has used since #53: the mechanism
+  moved into `crate::terminal::contained` so there is one implementation, one
+  place that holds the thread-local guard across the `catch_unwind` (so the panic
+  hook neither restores the terminal under a live TUI nor prints into the
+  alternate screen), and one place that drops the panic payload so no
+  venue-controlled string can steer a message. Still no `unsafe`.
+
+  The screen degrades honestly rather than silently: "could not be priced" (a
+  missing mark, a non-future expiry) and "the pricing model failed on these legs"
+  are **different** states with different messages, on both the live payoff screen
+  and the replay payoff-at-head panel, and one `WARN` names the failed curve on
+  the file sink. Containment is **not** the root cause — issue #131 stays open for
+  that, pending a backtrace from a machine that reproduces it.
+
+  The boundary wraps the WHOLE build, never a grid sample: a panic part-way
+  through invalidates that curve anyway, and a per-sample `catch_unwind` would sit
+  in the hot sampling loop. Every build runs off the draw path, so no boundary is
+  inside `terminal.draw` and the terminal-restore ownership is untouched. The
+  render tests that proptest could only reach by a random draw — 1x1 and 40x8
+  across every replay payoff state — are now deterministic cases.
+
 ### Changed
+
+- **`tracing` is now a direct dependency, promoted from a dev-dependency**
+  (issue #131). The contained-panic seam above is the crate's first production
+  emitter, and `CLAUDE.md` governance deviation 3 mandates `tracing` (never
+  stdout/stderr) while the TUI owns the terminal. **No new crate enters the
+  graph**: `tracing` was already compiled as a transitive dependency of the
+  non-optional `optionstratlib` and already present as a dev-dependency, so
+  `cargo audit` / `cargo deny` see no new surface — the same no-new-surface
+  promotion as #29's `serde_json` and #31's `arrow-array`. `tracing-subscriber`
+  stays a dev-dependency: a library must never install a global subscriber.
 
 - **Terminal stack upgraded to `ratatui` 0.30 + `crossterm` 0.29** (issue #130).
   ratatui 0.30 splits into `ratatui-core` / `ratatui-widgets` /

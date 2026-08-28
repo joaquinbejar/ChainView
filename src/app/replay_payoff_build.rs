@@ -61,6 +61,18 @@
 //! against the head step's `ts_ns` on the deterministic `Days` convention — a
 //! clock-free span (never `Utc::now`), so the build is a pure function of the open set
 //! and the head timestamp.
+//!
+//! # Contained panics: an honest "curve unavailable", never a dead terminal (#131)
+//!
+//! `optionstratlib`'s pricing math can `panic!` on a pathological input that no
+//! `Result` expresses, and a trader's terminal must degrade to an honest state rather
+//! than die because one curve could not be computed. The **whole** curve build
+//! therefore runs inside [`crate::terminal::contained`] ([`build_with`]) — off the
+//! draw path, so the boundary is never inside `terminal.draw` — and a contained panic
+//! yields [`ReplayCurve::ComputeFailed`], which the panel renders with its own
+//! message. The header figures (the open-leg count and the writer's summed
+//! `unrealized_cents`) are checked integer arithmetic outside the boundary, so they
+//! stay honest either way.
 
 use optionstratlib::model::Position;
 use optionstratlib::prelude::{Decimal, Positive};
@@ -99,21 +111,48 @@ const NANOS_PER_DAY: i64 = 86_400_000_000_000;
 /// #27's `ENTRY_IV_PLACEHOLDER`).
 const IV_PLACEHOLDER: Positive = Positive::ONE;
 
-/// The projected replay payoff-at-head geometry: the expiration payoff series, its
-/// break-even prices, the current net mark-to-market P&L in **integer cents**, and
-/// the count of open legs at the head — all built off the draw path and cached on
+/// The curve name the contained-panic `WARN` carries for the payoff-at-head build.
+const REPLAY_CURVE: &str = "replay payoff at head";
+
+/// The **curve** half of the payoff-at-head geometry (#131): the priced expiration
+/// series and its break-evens, or the distinct "the upstream pricing math panicked"
+/// state.
+///
+/// An **empty** [`Priced`](Self::Priced) series is a legitimate, already-honest state
+/// (no priceable leg at the head — an unparseable join key or a degenerate strike
+/// range), so a contained panic cannot be reported as one more empty series; it is its
+/// own variant with its own panel message. The header figures
+/// ([`mark_pnl_cents`](ReplayPayoffGeometry::mark_pnl_cents) and
+/// [`open_legs`](ReplayPayoffGeometry::open_legs)) are checked integer arithmetic that
+/// never enters the pricing math, so they stay honest in **both** variants.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ReplayCurve {
+    /// The expiration payoff series (possibly empty) and its break-even prices.
+    Priced {
+        /// The expiration payoff as a single `GraphData::Series` (underlying → P&L in
+        /// **per-contract-notional** dollars — the bundle carries no contract
+        /// multiplier, so this y-axis is per contract, never portfolio dollars; see the
+        /// module docs), or an empty series when there is no open position at the head
+        /// (the "flat at this step" state) or the legs cannot be priced.
+        graph: GraphData,
+        /// The break-even underlying prices, read off the expiration series (empty when
+        /// the curve is flat/degenerate).
+        break_evens: Vec<Positive>,
+    },
+    /// The upstream `optionstratlib` pricing math **panicked** mid-build and the panic
+    /// was contained ([`crate::terminal::contained`], #131) — the panel renders its own
+    /// "the pricing model failed" state, never a fabricated line.
+    ComputeFailed,
+}
+
+/// The projected replay payoff-at-head geometry: the expiration payoff curve outcome,
+/// the current net mark-to-market P&L in **integer cents**, and the count of open legs
+/// at the head — all built off the draw path and cached on
 /// [`LoadedReplay`](super::LoadedReplay).
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ReplayPayoffGeometry {
-    /// The expiration payoff as a single `GraphData::Series` (underlying → P&L in
-    /// **per-contract-notional** dollars — the bundle carries no contract multiplier, so
-    /// this y-axis is per contract, never portfolio dollars; see the module docs), or an
-    /// empty series when there is no open position at the head (the "flat at this step"
-    /// state) or the legs cannot be priced.
-    pub(crate) graph: GraphData,
-    /// The break-even underlying prices, read off the expiration series (empty when
-    /// the curve is flat/degenerate).
-    pub(crate) break_evens: Vec<Positive>,
+    /// The expiration payoff curve, or the contained-panic state (#131).
+    pub(crate) curve: ReplayCurve,
     /// The current net mark-to-market P&L in **integer cents** (signed), or `None`
     /// when the head is flat (no open leg) or the sum overflows. It is the **checked sum
     /// of the writer's own per-row `unrealized_cents`** across the open legs — the
@@ -132,8 +171,10 @@ impl ReplayPayoffGeometry {
     #[must_use]
     fn flat() -> Self {
         Self {
-            graph: empty_series(),
-            break_evens: Vec::new(),
+            curve: ReplayCurve::Priced {
+                graph: empty_series(),
+                break_evens: Vec::new(),
+            },
             mark_pnl_cents: None,
             open_legs: 0,
         }
@@ -149,31 +190,69 @@ impl ReplayPayoffGeometry {
 /// head_ts_ns)`.
 #[must_use]
 pub(crate) fn build(open: &[&PositionRow], head_ts_ns: Option<i64>) -> ReplayPayoffGeometry {
+    build_with(open, head_ts_ns, curve_at_head)
+}
+
+/// [`build`] with the curve builder as a parameter — the **containment seam** (#131).
+///
+/// Production has exactly one caller ([`build`], passing [`curve_at_head`]); the
+/// parameter exists because no valid [`PositionRow`] can drive the upstream panic this
+/// boundary exists for, so a test cannot otherwise reach the
+/// [`ComputeFailed`](ReplayCurve::ComputeFailed) arm: every money column is bounded by
+/// the checked cents→`Positive` seam (`u64` cents ≤ `i64::MAX` ⇒ ≤ $9.2e16, quantity
+/// ≤ `u32::MAX`), so the largest reachable cost basis is ~4e26 — far under
+/// `Decimal::MAX` — and every other arithmetic step on the route is already checked.
+/// A plain generic parameter is used rather than a `#[cfg(test)]` hook so the shipped
+/// code path and the tested code path are the **same** one.
+///
+/// The header figures ([`net_unrealized_cents`] and the open-leg count) are computed
+/// **outside** the boundary: they are checked integer arithmetic that never touches the
+/// pricing math, so they stay honest even when the curve build panics.
+#[must_use]
+fn build_with(
+    open: &[&PositionRow],
+    head_ts_ns: Option<i64>,
+    curve: impl FnOnce(&[&PositionRow], Option<i64>) -> ReplayCurve,
+) -> ReplayPayoffGeometry {
     if open.is_empty() {
         return ReplayPayoffGeometry::flat();
     }
     let open_legs = open.len();
     let mark_pnl_cents = net_unrealized_cents(open);
+    // Contain the WHOLE curve build, not each grid sample: a panic part-way through
+    // invalidates that curve anyway, and a per-sample `catch_unwind` would sit in the
+    // hot sampling loop. Off the draw path (bundle load + every cursor move), so the
+    // boundary is never inside `terminal.draw`.
+    let curve = crate::terminal::contained(|| curve(open, head_ts_ns)).unwrap_or_else(|| {
+        super::payoff_build::warn_curve_compute_failed(REPLAY_CURVE);
+        ReplayCurve::ComputeFailed
+    });
+    ReplayPayoffGeometry {
+        curve,
+        mark_pnl_cents,
+        open_legs,
+    }
+}
+
+/// The expiration payoff of the open legs at the head — the curve build
+/// [`build_with`] runs inside the contained-panic boundary. An empty series is the
+/// honest "no priceable leg" state; a panic is the caller's concern, never expressed
+/// here.
+#[must_use]
+fn curve_at_head(open: &[&PositionRow], head_ts_ns: Option<i64>) -> ReplayCurve {
     let positions = build_positions(open, head_ts_ns);
     let Some(grid) = price_grid(&positions) else {
         // The legs could not be priced (an unparseable id or a degenerate strike
         // range): an honest empty series, never a fabricated line. The open-leg count
         // and mark P&L still surface in the header.
-        return ReplayPayoffGeometry {
+        return ReplayCurve::Priced {
             graph: empty_series(),
             break_evens: Vec::new(),
-            mark_pnl_cents,
-            open_legs,
         };
     };
     let graph = per_contract_expiration_series(&positions, &grid);
     let break_evens = break_even_points(&graph);
-    ReplayPayoffGeometry {
-        graph,
-        break_evens,
-        mark_pnl_cents,
-        open_legs,
-    }
+    ReplayCurve::Priced { graph, break_evens }
 }
 
 /// The shared `optionstratlib` expiration payoff series, relabelled with the honest
@@ -354,8 +433,12 @@ mod tests {
     use optionstratlib::prelude::Decimal;
     use optionstratlib::visualization::GraphData;
 
-    use super::{REPLAY_SERIES_NAME, build, net_unrealized_cents, positive_from_cents};
+    use super::{
+        REPLAY_SERIES_NAME, ReplayCurve, ReplayPayoffGeometry, build, build_with,
+        net_unrealized_cents, positive_from_cents,
+    };
     use crate::replay::{PositionRow, PositionSide};
+    use optionstratlib::prelude::Positive;
 
     const HEAD_TS: i64 = 1_700_000_000_000_000_000;
     const EXP_NS: i64 = 1_735_286_400_000_000_000;
@@ -402,6 +485,31 @@ mod tests {
         }
     }
 
+    /// The priced curve of a geometry — the expiration series and its break-evens.
+    /// A contained pricing panic (#131) is a test failure with its own message here,
+    /// never silently read as one more empty series.
+    #[track_caller]
+    fn priced(geometry: &ReplayPayoffGeometry) -> (&GraphData, &[Positive]) {
+        match &geometry.curve {
+            ReplayCurve::Priced { graph, break_evens } => (graph, break_evens),
+            ReplayCurve::ComputeFailed => {
+                panic!("expected a priced curve, the pricing math panicked")
+            }
+        }
+    }
+
+    /// The priced curve's series length (`0` = the honest empty series).
+    #[track_caller]
+    fn curve_x_len(geometry: &ReplayPayoffGeometry) -> usize {
+        series_x_len(priced(geometry).0)
+    }
+
+    /// The priced curve's break-even prices.
+    #[track_caller]
+    fn curve_break_evens(geometry: &ReplayPayoffGeometry) -> &[Positive] {
+        priced(geometry).1
+    }
+
     // --- cents → Positive is a checked, f64-free seam ------------------------
 
     #[test]
@@ -424,8 +532,8 @@ mod tests {
         let geometry = build(&[], Some(HEAD_TS));
         assert_eq!(geometry.open_legs, 0, "no legs at the head");
         assert_eq!(geometry.mark_pnl_cents, None, "flat has no mark P&L");
-        assert!(geometry.break_evens.is_empty());
-        assert_eq!(series_x_len(&geometry.graph), 0, "the flat series is empty");
+        assert!(curve_break_evens(&geometry).is_empty());
+        assert_eq!(curve_x_len(&geometry), 0, "the flat series is empty");
     }
 
     // --- a real open position builds an expiration curve + break-even --------
@@ -449,15 +557,15 @@ mod tests {
         let geometry = build(&open, Some(HEAD_TS));
         assert_eq!(geometry.open_legs, 1);
         assert!(
-            series_x_len(&geometry.graph) >= 2,
+            curve_x_len(&geometry) >= 2,
             "a priced leg yields a sampled curve",
         );
         assert_eq!(
-            geometry.break_evens.len(),
+            curve_break_evens(&geometry).len(),
             1,
             "a long call has one break-even (strike + premium)",
         );
-        for be in &geometry.break_evens {
+        for be in curve_break_evens(&geometry) {
             let value = be.to_f64();
             assert!(
                 (60_000.0..=61_000.0).contains(&value),
@@ -523,7 +631,7 @@ mod tests {
         let open = vec![&long, &short];
         let geometry = build(&open, Some(HEAD_TS));
         assert_eq!(geometry.open_legs, 2);
-        assert!(series_x_len(&geometry.graph) >= 2, "both legs priced");
+        assert!(curve_x_len(&geometry) >= 2, "both legs priced");
         assert_eq!(geometry.mark_pnl_cents, Some(-500));
     }
 
@@ -546,7 +654,7 @@ mod tests {
         )];
         let open: Vec<&PositionRow> = legs.iter().collect();
         let geometry = build(&open, Some(HEAD_TS));
-        match &geometry.graph {
+        match priced(&geometry).0 {
             GraphData::Series(series) => assert_eq!(
                 series.x.first().copied(),
                 Some(Decimal::from(42_000)),
@@ -573,7 +681,7 @@ mod tests {
         )];
         let open: Vec<&PositionRow> = legs.iter().collect();
         let geometry = build(&open, Some(HEAD_TS));
-        match &geometry.graph {
+        match priced(&geometry).0 {
             GraphData::Series(series) => assert_eq!(series.name, REPLAY_SERIES_NAME),
             other => panic!("expected a series, got {other:?}"),
         }
@@ -603,7 +711,57 @@ mod tests {
         // The leg still counts as open (the header stays honest), but it cannot price,
         // so the curve is an empty series rather than a fabricated line.
         assert_eq!(geometry.open_legs, 1);
-        assert_eq!(series_x_len(&geometry.graph), 0);
+        assert_eq!(curve_x_len(&geometry), 0);
+    }
+
+    // --- #131: a contained upstream pricing panic, not a dead terminal --------
+
+    #[test]
+    fn test_build_with_contains_a_panicking_curve_build() {
+        // The boundary maps a panicking curve build to the DISTINCT `ComputeFailed`
+        // outcome instead of unwinding into the render loop. The panic is injected
+        // through the production `build_with` seam (the shipped `build` is the same
+        // function with the real curve builder) because NO valid `PositionRow` can
+        // reach the upstream panic: every money column is bounded by the checked
+        // cents->`Positive` seam, so the largest reachable cost basis is ~4e26, far
+        // under `Decimal::MAX`. The libtest default hook prints the caught panic to the
+        // captured stderr — expected noise, never a failure.
+        let leg = row('C', 6_000_000, PositionSide::Long, 1, 12_500, 11_800, -700);
+        let open = vec![&leg];
+        let geometry = build_with(&open, Some(HEAD_TS), |_, _| panic!("upstream pricing math"));
+        assert_eq!(
+            geometry.curve,
+            ReplayCurve::ComputeFailed,
+            "a panicking curve build is contained, not unwound",
+        );
+        // The header figures are computed OUTSIDE the boundary (checked integer
+        // arithmetic that never enters the pricing math), so they stay honest.
+        assert_eq!(
+            geometry.open_legs, 1,
+            "the open-leg count survives the panic"
+        );
+        assert_eq!(
+            geometry.mark_pnl_cents,
+            Some(-700),
+            "the writer's mark-to-market survives the panic",
+        );
+    }
+
+    #[test]
+    fn test_build_keeps_unpriceable_distinct_from_compute_failed() {
+        // An unparseable join key yields a priced-but-EMPTY series (the honest "could
+        // not be priced" state), never `ComputeFailed` — the two never collapse, so the
+        // panel can tell a trader which one happened.
+        let mut bad = row('C', 6_000_000, PositionSide::Long, 1, 12_500, 11_800, -700);
+        bad.contract_id = "not-a-valid-id".to_owned();
+        let open = vec![&bad];
+        let geometry = build(&open, Some(HEAD_TS));
+        assert_eq!(curve_x_len(&geometry), 0, "an honest empty series");
+        assert_ne!(
+            geometry.curve,
+            ReplayCurve::ComputeFailed,
+            "nothing panicked; the leg simply could not be priced",
+        );
     }
 
     #[test]
@@ -615,8 +773,8 @@ mod tests {
         let geometry = build(&open, Some(HEAD_TS));
         assert_eq!(geometry.open_legs, 1);
         // A long put has one break-even (strike − premium), just below the strike.
-        assert_eq!(geometry.break_evens.len(), 1);
-        for be in &geometry.break_evens {
+        assert_eq!(curve_break_evens(&geometry).len(), 1);
+        for be in curve_break_evens(&geometry) {
             assert!(
                 (59_000.0..=60_000.0).contains(&be.to_f64()),
                 "the put break-even sits just below the strike: {}",
