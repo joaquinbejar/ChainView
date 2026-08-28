@@ -12,6 +12,90 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A payoff curve can no longer take the terminal down** (issue #131). The
+  `optionstratlib` pricing math behind a payoff curve can `panic!` on an input no
+  `Result` expresses (the reported signature is `Positive invariant broken in sub`
+  from a `Positive` subtraction), and that panic would unwind out of the payoff
+  build and kill the TUI. All three curve builds — the live geometry, the live t+0
+  reprice, and the replay payoff-at-head — now run inside the **same**
+  contained-panic boundary the Parquet decode has used since #53: the mechanism
+  moved into `crate::terminal::contained` so there is one implementation, one
+  place that holds the thread-local guard across the `catch_unwind` (so the panic
+  hook neither restores the terminal under a live TUI nor prints into the
+  alternate screen), and one place that drops the panic payload so no
+  venue-controlled string can steer a message. Still no `unsafe`.
+
+  The screen degrades honestly rather than silently: "could not be priced" (a
+  missing mark, a non-future expiry) and "the pricing model failed on these legs"
+  are **different** states with different messages, on both the live payoff screen
+  and the replay payoff-at-head panel, and one `WARN` names the failed curve on
+  the file sink. Containment is **not** the root cause — issue #131 stays open for
+  that, pending a backtrace from a machine that reproduces it.
+
+  The boundary wraps the WHOLE build, never a grid sample: a panic part-way
+  through invalidates that curve anyway, and a per-sample `catch_unwind` would sit
+  in the hot sampling loop. Every build runs off the draw path, so no boundary is
+  inside `terminal.draw` and the terminal-restore ownership is untouched. The
+  render tests that proptest could only reach by a random draw — 1x1 and 40x8
+  across every replay payoff state — are now deterministic cases.
+
+### Changed
+
+- **`tracing` is now a direct dependency, promoted from a dev-dependency**
+  (issue #131). The contained-panic seam above is the crate's first production
+  emitter, and `CLAUDE.md` governance deviation 3 mandates `tracing` (never
+  stdout/stderr) while the TUI owns the terminal. **No new crate enters the
+  graph**: `tracing` was already compiled as a transitive dependency of the
+  non-optional `optionstratlib` and already present as a dev-dependency, so
+  `cargo audit` / `cargo deny` see no new surface — the same no-new-surface
+  promotion as #29's `serde_json` and #31's `arrow-array`. `tracing-subscriber`
+  stays a dev-dependency: a library must never install a global subscriber.
+
+- **Terminal stack upgraded to `ratatui` 0.30 + `crossterm` 0.29** (issue #130).
+  ratatui 0.30 splits into `ratatui-core` / `ratatui-widgets` /
+  `ratatui-crossterm` behind the same `ratatui` facade, so no ChainView source
+  change was needed; `ratatui-crossterm` defaults to the `crossterm_0_29`
+  backend, and the direct `crossterm` pin moves with it so cargo still unifies to
+  a SINGLE crossterm instance (the one ChainView calls is the one ratatui
+  drives). Nine chart-bearing render goldens were regenerated: 0.30 maps a
+  dataset point to a slightly different braille sub-cell, which also puts the
+  payoff break-even and spot markers exactly ON the zero-P&L line instead of one
+  row above it. Every golden keeps identical text, labels and line count — only
+  plot glyphs moved. The MSRV is unchanged (ratatui 0.30 needs 1.88; ours is
+  1.94). The split widens the LOCKFILE surface without widening the build:
+  `Cargo.lock` is feature-agnostic, so it gains ~43 packages for ratatui's other
+  backends and its optional `palette` support (`ratatui-termwiz`/
+  `ratatui-termina`, `termwiz`, `termina`, `terminfo`, `vtparse`, the `wezterm-*`
+  family, `pest*`, `palette*`, plus a second `bitflags` at 1.3.2). No ChainView
+  feature enables any of them, so none is compiled, linked or reachable —
+  `cargo tree --all-features -i ratatui-termwiz` prints nothing — and
+  `cargo deny check` is clean on the resolved graph.
+
+- **`tests/common/sha256.rs` uses `as_chunks::<64>()`** (issue #130). clippy 1.98
+  added `clippy::chunks_exact_to_as_chunks`, which fires on the `chunks_exact(64)`
+  loop in the bundle-fixture hash helper and failed the `check` job on every PR,
+  on a file untouched since #56.
+
+### Security
+
+- **Four supply-chain advisories cleared, the ignore set shrunk by one**
+  (issue #130). CI had been red on `main` since 2026-08-03 because the advisory
+  database moved: `h2 0.4.15` (RUSTSEC-2026-0258), `event-listener 5.4.1`
+  (RUSTSEC-2026-0221), `lru 0.12.5` (RUSTSEC-2026-0253) and a yanked
+  `chacha20 0.10.1`. Three were PATCHED by a lockfile update (h2 -> 0.4.19,
+  event-listener -> 5.4.2, chacha20 -> 0.10.2) with no manifest or MSRV change;
+  the fourth was patched by the ratatui 0.30 bump above, which moves `lru` from
+  the `^0.12` line ratatui 0.29 pinned to `^0.18` (0.18.3) — past the patched
+  floor of RUSTSEC-2026-0253 **and** of RUSTSEC-2026-0002, so that lru ignore is
+  DELETED from `deny.toml` and the CI audit flags rather than joined by a second
+  one. One entry is added: `rkyv 0.7.46` (RUSTSEC-2026-0235), which lives in
+  `Cargo.lock` only — an optional `rust_decimal` dependency no ChainView feature
+  enables, invisible to `cargo deny` (which resolves features) and never
+  compiled, linked or reached. `cargo audit` and `cargo deny check` are both
+  clean again.
+
 ### Added
 
 - **Interactive Brokers provider** (`src/providers/ibkr.rs`, issue #120), behind a
