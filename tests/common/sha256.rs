@@ -18,7 +18,7 @@
 #![allow(dead_code)]
 // SHA-256's message schedule and working variables are inherently index-addressed;
 // a `.get()`-everywhere rewrite would obscure a standard, verified algorithm. The
-// bounds are all compile-time-fixed (`[u32; 64]`, `chunks_exact(64)`), so no index
+// bounds are all compile-time-fixed (`[u32; 64]`, `as_chunks::<64>()`), so no index
 // is attacker-influenced. Scoped to this hasher module only.
 #![allow(clippy::indexing_slicing)]
 
@@ -118,7 +118,7 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     }
     msg.extend_from_slice(&bit_len.to_be_bytes());
 
-    for chunk in msg.chunks_exact(64) {
+    for chunk in msg.as_chunks::<64>().0 {
         let mut w = [0u32; 64];
         for (i, word) in w.iter_mut().enumerate().take(16) {
             let b = i * 4;
