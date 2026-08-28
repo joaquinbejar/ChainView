@@ -133,7 +133,9 @@ ig = ["dep:ig-client"]
 # `thiserror`, `log`) are permissive (MIT/Apache-2.0/ISC) and add no new advisory
 # (go/no-go GREEN, recorded on issue #120; `cargo audit` + `cargo deny check`
 # clean). Auth is injected programmatically: the adapter reads
-# `CHAINVIEW_IBKR_ENDPOINT` (host:port) + `CHAINVIEW_IBKR_CLIENT_ID` from the env
+# `CHAINVIEW_IBKR_ENDPOINT` (`host:port`, or the `scheme://host:port` form the
+# shared config layer requires of a SELECTED provider's endpoint — the adapter
+# normalizes either to the socket address) + `CHAINVIEW_IBKR_CLIENT_ID` from the env
 # and calls `ibapi::Client::connect(endpoint, client_id)` — the TWS/Gateway holds
 # the session, so ChainView carries NO credential (auth: None at the seam). `ibapi`
 # performs no dotenv load, no foreign env namespace read, and installs no global
@@ -346,7 +348,8 @@ ig-client = { version = "0.12", optional = true }
 # audit note in CHANGELOG (`cargo audit` + `cargo deny check`, deny.toml pins
 # `all-features = true`).
 # Auth is injected programmatically at the socket seam: the adapter reads
-# `CHAINVIEW_IBKR_ENDPOINT` (host:port) + `CHAINVIEW_IBKR_CLIENT_ID` (i32) from
+# `CHAINVIEW_IBKR_ENDPOINT` (`host:port` or `scheme://host:port`, normalized to the
+# socket address) + `CHAINVIEW_IBKR_CLIENT_ID` (i32) from
 # ChainView-namespaced env vars and calls `Client::connect(endpoint, client_id)`.
 # The TWS/Gateway holds the session, so ChainView carries NO credential (auth:
 # None at the seam) — there is no dotenv load, no foreign env namespace, and no

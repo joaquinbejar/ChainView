@@ -578,7 +578,18 @@ fn validate_log_file(path: PathBuf) -> Result<PathBuf, ConfigError> {
 
 /// Validate a minimally-absolute URL (`scheme://authority`), without a URL
 /// dependency. Rejects a relative or scheme-less value.
-fn validate_endpoint(raw: &str) -> Result<String, ConfigError> {
+///
+/// `field` is the provider-qualified label the failure is reported under
+/// (`providers.<id>.endpoint`), so the error names the provider whose endpoint was
+/// rejected rather than an anonymous `endpoint`.
+///
+/// A socket endpoint — IBKR's TWS/Gateway address, the only one in tree — is
+/// written in the same absolute-URL form (`tcp://127.0.0.1:7497`) and the adapter
+/// strips the scheme back to `host:port`
+/// ([`normalize_endpoint`](crate::providers::ibkr)). The rejection `reason` names
+/// that form, because this message is the only place a user with a bare
+/// `host:port` learns what to type (issue #120 follow-up).
+fn validate_endpoint(raw: &str, field: &str) -> Result<String, ConfigError> {
     let ok = match raw.split_once("://") {
         Some((scheme, rest)) => {
             !rest.is_empty()
@@ -592,11 +603,20 @@ fn validate_endpoint(raw: &str) -> Result<String, ConfigError> {
     if ok {
         Ok(raw.to_owned())
     } else {
+        // The raw value is never echoed: `reason` is a non-secret explanation and an
+        // endpoint can carry userinfo.
         Err(ConfigError::InvalidValue {
-            field: "endpoint".to_owned(),
-            reason: "must be an absolute URL (scheme://host)".to_owned(),
+            field: field.to_owned(),
+            reason: "must be an absolute URL (scheme://host); a bare host:port socket \
+                 needs a scheme too, e.g. tcp://127.0.0.1:7497"
+                .to_owned(),
         })
     }
+}
+
+/// The provider-qualified label [`validate_endpoint`] reports a rejection under.
+fn endpoint_field(provider: &str) -> String {
+    format!("providers.{provider}.endpoint")
 }
 
 // ---------------------------------------------------------------------------
@@ -621,7 +641,7 @@ fn assemble_providers(
     for (raw_id, raw) in file_providers {
         let id = validate_provider_id(&raw_id)?;
         let endpoint = match raw.endpoint {
-            Some(e) => Some(validate_endpoint(&e)?),
+            Some(e) => Some(validate_endpoint(&e, &endpoint_field(id.as_str()))?),
             None => None,
         };
         let refresh_interval = match raw.refresh_interval {
@@ -649,7 +669,7 @@ fn assemble_providers(
     if endpoint_override.is_some() || env_refresh.is_some() || out.contains_key(selected) {
         let entry = out.entry(selected.clone()).or_default();
         if let Some(e) = endpoint_override {
-            entry.endpoint = Some(validate_endpoint(&e)?);
+            entry.endpoint = Some(validate_endpoint(&e, &endpoint_field(selected.as_str()))?);
         }
         if let Some(d) = env_refresh {
             entry.refresh_interval = Some(parse_duration_in_range(
@@ -1262,6 +1282,46 @@ mod tests {
         };
         let result = Config::assemble(cli, &empty_env(), None);
         assert!(is_invalid_value(&result));
+    }
+
+    #[test]
+    fn test_config_accepts_socket_endpoint_in_absolute_url_form() {
+        // Issue #120 follow-up: IBKR's endpoint is a TWS/Gateway SOCKET, but this
+        // layer validates the SELECTED provider's endpoint as `scheme://host` for
+        // every provider alike. The socket-in-URL form is what reconciles the two —
+        // `IbkrAdapter::from_env` strips the scheme back to `host:port` — so
+        // `--provider ibkr` starts. A bare `host:port` is still rejected here (it
+        // is scheme-less), which is exactly what broke `--provider ibkr` before.
+        let url_env = env(&[("CHAINVIEW_IBKR_ENDPOINT", "tcp://127.0.0.1:7497")]);
+        let cli = CliOverrides {
+            provider: Some("ibkr".to_owned()),
+            ..Default::default()
+        };
+        let config = assembled(cli, &url_env, None);
+        let settings = match config.providers.get(&pid("ibkr")) {
+            Some(s) => s,
+            None => panic!("expected ibkr provider settings"),
+        };
+        assert_eq!(settings.endpoint.as_deref(), Some("tcp://127.0.0.1:7497"));
+
+        // A bare `host:port` is still rejected here (it is scheme-less), so the
+        // rejection has to be self-diagnosing: it names the provider and the form
+        // that works. This message is the only documentation a user with the bare
+        // value ever sees — the adapter's better message fires only on the path
+        // where ibkr is configured but NOT selected, which is not where they are.
+        let bare = env(&[("CHAINVIEW_IBKR_ENDPOINT", "127.0.0.1:7497")]);
+        let cli = CliOverrides {
+            provider: Some("ibkr".to_owned()),
+            ..Default::default()
+        };
+        match Config::assemble(cli, &bare, None) {
+            Err(ConfigError::InvalidValue { field, reason }) => {
+                assert_eq!(field, "providers.ibkr.endpoint");
+                assert!(reason.contains("tcp://127.0.0.1:7497"), "reason: {reason}");
+                assert!(reason.contains("host:port"), "reason: {reason}");
+            }
+            other => panic!("expected InvalidValue on the ibkr endpoint, got {other:?}"),
+        }
     }
 
     #[test]
