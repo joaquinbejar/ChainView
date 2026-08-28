@@ -395,6 +395,22 @@ parquet = { version = "59.0", default-features = false, features = [
 # writers, so it stays a dev-dependency. Version pinned to `parquet` 59's arrow
 # epoch.
 arrow-array = "59.0"
+# The structured logging facade the crate emits through (`CLAUDE.md` governance
+# deviation 3: `tracing` only, NEVER stdout/stderr while the TUI owns the terminal —
+# `println!`/`eprintln!`/`dbg!` are forbidden because stdout IS the UI). The first
+# production emitter is the contained-panic seam on the payoff-curve builds (issue
+# #131, `src/app/payoff_build.rs`): when the upstream `optionstratlib` pricing math
+# panics, the screen degrades to an honest "curve unavailable" state and ONE `WARN`
+# names the curve (never the dropped panic payload).
+# Promoted from a DEV-dependency to a direct dependency: NO new crate enters the
+# graph — `tracing` is already compiled in the tree as a transitive dependency of the
+# non-optional `optionstratlib` (and `deribit`/`tastytrade`) and was already a
+# dev-dependency — so `cargo audit`/`cargo deny` see NO new surface (the same "no new
+# surface" promotion pattern as #29's `serde_json` and #31's `arrow-array`).
+# `tracing-subscriber` stays a DEV-dependency: the binary's TUI-safe file sink is a
+# separate, still-deferred piece of work, and a library must never install a global
+# subscriber.
+tracing = "0.1"
 
 [dev-dependencies]
 proptest = "1.0"
@@ -441,7 +457,6 @@ tokio = { version = "1.0", default-features = false, features = [
 tokio-tungstenite = { version = "0.29", default-features = false, features = [
     "handshake",
 ] }
-tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = [
     "fmt",
 ] }

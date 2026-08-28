@@ -269,10 +269,12 @@ fn payoff_y_labels(bounds: [f64; 2]) -> Vec<Span<'static>> {
     ]
 }
 
-/// Draw the honest "committed, but the curve can't be priced" state: the committed
-/// header over a warning message keyed on the empty-projection reason, then the leg
-/// list — never a blank and never a fabricated chart (`docs/05-views-and-ux.md` §4,
-/// §6). A committed strategy whose legs lack an IV or a future expiry lands here.
+/// Draw the honest "committed, but there is no curve" state: the committed header
+/// over a warning message keyed on the empty-projection reason, then the leg list —
+/// never a blank and never a fabricated chart (`docs/05-views-and-ux.md` §4, §6). A
+/// committed strategy whose legs lack an IV or a future expiry lands here, and so does
+/// one whose upstream pricing math **panicked** off the draw path (#131) — the two
+/// carry different messages ([`unavailable_reason`]).
 fn draw_curve_unavailable(
     frame: &mut Frame,
     inner: Rect,
@@ -285,7 +287,12 @@ fn draw_curve_unavailable(
     lines.push(Line::from(vec![
         Span::styled("! ", theme.warning()),
         Span::styled(
-            unavailable_reason(builder.curve(), builder.has_expiration_curve(), reason),
+            unavailable_reason(
+                builder.curve(),
+                builder.has_expiration_curve(),
+                builder.curve_compute_failed(),
+                reason,
+            ),
             theme.warning(),
         ),
     ]));
@@ -320,10 +327,18 @@ fn committed_header(
     vec![summary, marks]
 }
 
-/// The message for a committed strategy with no renderable curve, keyed on the
-/// active [`CurveMode`], whether the (IV-independent) expiration curve renders, and
-/// the projection's [`EmptyReason`] (exhaustive, no wildcard) — an honest reason,
-/// never a fabricated line.
+/// The message for a committed strategy with no renderable curve, keyed on whether
+/// the upstream pricing math **panicked** (#131), the active [`CurveMode`], whether
+/// the (IV-independent) expiration curve renders, and the projection's
+/// [`EmptyReason`] (exhaustive, no wildcard) — an honest reason, never a fabricated
+/// line.
+///
+/// `compute_failed` is checked FIRST and answers a different question from the rest:
+/// the inputs were fine and the model blew up (the panic was contained off the draw
+/// path, `src/app/payoff_build.rs`), so neither the "no reliable IV" nor the "needs
+/// marks" wording would be true. It is deliberately **not** an [`EmptyReason`]
+/// variant: that enum is derived from a `GraphData`, and a build that panicked
+/// produced none — inventing one would fabricate data.
 ///
 /// The **t+0** curve alone can be unavailable purely for lack of a reliable IV
 /// (a leg's IV is absent or a sub-plausibility local inversion) while the expiration
@@ -333,8 +348,12 @@ fn committed_header(
 fn unavailable_reason(
     curve: CurveMode,
     expiration_available: bool,
+    compute_failed: bool,
     reason: Option<EmptyReason>,
 ) -> &'static str {
+    if compute_failed {
+        return COMPUTE_FAILED_REASON;
+    }
     if curve == CurveMode::TPlus0 && expiration_available {
         return "t+0 unavailable — no reliable IV";
     }
@@ -345,6 +364,22 @@ fn unavailable_reason(
         None => "payoff curve unavailable",
     }
 }
+
+/// The live payoff message for a **contained pricing panic** (#131): the legs were
+/// priceable, the upstream model failed on them, and the panic was contained off the
+/// draw path — so the screen degrades to this honest state instead of the terminal
+/// dying with the curve. Deliberately distinct from the "needs marks and a future
+/// expiry" wording, which would send a trader to fix inputs that are already fine.
+const COMPUTE_FAILED_REASON: &str =
+    "payoff curve unavailable — the pricing model failed on these legs";
+
+/// The replay payoff-at-head headline for the same contained pricing panic (#131),
+/// distinct from the "payoff unavailable at this step" of an unpriceable open set.
+const REPLAY_COMPUTE_FAILED_HEADLINE: &str = "payoff curve unavailable";
+
+/// The replay payoff-at-head sub-note for a contained pricing panic (#131) — the
+/// same fact as [`COMPUTE_FAILED_REASON`], phrased for the two-line centered state.
+const REPLAY_COMPUTE_FAILED_NOTE: &str = "the pricing model failed on these legs";
 
 /// Format the break-even prices as `b1, b2` text, or `—` when there are none — the
 /// `—`-not-`0` honesty rule. Each value uses the SAME [`fmt_price`] formatter as the
@@ -610,7 +645,9 @@ fn style_of(leg: LegFocus) -> OptionStyle {
 /// bundle is still opening, the **bundle-error** note with the mode-correct `R` retry
 /// key when the bundle failed (never the Live `r` provider key), then the **"flat at
 /// this step"** empty state when no position is open at the head (recovery: scrub to an
-/// open step), then — once an open position is priced — the payoff **line chart** (the
+/// open step), then the two no-curve states — the open set that could not be priced and
+/// the **contained pricing panic** (#131), each with its own honest wording — then,
+/// once an open position is priced, the payoff **line chart** (the
 /// expiration curve, the current-mark reference, the break-even markers, and the zero
 /// line). Never a blank, never a fabricated line, and **no claim of bit-exact upstream
 /// repricing** (`docs/04` §6).
@@ -675,18 +712,22 @@ pub fn draw_replay(
         return;
     }
 
-    // Open legs, but the curve projected Empty (a degenerate range, or every
-    // coordinate was non-finite and the #23 adapter dropped it): an honest state, never
-    // a fabricated line.
+    // Open legs, but no renderable curve: an honest state, never a fabricated line.
+    // The contained-panic case (#131) is checked FIRST and gets its own wording — the
+    // open legs WERE priceable and the upstream model blew up on them, so "could not be
+    // priced" would be the wrong fact. Otherwise the curve projected Empty (a
+    // degenerate range, or every coordinate was non-finite and the #23 adapter dropped
+    // it).
     let Some(series) = payoff.ready() else {
-        draw_replay_center(
-            frame,
-            inner,
-            theme,
-            theme.warning(),
-            "payoff unavailable at this step",
-            "the open position could not be priced",
-        );
+        let (headline, note) = if head.curve_compute_failed() {
+            (REPLAY_COMPUTE_FAILED_HEADLINE, REPLAY_COMPUTE_FAILED_NOTE)
+        } else {
+            (
+                "payoff unavailable at this step",
+                "the open position could not be priced",
+            )
+        };
+        draw_replay_center(frame, inner, theme, theme.warning(), headline, note);
         return;
     };
 
@@ -1057,6 +1098,77 @@ mod tests {
         )
     }
 
+    /// An absurd but **finite** `Positive` provider mark — half of `Decimal::MAX`, so
+    /// three contracts of it overflow the upstream cost basis. Deliberately NOT
+    /// `Positive::INFINITY` (which IS `Decimal::MAX`): the mark-honesty filter treats
+    /// that sentinel as "no mark", which would exercise the unpriceable path instead.
+    #[track_caller]
+    fn huge_positive() -> Positive {
+        let max = optionstratlib::prelude::Decimal::MAX;
+        let half = match max.checked_div(optionstratlib::prelude::Decimal::from(2)) {
+            Some(d) => d,
+            None => panic!("Decimal::MAX / 2 is representable"),
+        };
+        match Positive::new_decimal(half) {
+            Ok(p) => p,
+            Err(e) => panic!("half of Decimal::MAX is a valid Positive: {e}"),
+        }
+    }
+
+    /// A live state whose FULL_A row carries an absurd [`huge_positive`] mark, so a
+    /// three-contract leg makes `optionstratlib`'s cost basis (`premium * quantity`)
+    /// overflow and **panic** inside the off-draw geometry build (#131). The panic is
+    /// contained there, so the committed strategy carries the compute-failed state and
+    /// the screen renders its own message. The mid is set directly — `set_mid_prices`
+    /// would overflow on `bid + ask` in the fixture instead of in the code under test.
+    fn overflow_mark_live_state() -> LiveState {
+        let mut chain = OptionChain::new("BTC", pos(FULL_A), "2025-06-27".to_owned(), None, None);
+        let _ = chain.options.insert(OptionData {
+            strike_price: pos(FULL_A),
+            call_middle: Some(huge_positive()),
+            put_middle: Some(huge_positive()),
+            implied_volatility: pos(0.5),
+            ..Default::default()
+        });
+        let store = ChainStore::seed(
+            ChainFetch::new(
+                chain,
+                ExpirySource::new("BTC", utc(EXP), pid("deribit")),
+                AliasCatalog::new(),
+            ),
+            ChainSource::Merged,
+            Duration::from_secs(2),
+            utc(EXP),
+        );
+        LiveState::new(
+            SourceBinding::new(pid("deribit"), caps(), StreamHealth::Live),
+            store,
+        )
+    }
+
+    /// A COMMITTED live state in the contained-pricing-panic state (#131): one
+    /// two-contract leg on the absurd-mark chain, committed through the real
+    /// `commit` -> `build_geometry` path.
+    #[track_caller]
+    fn compute_failed_live_state() -> LiveState {
+        let mut state = overflow_mark_live_state();
+        focus(&mut state, 0);
+        press(&mut state, KeyCode::Char('a'));
+        // A quantity of 3 is what tips `premium * quantity` past `Decimal::MAX`.
+        press(&mut state, KeyCode::Char('+'));
+        press(&mut state, KeyCode::Char('+'));
+        press(&mut state, KeyCode::Enter);
+        assert!(
+            state.payoff_builder.committed().is_some(),
+            "the leg validates (its mark is present), even though pricing panics",
+        );
+        assert!(
+            state.payoff_builder.curve_compute_failed(),
+            "the contained upstream panic is recorded on the committed strategy",
+        );
+        state
+    }
+
     /// A live state whose FULL_A leg's only IV source is a sub-0.5% LOCAL inversion
     /// (tiny premiums + an absent chain IV) — the #27 SF-2 fixture where expiration
     /// renders but the t+0 curve is honestly unavailable.
@@ -1220,6 +1332,21 @@ mod tests {
             Ok(_) => {}
             Err(e) => panic!("payoff draw failed: {e}"),
         }
+    }
+
+    /// Draw the live payoff screen through the REAL projection path and return the
+    /// buffer as text, for the message assertions.
+    #[track_caller]
+    fn render_to_text(state: &LiveState, width: u16, height: u16) -> String {
+        let theme = Theme::resolve(ThemeChoice::Auto, false);
+        let payoff = projection(state);
+        let mut term = terminal(width, height);
+        let area = Rect::new(0, 0, width, height);
+        match term.draw(|frame| draw(state, &payoff, frame, area, theme)) {
+            Ok(_) => {}
+            Err(e) => panic!("payoff draw failed at {width}x{height}: {e}"),
+        }
+        crate::ui::golden::buffer_to_text(term.backend().buffer())
     }
 
     // --- `a` appends the focused leg, in order -------------------------------
@@ -1649,6 +1776,129 @@ mod tests {
             "no curve is fabricated for an unpriceable strategy",
         );
         render(&state, 80, 24); // the "curve unavailable" state renders without panic
+    }
+
+    // --- #131: the contained pricing panic renders its OWN honest message ------
+
+    #[test]
+    fn test_committed_compute_failed_renders_the_pricing_model_message() {
+        // The upstream pricing math panicked inside the off-draw geometry build; the
+        // panic was contained, so the screen must degrade to an honest state that says
+        // THE MODEL failed — never "needs marks and a future expiry", which would send a
+        // trader to fix inputs that are already fine, and never a fabricated curve.
+        // (The libtest default hook prints the caught panic to the captured stderr —
+        // expected noise, never a failure.)
+        let state = compute_failed_live_state();
+        assert!(
+            projection(&state).ready().is_none(),
+            "no curve is fabricated after a contained pricing panic",
+        );
+        let text = render_to_text(&state, 100, 24);
+        assert!(
+            text.contains("the pricing model failed on these legs"),
+            "the compute-failed message renders: {text:?}",
+        );
+        assert!(
+            !text.contains("needs marks and a future expiry"),
+            "a contained panic never claims the marks are missing: {text:?}",
+        );
+    }
+
+    #[test]
+    fn test_unpriceable_and_compute_failed_render_different_messages() {
+        // The two no-curve states stay DISTINGUISHABLE on screen: an expired chain says
+        // "needs marks and a future expiry", a contained pricing panic says the model
+        // failed. Collapsing them would be the dishonest outcome.
+        let mut expired = past_live_state();
+        focus(&mut expired, 0);
+        press(&mut expired, KeyCode::Char('a'));
+        press(&mut expired, KeyCode::Enter);
+        let expired_text = render_to_text(&expired, 100, 24);
+        assert!(
+            expired_text.contains("needs marks and a future expiry"),
+            "the unpriceable state keeps its own message: {expired_text:?}",
+        );
+        assert!(
+            !expired_text.contains("the pricing model failed"),
+            "an unpriceable strategy never claims the model failed: {expired_text:?}",
+        );
+        assert!(
+            !expired.payoff_builder.curve_compute_failed(),
+            "nothing panicked; the legs simply cannot be priced",
+        );
+    }
+
+    #[test]
+    fn test_compute_failed_message_wins_over_the_tplus0_no_iv_message() {
+        // On the t+0 curve the "no reliable IV" wording is the usual honest reason, but
+        // after a contained pricing panic it would be the WRONG fact — the compute-failed
+        // case is answered first.
+        let mut state = compute_failed_live_state();
+        state.payoff_builder.toggle_curve();
+        assert_eq!(state.payoff_builder.curve(), CurveMode::TPlus0);
+        let text = render_to_text(&state, 100, 24);
+        assert!(
+            text.contains("the pricing model failed on these legs"),
+            "the compute-failed message wins on the t+0 curve too: {text:?}",
+        );
+        assert!(
+            !text.contains("no reliable IV"),
+            "a contained panic is never reported as a missing IV: {text:?}",
+        );
+    }
+
+    #[test]
+    fn test_draw_live_payoff_states_render_at_the_shrunk_shapes() {
+        // The two shapes the #131 proptest shrank to (1x1 and 40x8), pinned
+        // DETERMINISTICALLY across every live builder state — including the new
+        // contained-pricing-panic one — so those cases no longer depend on a random
+        // draw. A 1x1 frame leaves a bordered block with a ZERO-area inner rect.
+        let committed = ic_committed_state();
+        let mut t0 = ic_committed_state();
+        t0.payoff_builder.toggle_curve();
+        let empty = live_state();
+        let mut partial = live_state();
+        focus(&mut partial, 0);
+        press(&mut partial, KeyCode::Char('a'));
+        let mut invalid = live_state();
+        focus(&mut invalid, 2); // the BARE strike: no mark -> validation fails
+        press(&mut invalid, KeyCode::Char('a'));
+        press(&mut invalid, KeyCode::Enter);
+        let mut unpriceable = past_live_state();
+        focus(&mut unpriceable, 0);
+        press(&mut unpriceable, KeyCode::Char('a'));
+        press(&mut unpriceable, KeyCode::Enter);
+        let compute_failed = compute_failed_live_state();
+        for (w, h) in [(1u16, 1u16), (40, 8)] {
+            for state in [
+                &committed,
+                &t0,
+                &empty,
+                &partial,
+                &invalid,
+                &unpriceable,
+                &compute_failed,
+            ] {
+                render(state, w, h);
+            }
+        }
+    }
+
+    /// A committed two-leg live state (both legs have marks) — the happy path for the
+    /// deterministic shape sweep.
+    #[track_caller]
+    fn ic_committed_state() -> LiveState {
+        let mut state = live_state();
+        focus(&mut state, 0);
+        press(&mut state, KeyCode::Char('a'));
+        focus(&mut state, 1);
+        press(&mut state, KeyCode::Char('a'));
+        press(&mut state, KeyCode::Enter);
+        assert!(
+            state.payoff_builder.committed().is_some(),
+            "both legs have marks, so the strategy commits",
+        );
+        state
     }
 
     #[test]
@@ -2745,6 +2995,163 @@ mod tests {
             );
         }
 
+        // --- #131: the contained pricing panic renders its OWN honest message ---
+
+        /// A `Ready` replay state whose cached payoff-at-head carries the
+        /// contained-pricing-panic state (#131). The state is staged through
+        /// `LoadedReplay::force_payoff_compute_failed` (a `#[cfg(test)]` seam) because no
+        /// valid `PositionRow` can drive the upstream panic — every money column is
+        /// bounded by the checked cents->`Positive` seam — so the PANEL's render of this
+        /// state cannot otherwise be pinned; the builder's own boundary test drives the
+        /// real panic through the production `build_with` path.
+        #[track_caller]
+        fn compute_failed_state() -> ReplayState {
+            let mut state = ready_state(vec![
+                position(0, 6_000_000, 'C', PositionSide::Long),
+                position(1, 6_000_000, 'C', PositionSide::Long),
+                position(2, 6_000_000, 'C', PositionSide::Long),
+            ]);
+            match &mut state.bundle {
+                crate::app::BundleLoad::Ready(loaded) => loaded.force_payoff_compute_failed(),
+                crate::app::BundleLoad::Loading | crate::app::BundleLoad::Error { .. } => {
+                    panic!("expected a Ready bundle")
+                }
+            }
+            state
+        }
+
+        #[test]
+        fn test_payoff_at_head_compute_failed_renders_the_pricing_model_message() {
+            // The open legs WERE priceable and the upstream model blew up on them, so
+            // the panel must say that — never "the open position could not be priced",
+            // and never a fabricated line.
+            let state = compute_failed_state();
+            let text = render_to_text(&state, 80, 24);
+            assert!(
+                text.contains("payoff curve unavailable"),
+                "the compute-failed headline renders: {text:?}",
+            );
+            assert!(
+                text.contains("the pricing model failed on these legs"),
+                "the compute-failed note renders: {text:?}",
+            );
+            assert!(
+                !text.contains("could not be priced"),
+                "a contained panic is never reported as unpriceable legs: {text:?}",
+            );
+        }
+
+        #[test]
+        fn test_payoff_at_head_unpriceable_and_compute_failed_differ() {
+            // The two no-curve states stay DISTINGUISHABLE on screen: an open set that
+            // cannot be priced keeps its own wording.
+            let unpriceable = ready_state(vec![position(2, 0, 'P', PositionSide::Short)]);
+            let text = render_to_text(&unpriceable, 80, 24);
+            assert!(
+                text.contains("payoff unavailable at this step"),
+                "the unpriceable state keeps its own headline: {text:?}",
+            );
+            assert!(
+                !text.contains("the pricing model failed"),
+                "an unpriceable open set never claims the model failed: {text:?}",
+            );
+        }
+
+        #[test]
+        fn test_draw_replay_states_render_at_the_shrunk_shapes() {
+            // The two shapes the #131 proptest shrank to (1x1 and 40x8), pinned
+            // DETERMINISTICALLY across every `state_idx` the property test draws (0..4)
+            // plus the contained-pricing-panic state, so those cases no longer depend on
+            // a random draw. A 1x1 frame leaves a bordered block with a ZERO-area inner
+            // rect.
+            for idx in 0..4u8 {
+                let state = replay_state_for(idx);
+                for (w, h) in [(1u16, 1u16), (40, 8)] {
+                    let _ = render_to_text(&state, w, h);
+                }
+            }
+            let failed = compute_failed_state();
+            for (w, h) in [(1u16, 1u16), (40, 8)] {
+                let _ = render_to_text(&failed, w, h);
+            }
+        }
+
+        /// The four replay payoff states the property test enumerates, by index:
+        /// `0` flat, `1` an open curve, `2` a degenerate open set, `3` still loading.
+        /// Shared with [`prop_draw_replay_never_panics`] so the deterministic shape
+        /// sweep and the property test cannot drift apart.
+        fn replay_state_for(state_idx: u8) -> ReplayState {
+            match state_idx {
+                0 => ready_state(Vec::new()), // flat
+                1 => ready_state(vec![
+                    position(0, 6_000_000, 'C', PositionSide::Long),
+                    position(1, 6_000_000, 'C', PositionSide::Long),
+                    position(2, 6_000_000, 'C', PositionSide::Long),
+                ]), // an open curve
+                2 => ready_state(vec![position(2, 0, 'P', PositionSide::Short)]), // degenerate
+                _ => {
+                    let mut s = ReplayState::new(PathBuf::from("/bundle/valid"));
+                    s.screen = ReplayScreen::Payoff;
+                    s // loading
+                }
+            }
+        }
+
+        // --- The #131 stress lever (ignored by default) --------------------------
+
+        #[test]
+        #[ignore = "stress lever for the #131 flake: cargo test --all-features -- --ignored"]
+        fn test_payoff_projections_stress_over_every_state() {
+            // A deliberate lever for the intermittent upstream panic (#131): rebuild and
+            // re-project BOTH payoff geometries — the live builder's commit path and the
+            // replay payoff-at-head — over every state, many times, and draw each one.
+            // Every build here is expected to succeed, so a `Positive invariant broken`
+            // panic printed by this test IS the flake reproducing; the containment
+            // boundary keeps it from killing the run, and the assertions below catch the
+            // resulting state change.
+            //
+            // The deliberately-panicking `compute_failed` fixture is EXCLUDED on purpose:
+            // its expected panic output would drown the signal this lever exists to find.
+            const ITERATIONS: usize = 250;
+            for _ in 0..ITERATIONS {
+                for idx in 0..4u8 {
+                    let state = replay_state_for(idx);
+                    if let Some(loaded) = state.loaded() {
+                        assert!(
+                            !loaded.payoff_head().curve_compute_failed(),
+                            "the replay payoff-at-head build panicked (the #131 flake)",
+                        );
+                    }
+                    let _ = render_to_text(&state, 80, 24);
+                }
+                let live = [
+                    super::ic_committed_state(),
+                    super::live_state(),
+                    super::subfloor_live_state(),
+                ];
+                for state in &live {
+                    assert!(
+                        !state.payoff_builder.curve_compute_failed(),
+                        "the live payoff geometry build panicked (the #131 flake)",
+                    );
+                    super::render(state, 80, 24);
+                }
+                // The t+0 tick reprice runs the same pricing math on the frozen basis.
+                let mut ticked = super::ic_committed_state();
+                let crate::app::LiveState {
+                    store,
+                    payoff_builder,
+                    ..
+                } = &mut ticked;
+                payoff_builder.refresh_tplus0(store);
+                assert!(
+                    !ticked.payoff_builder.curve_compute_failed(),
+                    "the t+0 reprice panicked (the #131 flake)",
+                );
+                super::render(&ticked, 80, 24);
+            }
+        }
+
         // --- render_never_panics over every replay payoff state -----------------
 
         proptest! {
@@ -2759,20 +3166,7 @@ mod tests {
                 width in 1u16..160,
                 height in 1u16..60,
             ) {
-                let state = match state_idx {
-                    0 => ready_state(Vec::new()), // flat
-                    1 => ready_state(vec![
-                        position(0, 6_000_000, 'C', PositionSide::Long),
-                        position(1, 6_000_000, 'C', PositionSide::Long),
-                        position(2, 6_000_000, 'C', PositionSide::Long),
-                    ]), // an open curve
-                    2 => ready_state(vec![position(2, 0, 'P', PositionSide::Short)]), // degenerate
-                    _ => {
-                        let mut s = ReplayState::new(PathBuf::from("/bundle/valid"));
-                        s.screen = ReplayScreen::Payoff;
-                        s // loading
-                    }
-                };
+                let state = replay_state_for(state_idx);
                 let theme = Theme::resolve(ThemeChoice::Auto, false);
                 let payoff = projection_of(&state);
                 let mut term = match Terminal::new(TestBackend::new(width, height)) {

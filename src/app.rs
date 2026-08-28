@@ -1392,6 +1392,11 @@ pub struct CommittedStrategy {
     tplus0: GraphData,
     /// The break-even underlying prices, read off the expiration series (#27).
     break_evens: Vec<Positive>,
+    /// Whether the last geometry build/reprice was abandoned because the upstream
+    /// `optionstratlib` pricing math **panicked** and the panic was contained (#131).
+    /// A DIFFERENT state from "these legs cannot be priced" (which leaves the geometry
+    /// empty with this flag clear), so the screen can say which one happened.
+    compute_failed: bool,
 }
 
 impl CommittedStrategy {
@@ -1434,14 +1439,25 @@ impl CommittedStrategy {
     /// the `store` snapshot, **off** the draw path. Leaves the geometry empty when
     /// the legs cannot be priced (a missing IV or a non-future expiry) — the
     /// screen then renders a deliberate "curve unavailable" state rather than a
-    /// fabricated line.
+    /// fabricated line — and records the DISTINCT contained-panic state (#131) when
+    /// the upstream pricing math blew up, which carries its own message. Exhaustive
+    /// over [`GeometryBuild`](payoff_build::GeometryBuild), no wildcard.
     fn populate_geometry(&mut self, store: &ChainStore) {
-        if let Some(geometry) = payoff_build::build_geometry(&self.legs, store) {
-            self.grid = geometry.grid;
-            self.entry_positions = geometry.entry_positions;
-            self.expiration = geometry.expiration;
-            self.tplus0 = geometry.tplus0;
-            self.break_evens = geometry.break_evens;
+        match payoff_build::build_geometry(&self.legs, store) {
+            payoff_build::GeometryBuild::Priced(geometry) => {
+                self.grid = geometry.grid;
+                self.entry_positions = geometry.entry_positions;
+                self.expiration = geometry.expiration;
+                self.tplus0 = geometry.tplus0;
+                self.break_evens = geometry.break_evens;
+                self.compute_failed = false;
+            }
+            // The legs cannot be priced: the geometry stays empty and the flag stays
+            // clear, so the screen keeps its "needs marks and a future expiry" message.
+            payoff_build::GeometryBuild::NotPriceable => self.compute_failed = false,
+            // The upstream pricing math panicked (contained, #131): the geometry stays
+            // empty AND the screen says the model failed, never "add a mark".
+            payoff_build::GeometryBuild::ComputeFailed => self.compute_failed = true,
         }
     }
 
@@ -1456,14 +1472,31 @@ impl CommittedStrategy {
         if self.grid.is_empty() {
             return false;
         }
-        let series =
-            payoff_build::rebuild_tplus0(&self.legs, store, &self.grid, &self.entry_positions);
-        if series != self.tplus0 {
-            self.tplus0 = series;
-            true
-        } else {
-            false
-        }
+        // Exhaustive over [`TPlus0Build`](payoff_build::TPlus0Build), no wildcard: a
+        // contained upstream panic (#131) drops the now-stale curve AND raises the
+        // compute-failed flag, so the screen never keeps painting a curve whose reprice
+        // blew up. A later successful reprice clears the flag again.
+        let (series, compute_failed) = match payoff_build::rebuild_tplus0(
+            &self.legs,
+            store,
+            &self.grid,
+            &self.entry_positions,
+        ) {
+            payoff_build::TPlus0Build::Series(series) => (series, false),
+            payoff_build::TPlus0Build::ComputeFailed => (payoff_build::empty_series(), true),
+        };
+        let changed = series != self.tplus0 || compute_failed != self.compute_failed;
+        self.tplus0 = series;
+        self.compute_failed = compute_failed;
+        changed
+    }
+
+    /// Whether the cached geometry is missing because the upstream pricing math
+    /// **panicked** (contained, #131) rather than because the legs could not be
+    /// priced — the two states carry different messages on the payoff screen.
+    #[must_use]
+    fn curve_compute_failed(&self) -> bool {
+        self.compute_failed
     }
 }
 
@@ -1628,6 +1661,20 @@ impl PayoffBuilder {
     pub fn has_expiration_curve(&self) -> bool {
         match self.committed.as_ref() {
             Some(committed) => committed.has_expiration_curve(),
+            None => false,
+        }
+    }
+
+    /// Whether the committed strategy has no curve because the upstream
+    /// `optionstratlib` pricing math **panicked** and the panic was contained
+    /// (#131) — as opposed to the legs simply not being priceable, which leaves this
+    /// `false`. `false` while nothing is committed. The payoff screen reads it to
+    /// render the honest "the pricing model failed on these legs" state instead of
+    /// telling a trader to fix marks that are already there.
+    #[must_use]
+    pub fn curve_compute_failed(&self) -> bool {
+        match self.committed.as_ref() {
+            Some(committed) => committed.curve_compute_failed(),
             None => false,
         }
     }
@@ -1853,6 +1900,9 @@ impl PayoffBuilder {
                 expiration: payoff_build::empty_series(),
                 tplus0: payoff_build::empty_series(),
                 break_evens: Vec::new(),
+                // No build has run yet, so nothing has panicked: the pricing-failed
+                // state is only ever set by [`populate_geometry`] / [`refresh_tplus0`].
+                compute_failed: false,
             })
         } else {
             Err(errors)
@@ -2498,6 +2548,10 @@ pub struct ReplayPayoffHead {
     mark_pnl_cents: Option<i64>,
     /// The number of open legs at the head (`0` ⇒ the "flat at this step" state).
     open_legs: usize,
+    /// Whether the curve is missing because the upstream `optionstratlib` pricing math
+    /// **panicked** and the panic was contained (#131) — a DIFFERENT state from "the
+    /// open legs could not be priced", which leaves this `false`.
+    curve_compute_failed: bool,
 }
 
 impl ReplayPayoffHead {
@@ -2519,6 +2573,17 @@ impl ReplayPayoffHead {
     #[must_use]
     pub fn open_legs(&self) -> usize {
         self.open_legs
+    }
+
+    /// Whether the payoff-at-head curve is missing because the upstream
+    /// `optionstratlib` pricing math **panicked** and the panic was contained
+    /// (#131) — as opposed to the open legs simply not being priceable, which leaves
+    /// this `false`. The panel reads it to render the honest "the pricing model
+    /// failed on these legs" state; the open-leg count and the mark P&L above stay
+    /// truthful either way (they never enter the pricing math).
+    #[must_use]
+    pub fn curve_compute_failed(&self) -> bool {
+        self.curve_compute_failed
     }
 }
 
@@ -2630,6 +2695,28 @@ impl LoadedReplay {
         let (graph, head) = build_payoff_at_head(&self.cursor, &self.bundle);
         self.payoff_graph = graph;
         self.payoff_head = head;
+        self.payoff_revision = self.payoff_revision.checked_add(1).unwrap_or(0);
+    }
+
+    /// Put the cached payoff-at-head into the **contained-panic** state (#131): the
+    /// empty curve plus the compute-failed flag, exactly as
+    /// [`build_payoff_at_head`] produces it from
+    /// [`ReplayCurve::ComputeFailed`](replay_payoff_build::ReplayCurve::ComputeFailed).
+    /// The header figures are left untouched, because a panicking curve build never
+    /// touches them.
+    ///
+    /// `#[cfg(test)]` — and deliberately the ONLY test-only seam in this change —
+    /// because no valid `PositionRow` can drive the upstream panic (every money column
+    /// is bounded by the checked cents→`Positive` seam, see
+    /// [`replay_payoff_build::build_with`]), so the panel's render of this state cannot
+    /// otherwise be pinned by a `TestBackend` test. The builder's own boundary test
+    /// drives the real panic through the production `build_with` path; this only
+    /// stages the resulting state for the render assertion.
+    #[cfg(test)]
+    pub(crate) fn force_payoff_compute_failed(&mut self) {
+        self.payoff_graph = payoff_build::empty_series();
+        self.payoff_head.break_evens = Vec::new();
+        self.payoff_head.curve_compute_failed = true;
         self.payoff_revision = self.payoff_revision.checked_add(1).unwrap_or(0);
     }
 
@@ -2750,6 +2837,11 @@ fn selection_key(selection: Option<&Fill>) -> Option<(u32, u64, u32)> {
 /// never a per-frame call) and build the cached payoff-at-head geometry from it (#49):
 /// the expiration payoff `GraphData::Series` and the header figures. Off the draw
 /// path — run only on load and on a cursor move.
+///
+/// Exhaustive over [`ReplayCurve`](replay_payoff_build::ReplayCurve) with no wildcard:
+/// a contained upstream panic (#131) yields the empty series AND raises the panel's
+/// compute-failed flag, so the "the pricing model failed" state stays distinguishable
+/// from the honest "these legs could not be priced" one.
 #[must_use]
 fn build_payoff_at_head(
     cursor: &TimelineCursor,
@@ -2758,12 +2850,21 @@ fn build_payoff_at_head(
     let open = cursor.open_positions(bundle);
     let head_ts_ns = cursor.head_equity(bundle).map(|point| point.ts_ns);
     let geometry = replay_payoff_build::build(&open, head_ts_ns);
+    let (graph, break_evens, curve_compute_failed) = match geometry.curve {
+        replay_payoff_build::ReplayCurve::Priced { graph, break_evens } => {
+            (graph, break_evens, false)
+        }
+        replay_payoff_build::ReplayCurve::ComputeFailed => {
+            (payoff_build::empty_series(), Vec::new(), true)
+        }
+    };
     let head = ReplayPayoffHead {
-        break_evens: geometry.break_evens,
+        break_evens,
         mark_pnl_cents: geometry.mark_pnl_cents,
         open_legs: geometry.open_legs,
+        curve_compute_failed,
     };
-    (geometry.graph, head)
+    (graph, head)
 }
 
 // ---------------------------------------------------------------------------
