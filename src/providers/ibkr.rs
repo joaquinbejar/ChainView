@@ -372,15 +372,24 @@ pub(crate) fn ibkr_capabilities() -> ProviderCapabilities {
         .build()
 }
 
-/// Validate a `host:port` endpoint shape (bounded): a non-empty host, a `:`, and a
-/// `u16` port. Rejects anything else so a malformed endpoint fails startup rather
-/// than reaching [`Client::connect`](ibapi::Client::connect). A trailing path or a
-/// non-numeric port lands in the port half and is rejected there.
+/// Validate a `host:port` endpoint shape (bounded): a non-empty host free of `/`
+/// and `@`, a `:`, and a `u16` port. Rejects anything else so a malformed endpoint
+/// fails startup rather than reaching [`Client::connect`](ibapi::Client::connect).
+///
+/// The host half is checked for `/` and `@` because the split takes the LAST `:`,
+/// so a trailing path (`127.0.0.1:7497/a:80`), userinfo
+/// (`user:pass@host:7497`), or a doubled scheme (`tcp://127.0.0.1:7497` arriving as
+/// the authority) would otherwise land in the host half and pass. A `:` in the host
+/// is allowed — an IPv6 authority is `[::1]:7497`.
 fn is_valid_endpoint(endpoint: &str) -> bool {
     let Some((host, port)) = endpoint.rsplit_once(':') else {
         return false;
     };
-    !host.is_empty() && !port.is_empty() && port.parse::<u16>().is_ok()
+    !host.is_empty()
+        && !host.contains('/')
+        && !host.contains('@')
+        && !port.is_empty()
+        && port.parse::<u16>().is_ok()
 }
 
 /// Normalize a configured endpoint to the bare `host:port` [`Client::connect`](ibapi::Client::connect)
@@ -393,7 +402,9 @@ fn is_valid_endpoint(endpoint: &str) -> bool {
 /// provider's endpoint as `scheme://host`, and this adapter, which needs a socket
 /// address. Stripping the scheme here lets one value satisfy both, so
 /// `--provider ibkr` starts (issue #120 follow-up). Returns `None` for a malformed
-/// value (bad scheme, empty authority, non-`u16` port, trailing path).
+/// value: a bad scheme, an empty authority, a non-`u16` port, or an authority
+/// carrying a path, userinfo, or a second `://` (all rejected outright by
+/// [`is_valid_endpoint`], never handed on to `Client::connect`).
 fn normalize_endpoint(raw: &str) -> Option<String> {
     let socket = match raw.split_once("://") {
         Some((scheme, authority)) => {
@@ -2064,6 +2075,10 @@ mod tests {
         assert!(!is_valid_endpoint("host:"));
         assert!(!is_valid_endpoint("host:notaport"));
         assert!(!is_valid_endpoint("host:99999999"));
+        assert!(!is_valid_endpoint("127.0.0.1:7497/a:80"));
+        assert!(!is_valid_endpoint("user:pass@host:7497"));
+        // An IPv6 authority keeps its colons in the host half.
+        assert!(is_valid_endpoint("[::1]:7497"));
     }
 
     #[test]
@@ -2101,6 +2116,13 @@ mod tests {
         assert_eq!(normalize_endpoint("tcp://127.0.0.1:7497/path"), None);
         assert_eq!(normalize_endpoint("tcp://host:notaport"), None);
         assert_eq!(normalize_endpoint("no-port"), None);
+        // The split takes the LAST `:`, so these three used to slip through into
+        // TcpStream::connect: a path whose own colon hides the port, userinfo, and
+        // a doubled scheme (split_once("://") grabs the first). The host half is
+        // now screened for `/` and `@`, so each fails at startup instead.
+        assert_eq!(normalize_endpoint("tcp://127.0.0.1:7497/a:80"), None);
+        assert_eq!(normalize_endpoint("tcp://user:pass@host:7497"), None);
+        assert_eq!(normalize_endpoint("tcp://tcp://127.0.0.1:7497"), None);
     }
 
     #[test]
