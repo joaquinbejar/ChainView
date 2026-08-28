@@ -18,7 +18,7 @@
 #![allow(dead_code)]
 // SHA-256's message schedule and working variables are inherently index-addressed;
 // a `.get()`-everywhere rewrite would obscure a standard, verified algorithm. The
-// bounds are all compile-time-fixed (`[u32; 64]`, `chunks_exact(64)`), so no index
+// bounds are all compile-time-fixed (`[u32; 64]`, `as_chunks::<64>()`), so no index
 // is attacker-influenced. Scoped to this hasher module only.
 #![allow(clippy::indexing_slicing)]
 

@@ -25,7 +25,14 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   payoff break-even and spot markers exactly ON the zero-P&L line instead of one
   row above it. Every golden keeps identical text, labels and line count — only
   plot glyphs moved. The MSRV is unchanged (ratatui 0.30 needs 1.88; ours is
-  1.94).
+  1.94). The split widens the LOCKFILE surface without widening the build:
+  `Cargo.lock` is feature-agnostic, so it gains ~43 packages for ratatui's other
+  backends and its optional `palette` support (`ratatui-termwiz`/
+  `ratatui-termina`, `termwiz`, `termina`, `terminfo`, `vtparse`, the `wezterm-*`
+  family, `pest*`, `palette*`, plus a second `bitflags` at 1.3.2). No ChainView
+  feature enables any of them, so none is compiled, linked or reachable —
+  `cargo tree --all-features -i ratatui-termwiz` prints nothing — and
+  `cargo deny check` is clean on the resolved graph.
 
 - **`tests/common/sha256.rs` uses `as_chunks::<64>()`** (issue #130). clippy 1.98
   added `clippy::chunks_exact_to_as_chunks`, which fires on the `chunks_exact(64)`

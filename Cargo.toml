@@ -196,6 +196,17 @@ tokio-util = { version = "0.7", default-features = false }
 # `crossterm` is pinned to that same `0.29` line so cargo unifies to a single
 # instance: the crossterm ChainView calls is exactly the one ratatui drives (no
 # two-version mismatch).
+# LOCKFILE SURFACE, not build surface: `Cargo.lock` is feature-agnostic, so the
+# 0.30 split adds ~43 packages for ratatui's OTHER backends and its optional
+# `palette` colour support — `ratatui-termwiz`/`ratatui-termina`, `termwiz`,
+# `termina`, `terminfo`, `termios`, `vtparse`, the `wezterm-*` family, `pest*`,
+# `palette*` — plus a second `bitflags` (1.3.2) underneath them. ChainView enables
+# none of those features (`ratatui` defaults are all-widgets/crossterm/
+# layout-cache/macros/underline-color), so none is compiled, linked or reachable:
+# `cargo tree --all-features -i ratatui-termwiz` (or `-i termina`, `-i pest`,
+# `-i palette`) prints nothing, exactly like the rkyv case documented in
+# deny.toml. The duplicate `bitflags` is covered by `multiple-versions = "warn"`
+# (deny.toml [bans]); `cargo deny check licenses` is clean on the RESOLVED graph.
 ratatui = { version = "0.30", features = ["crossterm"] }
 crossterm = "0.29"
 # The Deribit REST client (issue #15, the zero-config poll leg — ADR-0003). Wraps
