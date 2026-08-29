@@ -11,7 +11,12 @@ repository = "https://github.com/joaquinbejar/ChainView"
 homepage = "https://github.com/joaquinbejar/ChainView"
 keywords = ["finance", "options", "tui", "terminal", "trading"]
 categories = ["finance", "command-line-utilities"]
-include = ["src/**/*", "Cargo.toml", "README.md", "LICENSE"]
+# Anchored with a leading `/`: an `include` pattern is gitignore-style, so an
+# UNANCHORED `README.md` matches at ANY depth and swept the internal design
+# tree into the tarball (`docs/README.md`, `docs/specs/README.md` and the six
+# `milestones/*/README.md`) even though both directories are gitignored and
+# deliberately unpublished. Verified with `cargo package --list`.
+include = ["/src/**/*", "/Cargo.toml", "/README.md", "/LICENSE"]
 
 # `cargo binstall` packaging (issue #58, docs/RELEASE-PROCESS.md). These keys let
 # `cargo binstall chainview` resolve the prebuilt binary attached to the GitHub

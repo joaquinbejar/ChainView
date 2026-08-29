@@ -28,6 +28,74 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [0.1.0] - 2026-08-29
 
+The first release with an implementation behind it. `v0.0.1` reserved the crate
+name and carried no code; everything below is new.
+
+### Added
+
+- **Live mode.** Real-time option chains, Greeks and volatility surfaces streamed
+  through provider adapters. `chainview` with no arguments opens on a Deribit BTC
+  chain — the public endpoints need no credentials, so a stock install works with
+  no configuration at all.
+- **Replay mode.** `chainview replay <dir>` renders an IronCondor backtest result
+  bundle read-only: equity curve, P&L attribution by Greek, per-fill drill-down
+  and the payoff of the position at the scrub head. No network.
+- **Five screens.** The strike matrix (bid/ask/mark, IV and Greeks per call and
+  put, with a leg drill-down), the order-book depth ladder, an in-terminal
+  multi-leg payoff builder with expiration and t+0 curves and break-evens, the
+  vol smile / Greek curve / single-expiry surface, and the replay dashboard. `?`
+  opens a help overlay generated from the same keybinding map the app routes on,
+  so a bound key can never go undocumented.
+- **Six provider adapters.** `deribit` (default, no credentials), `alpaca`, `ig`
+  and `ibkr` ship behind dependency-weight feature flags; `tastytrade` and
+  `dxlink` are compiled but deliberately **never registered** while their
+  upstream credential-logging security gate holds — enabling one is a typed
+  startup error, never a silent activation.
+- **A public, semver-governed provider port.** `chainview` is a binary *and* a
+  library: the `Provider` trait, the `ProviderCapabilities` self-declaration and
+  every normalized type the trait emits are re-exported from the crate root, so
+  an external developer registers their own venue from a thin binary
+  (`ChainViewApp::builder().with_builtins().register(MyBroker::new()).run()`)
+  with no fork. A reserved or duplicate id is a typed startup error.
+
+### Guarantees this release commits to
+
+- **The terminal is always restored** — a normal quit, an early error, or a
+  panic. A panic hook restores before the default hook prints, and the
+  supervisor cancels every task before teardown so nothing writes to a
+  torn-down screen. Proven by a subprocess harness, not by inspection.
+- **The draw path does no I/O and never `.await`s.** Frames are a pure function
+  of app state; provider tasks push updates over bounded, coalescing channels, so
+  a slow venue can neither freeze a frame nor grow memory without bound.
+- **Capabilities are honest.** Every adapter declares what its upstream actually
+  backs, the UI gates screens off that declaration rather than off the provider
+  id, and a screen a provider cannot feed renders an explicit unavailable state.
+  No fabricated data, no zero-filled book, no invented Greek.
+- **Credentials are environment-only** — never logged, never accepted from a
+  config file, never echoed in an error, and redacted in `Debug`.
+- **Colour is never the only signal**, and `NO_COLOR` is honoured.
+- `#![forbid(unsafe_code)]`, MSRV 1.94, `cargo audit` + `cargo deny` in CI.
+
+### Known limits
+
+- The `tastytrade` and `dxlink` adapters do not ship (see above).
+- Depth is instrument-scoped: verified on Deribit options, crypto-spot only on
+  Alpaca, unverified on IG.
+- Performance numbers in the design docs are design targets, not measured
+  benchmarks, until the bench suite lands.
+- Upstream `optionstratlib` pricing can still panic on pathological inputs; it is
+  contained at the build seam and degrades to an explicit "curve unavailable"
+  state rather than taking the terminal down (issue #131 tracks the root cause).
+
+---
+
+## [0.1.0-dev] - the per-issue development log
+
+Not a released version. These are the per-issue entries accumulated while 0.1.0
+was built, kept verbatim because they carry the reasoning behind decisions the
+summary above only states. Read the section above for what shipped; read this one
+for why it was built that way.
+
 ### Changed
 
 - **Every dependency refreshed to its latest stable, pinned as `X.X`** — and the
