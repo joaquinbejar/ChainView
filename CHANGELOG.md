@@ -4,13 +4,29 @@ All notable changes to `chainview` are documented in this file.
 
 The format follows [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
-(the full versioning policy lives in the design docs, local until v0.1.0).
+(the full versioning policy lives in the design docs).
 
-> **Status:** `v0.0.1` is a crates.io name reservation — no implementation
-> code exists yet. The first real entries land with the v0.1 work from the
-> roadmap (local during the design phase).
+> **Status:** `v0.1.0` is the first version with an implementation behind it —
+> Live and Replay modes, five screens and six provider adapters, two of them
+> deliberately withheld on an upstream security gate. `v0.0.1` was a crates.io
+> name reservation and carried no code; every entry under it describes design
+> work, not shipped behaviour.
 
 ## [Unreleased]
+
+### Added
+
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.1.0] - 2026-08-29
 
 ### Changed
 
