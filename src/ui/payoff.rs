@@ -485,7 +485,7 @@ fn style_glyph(style: OptionStyle) -> &'static str {
 /// Format a strike, trailing zeros stripped, or `—` for the non-finite sentinel.
 #[must_use]
 fn fmt_strike(strike: Positive) -> String {
-    if strike == Positive::INFINITY {
+    if strike == Positive::MAX {
         return EM_DASH.to_owned();
     }
     format!("{}", strike.round_to(2))
@@ -497,7 +497,7 @@ fn fmt_strike(strike: Positive) -> String {
 #[must_use]
 fn fmt_price(value: Option<Positive>) -> String {
     match value {
-        Some(price) if price != Positive::INFINITY => format!("{price:.2}"),
+        Some(price) if price != Positive::MAX => format!("{price:.2}"),
         _ => EM_DASH.to_owned(),
     }
 }
@@ -1100,7 +1100,7 @@ mod tests {
 
     /// An absurd but **finite** `Positive` provider mark — half of `Decimal::MAX`, so
     /// three contracts of it overflow the upstream cost basis. Deliberately NOT
-    /// `Positive::INFINITY` (which IS `Decimal::MAX`): the mark-honesty filter treats
+    /// `Positive::MAX` (which IS `Decimal::MAX`): the mark-honesty filter treats
     /// that sentinel as "no mark", which would exercise the unpriceable path instead.
     #[track_caller]
     fn huge_positive() -> Positive {

@@ -347,7 +347,7 @@ const WHOLE_DECIMALS: usize = 2;
 const MAX_DECIMALS: usize = 8;
 
 /// Format a `Positive` price/size with **venue-scale-aware** precision (issue #109,
-/// #118), guarding the non-finite [`Positive::INFINITY`] sentinel to `—` so it never
+/// #118), guarding the non-finite [`Positive::MAX`] sentinel to `—` so it never
 /// paints (rule: guard `f64` `NaN`/`Inf` before a widget).
 ///
 /// The decimal count scales to the value's magnitude: a value `>= 1` renders at the
@@ -359,7 +359,7 @@ const MAX_DECIMALS: usize = 8;
 /// value stays the exact `Positive` the venue supplied.
 #[must_use]
 fn fmt_num(value: Positive) -> String {
-    if value == Positive::INFINITY {
+    if value == Positive::MAX {
         return EM_DASH.to_owned();
     }
     let places = price_decimals(value.to_dec());
@@ -391,7 +391,7 @@ fn price_decimals(value: Decimal) -> usize {
 /// with checked [`Decimal`] arithmetic so it never panics.
 #[must_use]
 fn fmt_spread(ask: Positive, bid: Positive) -> String {
-    if ask == Positive::INFINITY || bid == Positive::INFINITY {
+    if ask == Positive::MAX || bid == Positive::MAX {
         return EM_DASH.to_owned();
     }
     match ask.to_dec().checked_sub(bid.to_dec()) {
@@ -1125,7 +1125,7 @@ mod tests {
     fn test_fmt_spread_guards_crossed_and_infinite() {
         assert_eq!(fmt_spread(pos(60_010.0), pos(60_000.0)), "10.00");
         assert_eq!(fmt_spread(pos(60_000.0), pos(60_010.0)), "—", "crossed → —");
-        assert_eq!(fmt_spread(Positive::INFINITY, pos(1.0)), "—", "inf → —");
+        assert_eq!(fmt_spread(Positive::MAX, pos(1.0)), "—", "inf → —");
         // #118: a sub-unit spread (0.06 − 0.05 = 0.01, scale 2) renders at its own
         // decimal scale, keeping its tradeable digits.
         assert_eq!(fmt_spread(posd(6, 2), posd(5, 2)), "0.01");
@@ -1150,7 +1150,7 @@ mod tests {
         );
         assert_eq!(fmt_num(pos(1.0)), "1.00", "at 1.0 → cents");
         assert_eq!(fmt_num(pos(60_000.0)), "60000.00", "index scale → cents");
-        assert_eq!(fmt_num(Positive::INFINITY), "—", "non-finite → em dash");
+        assert_eq!(fmt_num(Positive::MAX), "—", "non-finite → em dash");
     }
 
     #[test]
