@@ -26,6 +26,24 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Security
 
+## [0.1.1] - 2026-08-29
+
+No functional change: the tree is byte-identical to `0.1.0` apart from the
+version. This patch exists to cut a release **end to end through the
+tag-triggered workflow**, which `0.1.0` could not do.
+
+`0.1.0` was published by hand from a maintainer machine because the repository
+had no `CRATES_IO_TOKEN` secret, so the workflow's `publish` job could not run
+and the `release` job that depends on it never fired — leaving `v0.1.0` as a tag
+with no GitHub Release and no downloadable assets, and therefore nothing for
+`cargo binstall` to discover. The secret now exists, so this tag exercises the
+full path: build the four platform archives, smoke each binary, `cargo publish`,
+then create the Release with notes extracted from this section and every archive
+attached.
+
+If you are choosing a version, `0.1.1` is the one to take: same code, and the
+only one with installable release assets.
+
 ## [0.1.0] - 2026-08-29
 
 The first release with an implementation behind it. `v0.0.1` reserved the crate
