@@ -1,6 +1,6 @@
 [package]
 name = "chainview"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.94"
 authors = ["Joaquin Bejar <jb@taunais.com>"]
