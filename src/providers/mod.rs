@@ -106,9 +106,12 @@ pub(crate) mod dxfeed_decode;
 
 /// The tastytrade adapter — the poll->stream merge provider (issue #40,
 /// `docs/03-data-providers.md` §7.2). Behind the DISABLED-by-default `tastytrade`
-/// Cargo feature and **excluded from `with_builtins()`**: the published
-/// `tastytrade` 0.3.0 (the checksum-pinned artifact ChainView resolves) logs
-/// credential material at `DEBUG` (`docs/SECURITY.md` §2.1), so it is reachable only through
+/// Cargo feature and **excluded from `with_builtins()`**: the gate was raised
+/// against `tastytrade` 0.3.0, which logged credential material at `DEBUG`
+/// (`docs/SECURITY.md` §2.1), and it still HOLDS on the currently resolved 0.4 —
+/// the dependency refresh reworked the API surface, it did not run the
+/// captured-log audit that lifts a gate (see the module docs of
+/// `providers::tastytrade`). So the adapter is reachable only through
 /// the explicit `with_gated_builtin(id)` opt-in, which fails with a typed startup
 /// error while the gate holds — a stock binary can never execute that logging
 /// (`docs/SECURITY.md` §2/§3). Crate-internal: no raw `tastytrade` DTO crosses the
@@ -519,8 +522,15 @@ pub enum AuthKind {
     Token,
     /// An API key + secret pair (Alpaca).
     KeySecret,
-    /// A username + password (IG, tastytrade).
+    /// A username + password (IG).
     UserPass,
+    /// An OAuth2 grant driven by a client secret + a long-lived refresh token
+    /// (tastytrade, since its 0.4 client dropped the password login when the
+    /// venue decommissioned `POST /sessions`). Distinct from
+    /// [`KeySecret`](Self::KeySecret): neither half is an API key, and the
+    /// refresh token is exchanged for a short-lived access token per session
+    /// rather than sent as the credential itself.
+    OAuth,
 }
 
 /// One underlying a provider offers, with its expirations where the provider

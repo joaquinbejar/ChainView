@@ -108,7 +108,7 @@ fn test_tastytrade_row_reconciles_with_section_8() {
         underlying_stream: false,
         chain_poll: true,
         trades_tape: false,
-        auth: AuthKind::UserPass,
+        auth: AuthKind::OAuth,
     };
     assert_row(
         crate::providers::tastytrade::tastytrade_capabilities(),

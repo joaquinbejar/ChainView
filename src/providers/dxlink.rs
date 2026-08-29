@@ -417,6 +417,20 @@ impl DxlinkTransport for LiveTransport {
 /// Map a raw DXLink `MarketEvent` onto the neutral [`RawDxEvent`] — the one place a
 /// raw upstream event is touched (it never escapes [`LiveTransport`]). DXLink sizes
 /// are `f64` and there is no venue time field.
+///
+/// # Only the two subscribed kinds are consumed
+///
+/// The adapter subscribes exactly `Quote` + `Greeks` (see
+/// [`feed_subscriptions`]), which is what the `ChainQuotes` / `Provided`
+/// capability cells claim, so those two are the only variants that normalize.
+/// `dxlink 0.3` widened `MarketEvent` from three variants to eleven
+/// (`TradeETH`, `Summary`, `Candle`, `TimeAndSale`, `Profile`, `Underlying`,
+/// `Series`, `TheoPrice` joined `Trade`); none of them is a top-of-book quote or
+/// a per-contract Greeks row, and this adapter declares `trades_tape: false`, so
+/// every one of them takes the **existing** [`RawDxEvent::Ignored`] path rather
+/// than an invented normalization. A kind that was never subscribed should not
+/// arrive at all — if one does (a shared channel, a venue that over-delivers), it
+/// is dropped, never folded into the chain.
 fn map_market_event(event: MarketEvent) -> RawDxEvent {
     match event {
         MarketEvent::Quote(quote) => RawDxEvent::Quote {
@@ -435,7 +449,10 @@ fn map_market_event(event: MarketEvent) -> RawDxEvent {
             rho: greeks.rho,
             volatility: greeks.volatility,
         },
-        MarketEvent::Trade(_) => RawDxEvent::Ignored,
+        // Not subscribed, not overlaid: Trade / TradeETH / Summary / Candle /
+        // TimeAndSale / Profile / Underlying / Series / TheoPrice, plus anything
+        // a later `dxlink` release adds.
+        _ => RawDxEvent::Ignored,
     }
 }
 
@@ -1044,6 +1061,32 @@ mod tests {
             price: 1.6,
             size: 3.0,
             day_volume: 100.0,
+        }));
+        assert!(matches!(ev, RawDxEvent::Ignored));
+    }
+
+    #[test]
+    fn test_map_market_event_unsubscribed_kind_is_ignored() {
+        // `dxlink 0.3` widened `MarketEvent` to eleven kinds. This adapter
+        // subscribes only Quote + Greeks, so an unsubscribed kind that reached
+        // the receiver anyway is DROPPED — never normalized into a quote or a
+        // Greeks row it is not (the capability cells stay honest).
+        let ev = map_market_event(MarketEvent::TradeETH(dxlink::events::TradeETHEvent {
+            event_type: "TradeETH".to_owned(),
+            event_symbol: DX_SYMBOL.to_owned(),
+            event_time: 0,
+            time: 0,
+            time_nano_part: 0,
+            sequence: 0,
+            exchange_code: "Q".to_owned(),
+            price: 1.6,
+            change: 0.0,
+            size: 3.0,
+            day_id: 20_665,
+            day_volume: 100.0,
+            day_turnover: 160.0,
+            tick_direction: "UNDEFINED".to_owned(),
+            extended_trading_hours: true,
         }));
         assert!(matches!(ev, RawDxEvent::Ignored));
     }

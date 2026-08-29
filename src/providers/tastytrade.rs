@@ -10,37 +10,52 @@
 //!
 //! # The gate — credential logging upstream (`docs/SECURITY.md` §2)
 //!
-//! The published `tastytrade` 0.3.0 — the checksum-pinned artifact ChainView
-//! actually resolves (`Cargo.lock`) — logs credential material at `DEBUG` in four
-//! sites (`docs/SECURITY.md` §2.1):
-//!
-//! - `src/api/client.rs` `login` — `debug!("{creds:?}")` of the `LoginResponse`
-//!   (carries the `session_token`);
-//! - `src/api/client.rs` `create_quote_streamer` / `quote_streamer.rs` — the
-//!   session/DXLink token paths;
-//! - `src/api/quote_streaming.rs` — the raw quote-token response body.
+//! The gate was raised against `tastytrade` 0.3.0, which logged credential
+//! material at `DEBUG` in four sites (`docs/SECURITY.md` §2.1): the `login`
+//! `debug!("{creds:?}")` of the `LoginResponse` (carrying the `session_token`),
+//! the `create_quote_streamer` / `quote_streamer.rs` session/DXLink token paths,
+//! and the raw quote-token response body in `src/api/quote_streaming.rs`.
 //!
 //! ChainView does **not** modify that repo. Instead the whole adapter sits behind
 //! the DISABLED-by-default `tastytrade` Cargo feature and is **excluded from
 //! `with_builtins()`**; it is reachable only via the explicit `with_gated_builtin`
 //! opt-in, which returns a typed startup error while the gate holds. So a stock
 //! binary can **never** execute the upstream's logging — the credential guarantee
-//! holds **by construction**, not author discipline (`docs/SECURITY.md` §3). The
-//! gate lifts only when an upstream release redacts all four paths, a captured-log
-//! test proves it, and the matrix cell flips in the same PR (**tastytrade#... — the
-//! upstream redaction issue**, `docs/SECURITY.md` §2.3).
+//! holds **by construction**, not author discipline (`docs/SECURITY.md` §3).
 //!
-//! # Auth is injected programmatically (no dotenv, no foreign env namespace)
+//! **The gate REMAINS IN FORCE on `tastytrade` 0.4.** The dependency refresh that
+//! moved this adapter from 0.3 to 0.4 reworked the API surface only; it did **not**
+//! perform the audit that lifts the gate. Lifting is a separate, deliberate change
+//! that must, in ONE PR: re-audit every credential-adjacent log site of the pinned
+//! artifact, land a captured-log test at the ChainView boundary proving no
+//! credential reaches the sink (the shape the `alpaca` gate lift used,
+//! `docs/SECURITY.md` §2.4), and flip the matrix cell. Until that happens the
+//! adapter stays gated and `with_gated_builtin` keeps recording
+//! `RegistryError::Gated` — nothing here becomes live by a version bump.
 //!
-//! Unlike a crate that hardcodes its own env/file loading, `TastyTradeConfig` has
-//! **all-public fields**, so [`login`](TastytradeAdapter::login) builds it as a
-//! struct literal from ChainView-namespaced `CHAINVIEW_TASTYTRADE_*` env vars and
-//! calls [`TastyTrade::login`] directly. It never calls `TastyTradeConfig::from_env`
-//! / `::new` / `::default` (which would read the foreign `TASTYTRADE_*` namespace,
-//! load a `.env` file, AND install a `tracing` subscriber via
-//! `setup_logger_with_level`) — so ChainView owns its own tracing sink and the
+//! # Auth is OAuth2, injected programmatically (no dotenv, no foreign env namespace)
+//!
+//! tastytrade decommissioned `POST /sessions` on 2026-02-11, so `tastytrade` 0.4
+//! has **no password login**: `TastyTradeConfig` carries a `client_secret` +
+//! `refresh_token` pair (the personal refresh-token grant) instead of
+//! `username`/`password`/`remember_me`, and [`TastyTrade::connect`] replaces the
+//! removed `TastyTrade::login`.
+//!
+//! `TastyTradeConfig` still has **all-public fields**, so
+//! [`connect`](TastytradeAdapter::connect) builds it as a struct literal from
+//! ChainView-namespaced `CHAINVIEW_TASTYTRADE_*` env vars and calls
+//! [`TastyTrade::connect`] directly. It never calls `TastyTradeConfig::from_env`
+//! / `::new` / `::default` (which would read the foreign `TASTYTRADE_*` namespace
+//! AND load a `.env` file) — so ChainView owns its own tracing sink and the
 //! credential is read only from `Secret::expose` at the single hand-off site
 //! (`CLAUDE.md` "Credentials from env only", `docs/03-data-providers.md` §11.3).
+//! The two secrets are wrapped in the upstream's own redacting `ClientSecret` /
+//! `RefreshToken` newtypes the moment they leave [`Secret::expose`], so neither
+//! is reachable through a `Debug`/`Display` of the config.
+//!
+//! The `client_id` / `redirect_uri` fields belong to the third-party
+//! authorization-code grant, which ChainView does not use; they are left empty,
+//! and `TastyTrade::connect` never sends them.
 //!
 //! # Normalization happens at this seam
 //!
@@ -58,7 +73,7 @@
 //!
 //! The REST `nested_option_chain_for` snapshot carries **no** IV field, so the
 //! streamed dxfeed **Greeks** event is this provider's sole venue IV source. The
-//! published `tastytrade` 0.3.0 preserves that IV through its streamer
+//! published `tastytrade` crate preserves that IV through its streamer
 //! (`volatility: greeks.volatility`) and has **no** `optionstratlib` dependency, so
 //! there is no "conversion zeroes IV" step: the value reaches the neutral
 //! [`decode_greeks`](super::dxfeed_decode::decode_greeks) helper (#38) unchanged and
@@ -103,8 +118,9 @@ use tokio_util::sync::CancellationToken;
 
 use tastytrade::TastyTrade;
 use tastytrade::prelude::{
-    DXF_ET_GREEKS, DXF_ET_QUOTE, DxFeedSymbol, Event, EventData, InstrumentType, OptionExpiration,
-    OptionNestedChain, OptionStrike, QuoteStreamer, QuoteSubscription, TastyTradeConfig,
+    ClientSecret, DxFeedSymbol, Event, EventData, EventKind, InstrumentType, OptionExpiration,
+    OptionNestedChain, OptionStrike, QuoteStreamer, QuoteSubscription, RefreshToken,
+    TastyTradeConfig,
 };
 
 use super::dxfeed_decode::{DxGreeksEvent, DxQuoteEvent, decode_greeks, decode_quote};
@@ -133,10 +149,21 @@ const TASTYTRADE_BASE_URL: &str = "https://api.tastyworks.com";
 /// The tastytrade production streamer URL — a public, non-secret venue endpoint.
 const TASTYTRADE_WS_URL: &str = "wss://streamer.tastyworks.com";
 
-/// The credential field names read from the environment for `UserPass` auth
-/// (`CHAINVIEW_TASTYTRADE_USERNAME` / `CHAINVIEW_TASTYTRADE_PASSWORD`,
+/// The credential field names read from the environment
+/// (`CHAINVIEW_TASTYTRADE_CLIENT_SECRET` / `CHAINVIEW_TASTYTRADE_REFRESH_TOKEN`,
 /// `docs/03-data-providers.md` §11.3).
-const CREDENTIAL_KEYS: [&str; 2] = ["username", "password"];
+///
+/// **These renamed with the upstream 0.4 OAuth2 switch.** tastytrade
+/// decommissioned `POST /sessions` on 2026-02-11, so there is no password login
+/// left to name: the personal refresh-token grant takes an OAuth application's
+/// client secret plus the grant's long-lived refresh token, both created under
+/// Manage > My Profile > API on `my.tastytrade.com`. The previous
+/// `CHAINVIEW_TASTYTRADE_USERNAME` / `CHAINVIEW_TASTYTRADE_PASSWORD` pair no
+/// longer authenticates anything and is NOT read — an operator carrying the old
+/// pair gets the typed
+/// [`ConfigError::MissingCredential`](crate::error::ConfigError::MissingCredential)
+/// rather than a silent failed login.
+const CREDENTIAL_KEYS: [&str; 2] = ["client_secret", "refresh_token"];
 
 /// The suggested chain-refresh cadence, in seconds — a hint only; the effective
 /// interval is `config.refresh_interval` (`docs/03-data-providers.md` §2).
@@ -175,23 +202,25 @@ const BACKOFF_MAX_SHIFT: u32 = 20;
 /// The tastytrade `Provider` adapter (crate-internal; behind the disabled
 /// `tastytrade` feature and reachable only via `with_gated_builtin`).
 ///
-/// Holds the reserved [`ProviderId`], the env-resolved credentials (wrapped in
-/// [`Secret`], never logged), and the venue base URL. `Clone` is cheap — a clone
-/// is moved into the spawned reconnect loop so it can re-`fetch_chain` and
-/// re-`login` on reconnect without borrowing `&self` across the task boundary.
+/// Holds the reserved [`ProviderId`], the env-resolved OAuth2 credentials
+/// (wrapped in [`Secret`], never logged), and the venue base URL. `Clone` is cheap
+/// — a clone is moved into the spawned reconnect loop so it can re-`fetch_chain`
+/// and re-`connect` on reconnect without borrowing `&self` across the task
+/// boundary.
 #[derive(Clone)]
 pub(crate) struct TastytradeAdapter {
     id: ProviderId,
-    username: Secret,
-    password: Secret,
+    client_secret: Secret,
+    refresh_token: Secret,
     base_url: String,
 }
 
 impl TastytradeAdapter {
     /// Build the adapter from the ChainView-namespaced environment
-    /// (`CHAINVIEW_TASTYTRADE_USERNAME` / `CHAINVIEW_TASTYTRADE_PASSWORD`). The
-    /// credentials are read **only** here (env-only policy) and wrapped in
-    /// [`Secret`]; they are never logged or echoed in an error.
+    /// (`CHAINVIEW_TASTYTRADE_CLIENT_SECRET` /
+    /// `CHAINVIEW_TASTYTRADE_REFRESH_TOKEN`). The credentials are read **only**
+    /// here (env-only policy) and wrapped in [`Secret`]; they are never logged or
+    /// echoed in an error.
     ///
     /// # Errors
     ///
@@ -200,43 +229,52 @@ impl TastytradeAdapter {
     pub(crate) fn from_env(env: &dyn EnvSource) -> Result<Self, crate::error::ConfigError> {
         let id = tastytrade_provider_id();
         let creds = require_credentials(env, &id, &CREDENTIAL_KEYS)?;
-        let username = creds
-            .get("USERNAME")
+        let client_secret = creds
+            .get("CLIENT_SECRET")
             .cloned()
             .ok_or_else(|| crate::error::ConfigError::MissingCredential(id.clone()))?;
-        let password = creds
-            .get("PASSWORD")
+        let refresh_token = creds
+            .get("REFRESH_TOKEN")
             .cloned()
             .ok_or_else(|| crate::error::ConfigError::MissingCredential(id.clone()))?;
         Ok(Self {
             id,
-            username,
-            password,
+            client_secret,
+            refresh_token,
             base_url: TASTYTRADE_BASE_URL.to_owned(),
         })
     }
 
-    /// Log in to tastytrade, building [`TastyTradeConfig`] as a struct literal from
-    /// the injected credentials so the upstream `from_env` (dotenv + foreign
-    /// namespace + logger install) is never touched. The credential is exposed only
-    /// at this single hand-off site and never logged.
+    /// Authenticate against tastytrade with the personal **refresh-token grant**,
+    /// building [`TastyTradeConfig`] as a struct literal from the injected
+    /// credentials so the upstream `from_env` (dotenv + foreign namespace) is never
+    /// touched. The credential is exposed only at this single hand-off site — and
+    /// straight into the upstream's redacting `ClientSecret` / `RefreshToken`
+    /// newtypes — and is never logged.
+    ///
+    /// [`TastyTrade::connect`] replaces the removed `TastyTrade::login`: the venue
+    /// decommissioned `POST /sessions`, so this is the only entry point that still
+    /// authenticates a personal application.
     ///
     /// # Errors
     ///
     /// A redaction-safe [`ProviderError`] — [`ProviderError::Auth`] for a rejected
     /// credential (never carrying it), else a categorized transport failure.
-    async fn login(&self) -> Result<TastyTrade, ProviderError> {
+    async fn connect(&self) -> Result<TastyTrade, ProviderError> {
         let config = TastyTradeConfig {
-            username: self.username.expose().to_owned(),
-            password: self.password.expose().to_owned(),
+            client_secret: ClientSecret::new(self.client_secret.expose()),
+            refresh_token: RefreshToken::new(self.refresh_token.expose()),
+            // The authorization-code grant's fields. ChainView uses the personal
+            // refresh-token grant, which does not send either, so both stay empty.
+            client_id: String::new(),
+            redirect_uri: String::new(),
             use_demo: false,
-            // Never consulted: only `from_env`/`from_file` call `setup_logger_with_level`.
+            // Never consulted: only `from_env`/`from_file` read it.
             log_level: "OFF".to_owned(),
-            remember_me: false,
             base_url: self.base_url.clone(),
             websocket_url: TASTYTRADE_WS_URL.to_owned(),
         };
-        TastyTrade::login(&config).await.map_err(login_error)
+        TastyTrade::connect(&config).await.map_err(connect_error)
     }
 }
 
@@ -272,7 +310,7 @@ impl Provider for TastytradeAdapter {
             })?;
         let target_day = target.date_naive();
 
-        let client = self.login().await?;
+        let client = self.connect().await?;
         let nested = client
             .nested_option_chain_for(symbol.clone())
             .await
@@ -362,7 +400,16 @@ fn tastytrade_provider_id() -> ProviderId {
 /// underlying stream would leave the median-strike placeholder posing as a live
 /// spot — declared unavailable until a real underlying quote is subscribed AND
 /// folded, the same honesty resolution as the Deribit ADR-0009 row), REST chain
-/// polling, no trades tape, and `UserPass` auth.
+/// polling, no trades tape, and `OAuth` auth.
+///
+/// The `auth` cell is [`AuthKind::OAuth`], not `UserPass`: `tastytrade` 0.4 dropped
+/// the password login for the OAuth2 personal refresh-token grant (a client secret
+/// plus a long-lived refresh token, see [`TastytradeAdapter::connect`]) when the
+/// venue decommissioned `POST /sessions`. The cell moved with the credential shape
+/// in the same change that adopted 0.4, together with its
+/// `docs/03-data-providers.md` §8 row and the matrix reconciliation in
+/// `src/tests_capability_matrix.rs` — a capability cell that outlives the thing it
+/// describes is exactly the fabricated claim the matrix exists to prevent.
 #[must_use]
 pub(crate) fn tastytrade_capabilities() -> ProviderCapabilities {
     ProviderCapabilities::builder()
@@ -375,7 +422,7 @@ pub(crate) fn tastytrade_capabilities() -> ProviderCapabilities {
             interval_hint_secs: REFRESH_HINT_SECS,
         })
         .trades_tape(false)
-        .auth(AuthKind::UserPass)
+        .auth(AuthKind::OAuth)
         .build()
 }
 
@@ -383,10 +430,18 @@ pub(crate) fn tastytrade_capabilities() -> ProviderCapabilities {
 // Expiry resolution: 16:00 America/New_York -> UTC, DST-aware.
 // ---------------------------------------------------------------------------
 
-/// Resolve a US-equity `YYYY-MM-DD` expiry to an absolute UTC instant at the
+/// Resolve a US-equity expiration **day** to an absolute UTC instant at the
 /// venue's **`16:00 America/New_York`** close, DST-aware
 /// (`docs/03-data-providers.md` §3). The fixed `21:00 UTC` upstream helper is
 /// **not** used — it is DST-wrong from mid-March to early November.
+///
+/// The input is the upstream's own [`NaiveDate`]: `tastytrade` 0.4 types
+/// `Expiration::expiration_date` as a `NaiveDate` (deserialized from the venue's
+/// `YYYY-MM-DD` under `#[serde(with = "…::date")]`) instead of the 0.3 `String`,
+/// so ChainView no longer re-parses a date the upstream already parsed — the
+/// adapter's own `YYYY-MM-DD` splitter is gone. **The UTC instant is unchanged**:
+/// this is the same 16:00-Eastern rule applied to the same calendar day, only
+/// without a redundant string round-trip that could disagree.
 ///
 /// The Eastern offset at a 16:00 wall-clock time is unambiguous: both DST
 /// transitions occur at `02:00`, well before the close, so a same-day 16:00 is
@@ -395,9 +450,9 @@ pub(crate) fn tastytrade_capabilities() -> ProviderCapabilities {
 ///
 /// # Errors
 ///
-/// [`NormalizeKind::UnparseableExpiry`] for a malformed or calendar-invalid date.
-fn expiry_to_utc(date_str: &str) -> Result<DateTime<Utc>, NormalizeKind> {
-    let date = parse_ymd(date_str)?;
+/// [`NormalizeKind::UnparseableExpiry`] when the day cannot carry a 16:00 close or
+/// the offset shift leaves the representable range.
+fn expiry_to_utc(date: NaiveDate) -> Result<DateTime<Utc>, NormalizeKind> {
     let offset_hours = if is_us_eastern_dst(date) { 4 } else { 5 };
     let local_close = date
         .and_hms_opt(16, 0, 0)
@@ -407,28 +462,6 @@ fn expiry_to_utc(date_str: &str) -> Result<DateTime<Utc>, NormalizeKind> {
         .checked_add_signed(TimeDelta::hours(offset_hours))
         .ok_or(NormalizeKind::UnparseableExpiry)?;
     Ok(DateTime::<Utc>::from_naive_utc_and_offset(utc_naive, Utc))
-}
-
-/// Parse a strict `YYYY-MM-DD` date, rejecting any other shape or a
-/// calendar-invalid day.
-fn parse_ymd(s: &str) -> Result<NaiveDate, NormalizeKind> {
-    let mut parts = s.split('-');
-    let year = parts
-        .next()
-        .and_then(|value| value.parse::<i32>().ok())
-        .ok_or(NormalizeKind::UnparseableExpiry)?;
-    let month = parts
-        .next()
-        .and_then(|value| value.parse::<u32>().ok())
-        .ok_or(NormalizeKind::UnparseableExpiry)?;
-    let day = parts
-        .next()
-        .and_then(|value| value.parse::<u32>().ok())
-        .ok_or(NormalizeKind::UnparseableExpiry)?;
-    if parts.next().is_some() {
-        return Err(NormalizeKind::UnparseableExpiry);
-    }
-    NaiveDate::from_ymd_opt(year, month, day).ok_or(NormalizeKind::UnparseableExpiry)
 }
 
 /// Whether US Eastern DST (EDT) is in effect on `date` at the 16:00 close: from
@@ -500,15 +533,20 @@ fn tastytrade_fingerprint(root_symbol: &str, multiplier: u32) -> ContractSpecFin
 // Chain assembly: NestedOptionChain -> ChainFetch.
 // ---------------------------------------------------------------------------
 
-/// Select the expiration whose `expiration_date` resolves to `target_day`, without
+/// Select the expiration whose `expiration_date` equals `target_day`, without
 /// indexing (the empty-response bypass).
+///
+/// `tastytrade` 0.4 types `expiration_date` as a [`NaiveDate`], so this is a
+/// direct day comparison — the previous string re-parse (which silently skipped an
+/// expiration whose date did not re-parse) is gone.
 fn select_expiration(
     nested: &OptionNestedChain,
     target_day: NaiveDate,
 ) -> Option<&OptionExpiration> {
-    nested.expirations.iter().find(|expiration| {
-        parse_ymd(&expiration.expiration_date).is_ok_and(|day| day == target_day)
-    })
+    nested
+        .expirations
+        .iter()
+        .find(|expiration| expiration.expiration_date == target_day)
 }
 
 /// One normalized contract leg assembled into an [`OptionChain`] row and its
@@ -563,7 +601,7 @@ fn assemble_chain(
     resolve_streamer: &dyn Fn(&str) -> Option<String>,
 ) -> Result<ChainFetch, ProviderError> {
     let underlying = nested.underlying_symbol.0.to_ascii_uppercase();
-    let expiration_utc = expiry_to_utc(&expiration.expiration_date)
+    let expiration_utc = expiry_to_utc(expiration.expiration_date)
         .map_err(|kind| ProviderError::Normalize { kind })?;
     let multiplier = multiplier_of(nested.shares_per_contract);
     let spec = tastytrade_fingerprint(&nested.root_symbol.0, multiplier);
@@ -662,10 +700,10 @@ fn median_strike(by_strike: &std::collections::BTreeMap<Positive, StrikePair<'_>
 // Redaction-safe transport / auth error mapping.
 // ---------------------------------------------------------------------------
 
-/// Map a login failure to a redaction-safe [`ProviderError`] by **category only**
-/// — the credential (and any upstream message) is never interpolated
-/// (`docs/03-data-providers.md` §6, `docs/SECURITY.md` §1).
-fn login_error(err: tastytrade::TastyTradeError) -> ProviderError {
+/// Map an authentication failure to a redaction-safe [`ProviderError`] by
+/// **category only** — the credential (and any upstream message) is never
+/// interpolated (`docs/03-data-providers.md` §6, `docs/SECURITY.md` §1).
+fn connect_error(err: tastytrade::TastyTradeError) -> ProviderError {
     transport_error(&err)
 }
 
@@ -673,6 +711,22 @@ fn login_error(err: tastytrade::TastyTradeError) -> ProviderError {
 /// redaction-safe [`ProviderError`] by **category only** — the inner message
 /// (which may hold a token, URL, or body) is never interpolated
 /// (`docs/03-data-providers.md` §6).
+///
+/// # The two `tastytrade` 0.4 variants
+///
+/// - `Request { context, .. }` is "the request reached the venue and came back a
+///   failure". It is the categorized replacement for a bare `Http`, so it maps to
+///   [`TransportKind::Http`] — and it is the ONE place a detail rides along: the
+///   upstream's `RequestContext::status` is a plain HTTP status code, exactly what
+///   [`TransportDetail`] is built to carry. Nothing else from the context (method,
+///   redacted operation, environment) and never the `ApiError` document is
+///   touched, so no venue text can escape.
+/// - `Precondition(_)` is a **local** refusal: the crate declined to send the
+///   request at all because the caller asked for something it will not do
+///   (a candles-only subscription, a zero-capacity channel). Nothing reached the
+///   network, so no transport category is truthful; it maps to the existing
+///   [`ProviderError::Unsupported`] with a compile-time `&'static str`, never the
+///   upstream message.
 fn transport_error(err: &tastytrade::TastyTradeError) -> ProviderError {
     use tastytrade::TastyTradeError as E;
     match err {
@@ -681,6 +735,11 @@ fn transport_error(err: &tastytrade::TastyTradeError) -> ProviderError {
         E::WebSocket(_) | E::DxFeed(_) | E::Streaming(_) | E::Connection(_) | E::Io(_) => {
             transport(TransportKind::Closed)
         }
+        E::Request { context, .. } => ProviderError::Transport(Box::new(TransportDetail::new(
+            TransportKind::Http,
+            context.status,
+        ))),
+        E::Precondition(_) => ProviderError::Unsupported("tastytrade request precondition"),
         E::Http(_) | E::Api(_) | E::Unknown(_) | E::ConfigError(_) => {
             transport(TransportKind::Http)
         }
@@ -778,14 +837,28 @@ impl LiveTransport {
 #[async_trait]
 impl TastyTransport for LiveTransport {
     async fn connect_and_subscribe(&mut self, symbols: Vec<String>) -> Result<(), TransportGone> {
-        let client = self.adapter.login().await.map_err(|_| TransportGone)?;
+        let client = self.adapter.connect().await.map_err(|_| TransportGone)?;
         let mut streamer = client
             .create_quote_streamer()
             .await
             .map_err(|_| TransportGone)?;
-        let subscription = streamer.create_sub(DXF_ET_QUOTE | DXF_ET_GREEKS);
+        // `tastytrade` 0.4 replaced the raw `DXF_ET_*` bitmask with the typed
+        // `EventKind` set (and made both calls fallible + `async`). The requested
+        // set is unchanged — Quote + Greeks, exactly what the `ChainQuotes` /
+        // `Provided` capability cells claim.
+        let subscription = streamer
+            .create_sub([EventKind::Quote, EventKind::Greeks])
+            .await
+            .map_err(|_| TransportGone)?;
         let dxfeed_symbols: Vec<DxFeedSymbol> = symbols.into_iter().map(DxFeedSymbol).collect();
-        subscription.add_symbols(&dxfeed_symbols);
+        // `add_symbols` now RESOLVES once the venue has accepted the subscription
+        // and reports a refusal instead of dropping it silently, so a failed
+        // resubscribe becomes an honest reconnect rather than a live-looking stream
+        // that never delivers.
+        subscription
+            .add_symbols(&dxfeed_symbols)
+            .await
+            .map_err(|_| TransportGone)?;
         self.subscription = Some(subscription);
         self.streamer = Some(streamer);
         Ok(())
@@ -812,6 +885,19 @@ impl TastyTransport for LiveTransport {
 
 /// Map a raw tastytrade `dxfeed::Event` onto the neutral [`RawDxEvent`] — the one
 /// place a raw upstream event is touched (it never escapes [`LiveTransport`]).
+///
+/// # Only the two subscribed kinds are consumed
+///
+/// The subscription asks for exactly [`EventKind::Quote`] + [`EventKind::Greeks`]
+/// (see [`LiveTransport::connect_and_subscribe`]), which is what the `ChainQuotes`
+/// / `Provided` capability cells claim, so those two are the only variants that
+/// normalize. `tastytrade` 0.4 widened `EventData` from three variants to eleven
+/// (`TradeEth`, `Candle`, `Summary`, `TimeAndSale`, `Profile`, `Underlying`,
+/// `TheoPrice`, `Series` joined `Trade`); none of them is a top-of-book quote or a
+/// per-contract Greeks row, and this adapter declares `trades_tape: false`, so
+/// every one of them takes the **existing** [`RawDxEvent::Ignored`] path rather
+/// than an invented normalization. A kind that was never subscribed should not
+/// arrive at all — if one does, it is dropped, never folded into the chain.
 fn map_dxfeed_event(event: Event) -> RawDxEvent {
     let symbol = event.sym;
     match event.data {
@@ -833,7 +919,10 @@ fn map_dxfeed_event(event: Event) -> RawDxEvent {
             volatility: greeks.volatility,
             time_ms: greeks.time,
         },
-        EventData::Trade(_) => RawDxEvent::Ignored,
+        // Not subscribed, not overlaid: Trade / TradeEth / Candle / Summary /
+        // TimeAndSale / Profile / Underlying / TheoPrice / Series, plus anything a
+        // later `tastytrade` release adds.
+        _ => RawDxEvent::Ignored,
     }
 }
 
@@ -1233,9 +1322,12 @@ mod tests {
         }
     }
 
+    /// A `YYYY-MM-DD` test date. The adapter no longer parses dates itself
+    /// (`tastytrade` 0.4 hands a typed `NaiveDate`), so a test that needs one
+    /// builds it through `chrono` directly.
     #[track_caller]
     fn date(s: &str) -> NaiveDate {
-        match parse_ymd(s) {
+        match NaiveDate::parse_from_str(s, "%Y-%m-%d") {
             Ok(d) => d,
             Err(e) => panic!("invalid test date `{s}`: {e}"),
         }
@@ -1254,12 +1346,12 @@ mod tests {
     fn creds_env() -> MapEnv {
         let mut env = HashMap::new();
         let _ = env.insert(
-            "CHAINVIEW_TASTYTRADE_USERNAME".to_owned(),
-            "user@example.test".to_owned(),
+            "CHAINVIEW_TASTYTRADE_CLIENT_SECRET".to_owned(),
+            "do-not-log-this-client-secret".to_owned(),
         );
         let _ = env.insert(
-            "CHAINVIEW_TASTYTRADE_PASSWORD".to_owned(),
-            "do-not-log-this".to_owned(),
+            "CHAINVIEW_TASTYTRADE_REFRESH_TOKEN".to_owned(),
+            "do-not-log-this-refresh-token".to_owned(),
         );
         MapEnv(env)
     }
@@ -1349,7 +1441,7 @@ mod tests {
             }
         );
         assert!(!caps.trades_tape);
-        assert_eq!(caps.auth, AuthKind::UserPass);
+        assert_eq!(caps.auth, AuthKind::OAuth);
     }
 
     #[test]
@@ -1362,9 +1454,43 @@ mod tests {
     #[test]
     fn test_credentials_never_appear_in_debug_of_adapter_secrets() {
         let adapter = sample_adapter();
-        let rendered = format!("{:?}", adapter.username);
-        assert!(!rendered.contains("user@example.test"));
-        assert!(rendered.contains("redacted"));
+        for rendered in [
+            format!("{:?}", adapter.client_secret),
+            format!("{:?}", adapter.refresh_token),
+        ] {
+            assert!(!rendered.contains("do-not-log-this-client-secret"));
+            assert!(!rendered.contains("do-not-log-this-refresh-token"));
+            assert!(rendered.contains("redacted"));
+        }
+    }
+
+    #[test]
+    fn test_upstream_config_debug_redacts_both_oauth_secrets() {
+        // The credential leaves `Secret` only to enter the upstream's own
+        // redacting `ClientSecret`/`RefreshToken` newtypes, so a `Debug`/`Display`
+        // of the config the adapter hands to `TastyTrade::connect` cannot carry
+        // either value (docs/SECURITY.md §1).
+        let adapter = sample_adapter();
+        let config = TastyTradeConfig {
+            client_secret: ClientSecret::new(adapter.client_secret.expose()),
+            refresh_token: RefreshToken::new(adapter.refresh_token.expose()),
+            client_id: String::new(),
+            redirect_uri: String::new(),
+            use_demo: false,
+            log_level: "OFF".to_owned(),
+            base_url: adapter.base_url.clone(),
+            websocket_url: TASTYTRADE_WS_URL.to_owned(),
+        };
+        for rendered in [format!("{config:?}"), format!("{config}")] {
+            assert!(
+                !rendered.contains("do-not-log-this-client-secret"),
+                "the client secret leaked: {rendered}"
+            );
+            assert!(
+                !rendered.contains("do-not-log-this-refresh-token"),
+                "the refresh token leaked: {rendered}"
+            );
+        }
     }
 
     #[test]
@@ -1373,21 +1499,21 @@ mod tests {
         // TASTYTRADE_* namespace the upstream `from_env` would read.
         let mut env = HashMap::new();
         let _ = env.insert(
-            "CHAINVIEW_TASTYTRADE_USERNAME".to_owned(),
-            "alice".to_owned(),
+            "CHAINVIEW_TASTYTRADE_CLIENT_SECRET".to_owned(),
+            "cs-abc".to_owned(),
         );
         let _ = env.insert(
-            "CHAINVIEW_TASTYTRADE_PASSWORD".to_owned(),
-            "secret-pw".to_owned(),
+            "CHAINVIEW_TASTYTRADE_REFRESH_TOKEN".to_owned(),
+            "rt-xyz".to_owned(),
         );
         // A foreign-namespace value must be ignored.
-        let _ = env.insert("TASTYTRADE_USERNAME".to_owned(), "foreign".to_owned());
+        let _ = env.insert("TASTYTRADE_CLIENT_SECRET".to_owned(), "foreign".to_owned());
         let adapter = match TastytradeAdapter::from_env(&MapEnv(env)) {
             Ok(adapter) => adapter,
             Err(e) => panic!("from_env should succeed: {e}"),
         };
-        assert_eq!(adapter.username.expose(), "alice");
-        assert_eq!(adapter.password.expose(), "secret-pw");
+        assert_eq!(adapter.client_secret.expose(), "cs-abc");
+        assert_eq!(adapter.refresh_token.expose(), "rt-xyz");
         assert_eq!(adapter.base_url, TASTYTRADE_BASE_URL);
     }
 
@@ -1395,10 +1521,10 @@ mod tests {
     fn test_from_env_missing_credential_is_error() {
         let mut env = HashMap::new();
         let _ = env.insert(
-            "CHAINVIEW_TASTYTRADE_USERNAME".to_owned(),
-            "alice".to_owned(),
+            "CHAINVIEW_TASTYTRADE_CLIENT_SECRET".to_owned(),
+            "cs-abc".to_owned(),
         );
-        // Password absent.
+        // The refresh token is absent.
         match TastytradeAdapter::from_env(&MapEnv(env)) {
             Err(crate::error::ConfigError::MissingCredential(id)) => {
                 assert_eq!(id.as_str(), "tastytrade");
@@ -1408,13 +1534,37 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_retired_userpass_credentials_no_longer_authenticate() {
+        // tastytrade 0.4 has no password login (the venue decommissioned
+        // `POST /sessions`), so the retired CHAINVIEW_TASTYTRADE_USERNAME /
+        // _PASSWORD pair must produce the typed MissingCredential rather than a
+        // silently-constructed adapter that could never log in.
+        let mut env = HashMap::new();
+        let _ = env.insert(
+            "CHAINVIEW_TASTYTRADE_USERNAME".to_owned(),
+            "alice".to_owned(),
+        );
+        let _ = env.insert(
+            "CHAINVIEW_TASTYTRADE_PASSWORD".to_owned(),
+            "secret-pw".to_owned(),
+        );
+        match TastytradeAdapter::from_env(&MapEnv(env)) {
+            Err(crate::error::ConfigError::MissingCredential(id)) => {
+                assert_eq!(id.as_str(), "tastytrade");
+            }
+            Err(other) => panic!("expected MissingCredential, got a different error: {other}"),
+            Ok(_) => panic!("the retired username/password pair must not build an adapter"),
+        }
+    }
+
     // === Expiry: 16:00 America/New_York -> UTC, DST-aware =====================
 
     #[test]
     fn test_expiry_edt_resolves_to_2000_utc() {
         // 2026-03-20 is after the second Sunday of March (2026-03-08) -> EDT ->
         // 16:00 EDT = 20:00 UTC.
-        match expiry_to_utc("2026-03-20") {
+        match expiry_to_utc(date("2026-03-20")) {
             Ok(utc) => assert_eq!(utc.to_rfc3339(), "2026-03-20T20:00:00+00:00"),
             Err(e) => panic!("EDT expiry should resolve, got: {e}"),
         }
@@ -1424,7 +1574,7 @@ mod tests {
     fn test_expiry_est_resolves_to_2100_utc() {
         // 2026-11-20 is after the first Sunday of November (2026-11-01) -> EST ->
         // 16:00 EST = 21:00 UTC.
-        match expiry_to_utc("2026-11-20") {
+        match expiry_to_utc(date("2026-11-20")) {
             Ok(utc) => assert_eq!(utc.to_rfc3339(), "2026-11-20T21:00:00+00:00"),
             Err(e) => panic!("EST expiry should resolve, got: {e}"),
         }
@@ -1435,7 +1585,7 @@ mod tests {
         // The second Sunday of March 2026 is 2026-03-08: at 16:00 DST is already in
         // effect (transition at 02:00), so it is EDT -> 20:00 UTC.
         assert!(is_us_eastern_dst(date("2026-03-08")));
-        match expiry_to_utc("2026-03-08") {
+        match expiry_to_utc(date("2026-03-08")) {
             Ok(utc) => assert_eq!(utc.to_rfc3339(), "2026-03-08T20:00:00+00:00"),
             Err(e) => panic!("DST-start expiry should resolve, got: {e}"),
         }
@@ -1448,7 +1598,7 @@ mod tests {
         // The first Sunday of November 2026 is 2026-11-01: at 16:00 the fall-back
         // (02:00) has already happened, so it is EST -> 21:00 UTC.
         assert!(!is_us_eastern_dst(date("2026-11-01")));
-        match expiry_to_utc("2026-11-01") {
+        match expiry_to_utc(date("2026-11-01")) {
             Ok(utc) => assert_eq!(utc.to_rfc3339(), "2026-11-01T21:00:00+00:00"),
             Err(e) => panic!("DST-end expiry should resolve, got: {e}"),
         }
@@ -1460,7 +1610,7 @@ mod tests {
     fn test_expiry_fixed_2100_helper_is_not_used_in_summer() {
         // A summer expiry must NOT resolve to the fixed 21:00 UTC (the DST-wrong
         // upstream helper); it is 20:00 UTC.
-        match expiry_to_utc("2026-07-17") {
+        match expiry_to_utc(date("2026-07-17")) {
             Ok(utc) => {
                 assert_eq!(utc.to_rfc3339(), "2026-07-17T20:00:00+00:00");
                 assert_ne!(utc.to_rfc3339(), "2026-07-17T21:00:00+00:00");
@@ -1469,24 +1619,29 @@ mod tests {
         }
     }
 
+    // NOTE: `test_expiry_unparseable_is_rejected` was DELETED with the 0.4 bump.
+    // It asserted that `expiry_to_utc("not-a-date")` / `"2026-13-01"` / `"2026-03"`
+    // / `"2026-03-20-01"` yielded `UnparseableExpiry`. `tastytrade` 0.4 types
+    // `Expiration::expiration_date` as a `NaiveDate` (the upstream's own
+    // `#[serde(with = "…::date")]` rejects a malformed date at DESERIALIZATION, with
+    // the fixture-level proof in `test_malformed_expiration_date_is_rejected_upstream`
+    // below), so the adapter's `YYYY-MM-DD` splitter is gone and there is no
+    // adapter-level string to reject. The four inputs are unrepresentable in the new
+    // signature — keeping the test would have meant keeping dead parsing alive purely
+    // to have something to test.
+
     #[test]
-    fn test_expiry_unparseable_is_rejected() {
-        assert_eq!(
-            expiry_to_utc("not-a-date"),
-            Err(NormalizeKind::UnparseableExpiry)
-        );
-        assert_eq!(
-            expiry_to_utc("2026-13-01"),
-            Err(NormalizeKind::UnparseableExpiry)
-        );
-        assert_eq!(
-            expiry_to_utc("2026-03"),
-            Err(NormalizeKind::UnparseableExpiry)
-        );
-        assert_eq!(
-            expiry_to_utc("2026-03-20-01"),
-            Err(NormalizeKind::UnparseableExpiry)
-        );
+    fn test_malformed_expiration_date_is_rejected_upstream() {
+        // The rejection MOVED, it did not disappear: a venue payload carrying a
+        // calendar-invalid or malformed expiration date now fails to deserialize
+        // into `OptionNestedChain` at all, so it never reaches normalization.
+        for bad in ["not-a-date", "2026-13-01", "2026-03", "2026-03-20-01"] {
+            let json = NESTED_SPY_JSON.replace("\"2026-03-20\"", &format!("\"{bad}\""));
+            assert!(
+                serde_json::from_str::<OptionNestedChain>(&json).is_err(),
+                "a malformed expiration-date `{bad}` must be rejected upstream"
+            );
+        }
     }
 
     #[test]
@@ -2032,27 +2187,31 @@ mod tests {
     // === Property: normalization is total (never a panic) ====================
 
     proptest! {
-        /// `expiry_to_utc` is TOTAL: any string yields `Ok` or `UnparseableExpiry`,
-        /// never a panic; and every valid US-equity date resolves to exactly the
-        /// `20:00` (EDT) or `21:00` (EST) UTC close, never any other wall time
-        /// (contributes to `normalize_total`).
+        /// `expiry_to_utc` is TOTAL over any calendar day: it yields `Ok` or
+        /// `UnparseableExpiry`, never a panic; and every US-equity date resolves to
+        /// exactly the `20:00` (EDT) or `21:00` (EST) UTC close, never any other
+        /// wall time (contributes to `normalize_total`).
+        ///
+        /// The `junk` string arm is GONE with the 0.4 bump: the input is now the
+        /// upstream's typed `NaiveDate`, so an unparseable string cannot be
+        /// constructed to feed in. Totality over the whole *representable* input
+        /// domain is what is asserted here, and it is a strictly larger claim than
+        /// the old "any string" one, which only ever exercised the deleted parser.
         #[test]
         fn prop_expiry_to_utc_total_and_dst_shape(
             year in 2000i32..2100,
             month in 1u32..=12,
             day in 1u32..=28,
-            junk in "\\PC{0,16}",
         ) {
-            // Arbitrary junk is total (no panic).
-            let _ = expiry_to_utc(&junk);
-            // A valid date resolves to a 20:00 or 21:00 UTC instant.
-            let date_str = format!("{year:04}-{month:02}-{day:02}");
-            match expiry_to_utc(&date_str) {
+            let Some(day) = NaiveDate::from_ymd_opt(year, month, day) else {
+                return Ok(());
+            };
+            match expiry_to_utc(day) {
                 Ok(utc) => {
                     let hour = utc.hour();
                     prop_assert!(
                         hour == 20 || hour == 21,
-                        "unexpected UTC hour {hour} for {date_str}"
+                        "unexpected UTC hour {hour} for {day}"
                     );
                 }
                 Err(kind) => prop_assert_eq!(kind, NormalizeKind::UnparseableExpiry),
