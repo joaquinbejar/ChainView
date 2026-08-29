@@ -12,6 +12,49 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+### Changed
+
+- **Every dependency refreshed to its latest stable, pinned as `X.X`** — and the
+  per-dependency prose notes are out of `Cargo.toml`, which had become
+  unreadable. The notes are preserved in `docs/specs/dependencies.md`; the
+  POLICY is unchanged, since `deny.toml` and `docs/SECURITY.md` §7 remain the
+  enforced half. Seventeen pins moved; five crossed a major and needed real
+  migration work: `optionstratlib` 0.18 -> 0.20, `ig-client` 0.12 -> 0.16,
+  `tastytrade` 0.3 -> 0.4, `dxlink` 0.2 -> 0.3, `criterion` 0.5 -> 0.8. No crate
+  was added or removed, `cargo audit` and `cargo deny check` stay clean on the
+  same three documented ignores, and the MSRV is unchanged at 1.94.
+
+- **`AuthKind::OAuth` is a new variant, and tastytrade's `auth` cell moved onto
+  it.** `tastytrade` 0.4 dropped the password login when the venue
+  decommissioned `POST /sessions`, replacing it with the OAuth2 personal
+  refresh-token grant, so `AuthKind::UserPass` had stopped describing what the
+  provider needs. The cell, the `docs/03-data-providers.md` §8 row and the
+  matrix reconciliation in `src/tests_capability_matrix.rs` moved together — a
+  capability cell that outlives the thing it describes is exactly the fabricated
+  claim that matrix exists to prevent. `AuthKind` is `#[non_exhaustive]`, so the
+  variant is additive. IG keeps `UserPass`.
+
+- **BREAKING for a tastytrade operator: the credential keys are renamed.**
+  `CHAINVIEW_TASTYTRADE_USERNAME` / `_PASSWORD` are retired and no longer read;
+  the pair is now `CHAINVIEW_TASTYTRADE_CLIENT_SECRET` +
+  `CHAINVIEW_TASTYTRADE_REFRESH_TOKEN`, both minted under Manage > My Profile >
+  API on `my.tastytrade.com`. An operator still carrying the old pair gets a
+  typed `ConfigError::MissingCredential` naming the provider, never a silent
+  failed login. Both new keys joined the config-file credential guard, so
+  neither can be smuggled in through a file. The adapter stays SECURITY-GATED
+  either way — this changes how it would authenticate, not whether it ships.
+
+- **A refused tastytrade subscription is now an honest reconnect.** 0.4 made
+  `create_sub` / `add_symbols` async and fallible, and both are now awaited: a
+  subscribe the venue refuses becomes `TransportGone` instead of being dropped
+  on the floor while the adapter reported `Health::Live` on a stream that would
+  never deliver.
+
+- `Positive::INFINITY` is renamed `Positive::MAX` upstream (`positive` 0.6) —
+  the value was always `Decimal::MAX`, never an infinity. Twelve call sites
+  moved; the sentinel's meaning is unchanged, including `BuilderLeg::mark_in`
+  treating it as "no mark".
+
 ### Fixed
 
 - **A payoff curve can no longer take the terminal down** (issue #131). The

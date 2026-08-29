@@ -1,6 +1,6 @@
 [package]
 name = "chainview"
-version = "0.0.1"
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.94"
 authors = ["Joaquin Bejar <jb@taunais.com>"]
@@ -154,343 +154,61 @@ path = "src/main.rs"
 [dependencies]
 thiserror = "2.0"
 serde = { version = "1.0", features = ["derive"] }
-# The opaque manifest blobs in the replay result-bundle contract
-# (`config`/`strategy`/`data_source`/`metrics` are `serde_json::Value`, issue #29,
-# `docs/04-replay-mode.md` §2.1). Explicit-approval addition (CLAUDE.md "Coding
-# Rules"). Supply-chain: NO new surface — `serde_json` is already in the
-# transitive tree via `deribit-http`/`deribit-websocket`, so this only promotes an
-# existing crate to a direct dependency; audit note in CHANGELOG (ADR-0007).
 serde_json = "1.0"
-toml = "1.0"
-humantime = "2.0"
-clap = { version = "4.5", features = ["derive"] }
+toml = "1.1"
+humantime = "2.4"
+clap = { version = "4.6", features = ["derive"] }
 dotenvy = "0.15"
-optionstratlib = { version = "0.18", default-features = false }
+optionstratlib = { version = "0.20", default-features = false }
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 async-trait = "0.1"
-# `rt`/`macros`/`time` join the existing `sync` for the task supervisor (issue
-# #11): `rt` for `JoinHandle`/`abort`/`JoinError::is_panic` (and the Deribit
-# adapter's bounded `JoinSet` ticker hydration, #15), `macros` for the
-# `tokio::select!` in the supervise loop, `time` for the 2 s bounded-join
-# `tokio::time::timeout`. The `net`/`fs`/`rt-multi-thread` features are not
-# requested here, but `deribit-http` (#15) feature-unifies `tokio` toward `full`
-# transitively; the render loop (#13) still picks the runtime flavor.
-tokio = { version = "1.0", default-features = false, features = [
+tokio = { version = "1.53", default-features = false, features = [
     "sync",
     "rt",
     "macros",
     "time",
 ] }
-# The cancellation-token tree owned by the supervisor (issue #11): the root
-# `CancellationToken` + one `child_token` per task. `default-features = false`
-# keeps only `tokio_util::sync::CancellationToken` (no codec/io); RUSTSEC-clean,
-# MSRV 1.71 (below our 1.94). Explicit-approval addition (CLAUDE.md "Coding
-# Rules") — audit note in CHANGELOG.
 tokio-util = { version = "0.7", default-features = false }
-# The terminal stack (ADR-0001, issue #8, first TUI pull; migrated 0.29 -> 0.30
-# at issue #130). ratatui 0.30 splits into `ratatui-core`/`ratatui-widgets`/
-# `ratatui-crossterm` behind the same `ratatui` facade and needs rustc 1.88 (our
-# MSRV is 1.94). The bump is what CLEARS the two lru advisories — 0.29 pinned
-# `lru = ^0.12`, whose newest release is the unsound 0.12.5 (RUSTSEC-2026-0002
-# IterMut, RUSTSEC-2026-0253 pop panic-safety); `ratatui-core` requires
-# `lru = ^0.18`, past both patched floors — so neither is ignored in deny.toml
-# any more. `ratatui-crossterm` defaults to the `crossterm_0_29` backend, and
-# `crossterm` is pinned to that same `0.29` line so cargo unifies to a single
-# instance: the crossterm ChainView calls is exactly the one ratatui drives (no
-# two-version mismatch).
-# LOCKFILE SURFACE, not build surface: `Cargo.lock` is feature-agnostic, so the
-# 0.30 split adds ~43 packages for ratatui's OTHER backends and its optional
-# `palette` colour support — `ratatui-termwiz`/`ratatui-termina`, `termwiz`,
-# `termina`, `terminfo`, `termios`, `vtparse`, the `wezterm-*` family, `pest*`,
-# `palette*` — plus a second `bitflags` (1.3.2) underneath them. ChainView enables
-# none of those features (`ratatui` defaults are all-widgets/crossterm/
-# layout-cache/macros/underline-color), so none is compiled, linked or reachable:
-# `cargo tree --all-features -i ratatui-termwiz` (or `-i termina`, `-i pest`,
-# `-i palette`) prints nothing, exactly like the rkyv case documented in
-# deny.toml. The duplicate `bitflags` is covered by `multiple-versions = "warn"`
-# (deny.toml [bans]); `cargo deny check licenses` is clean on the RESOLVED graph.
 ratatui = { version = "0.30", features = ["crossterm"] }
 crossterm = "0.29"
-# The Deribit REST client (issue #15, the zero-config poll leg — ADR-0003). Wraps
-# the venue's JSON-RPC-over-HTTP; ChainView never reimplements the protocol
-# (CLAUDE.md "Key Decisions"). Explicit-approval addition (CLAUDE.md "Coding
-# Rules") — audit note in CHANGELOG. Public data needs NO credentials: the
-# adapter drives `HttpConfig::production()` and never requires or logs a
-# credential; the public endpoints send none.
-# Supply-chain: pulls `reqwest` (+ its default TLS), `tokio` (feature-unified to
-# `full`), `serde_json`, `hmac`/`sha2`/`base64` (request signing, unused on the
-# public path), `url`, `serde_with`, `rand`, and `dotenv`. `deribit-websocket`
-# (streaming) is a SEPARATE addition deferred to #16. No rustls crypto-provider
-# install is needed here — the HTTP client relies on `reqwest`'s default TLS and
-# exposes no `install_default_crypto_provider`; any provider install belongs to
-# the websocket path (#16), and no live TLS handshake runs in the test suite.
 deribit-http = "0.7"
-# The Deribit WebSocket client (issue #16, the streaming overlay + reconnect
-# loop). Wraps the venue's JSON-RPC 2.0 over WebSocket; ChainView never
-# reimplements the protocol (CLAUDE.md "Key Decisions"). Explicit-approval
-# addition (CLAUDE.md "Coding Rules") — audit note in CHANGELOG. Public market
-# data needs NO credentials: the adapter drives the production URL and never
-# authenticates, so no credential is required or logged.
-# Supply-chain delta over #15's `deribit-http`: adds `tokio-tungstenite` (WS
-# framing) and the default `rustls-aws-lc` TLS backend — `rustls` + the
-# `aws-lc-rs` crypto provider — installed ONCE via
-# `install_default_crypto_provider()` before the first WS TLS handshake (this is
-# what differs from #15, where the REST client used `reqwest`'s default TLS and
-# needed no provider install), plus `futures-util`. It shares `tokio`
-# (feature-unified toward `full`), `serde`/`serde_json`, `url`, and `dotenv`
-# with the existing tree. `aws-lc-rs` requires a C/ASM toolchain at build time.
 deribit-websocket = "0.3"
-# The tastytrade client (issue #40, the poll->stream merge provider —
-# `docs/03-data-providers.md` §7.2). OPTIONAL and behind the DISABLED-by-default
-# `tastytrade` feature: a normal build never pulls it, and it is reachable only
-# via `with_gated_builtin` (which fails while the credential-logging gate holds,
-# docs/SECURITY.md §2). Wraps tastytrade's REST option-chain + its bundled dxfeed
-# streaming binding; ChainView never reimplements the protocol (CLAUDE.md "Key
-# Decisions"). Explicit-approval addition (CLAUDE.md "Coding Rules") — ADR-0007
-# audit note in CHANGELOG (`cargo audit` + `cargo deny check` (deny.toml pins `all-features = true`)).
-# Auth is injected programmatically: `TastyTradeConfig` has all-public fields, so
-# the adapter builds it from ChainView-namespaced `CHAINVIEW_TASTYTRADE_*` env
-# vars and calls `TastyTrade::login(&config)` WITHOUT the crate's `from_env()`
-# (which would read the foreign `TASTYTRADE_*` namespace, load a dotenv file, and
-# install a tracing subscriber) — verified against the 0.3.0 checkout.
-# Supply-chain delta (feature-on only): pulls `tokio-tungstenite` (native-tls
-# backend), `dxlink`, `reqwest`, `erased-serde`, `flume`, `derive_builder`,
-# `pretty-simple-display`, and (transitively) `dotenv`/`tracing-subscriber` — the
-# latter two are never exercised because the adapter never calls `from_env`.
-tastytrade = { version = "0.3", optional = true }
-# The Alpaca REST + WebSocket clients (issue #41, the composed poll->stream
-# provider — `docs/03-data-providers.md` §7.5). OPTIONAL and behind the
-# DISABLED-by-default `alpaca` feature: a normal build never pulls them, and the
-# adapter is reachable only via `with_gated_builtin` (which fails while the gate
-# holds, docs/SECURITY.md §2.4). `alpaca-http` wraps the venue REST (option
-# contracts + snapshots); `alpaca-websocket` wraps the underlying Trade/Quote/Bar
-# stream — ChainView never reimplements a protocol (CLAUDE.md "Key Decisions").
-# Explicit-approval addition (CLAUDE.md "Coding Rules") — ADR-0007 audit note in
-# CHANGELOG (`cargo audit` + `cargo deny check` (deny.toml pins `all-features = true`)).
-# Auth is injected programmatically: both clients construct from
-# `alpaca_base::Credentials::new(key, secret)` + `Environment::{Paper,Live}`, so
-# the adapter builds them from ChainView-namespaced `CHAINVIEW_ALPACA_*` env vars
-# and NEVER calls the crates' `from_env()` (which would read the foreign
-# `ALPACA_*` namespace and load a `.env` via `dotenv`). No global tracing
-# subscriber is installed on construction (`init_logger` is opt-in and untouched)
-# — verified against the 0.21.2 / 0.6.0 checkout.
-# Supply-chain delta (feature-on only): pulls `reqwest` (+ default TLS),
-# `tokio-tungstenite` (rustls-tls-webpki-roots), `rustls` (ring provider,
-# installed once by the crate's own `init_crypto_provider`), `futures-util`,
-# `url`, `serde_urlencoded`, `urlencoding`, `uuid`, and (transitively, never
-# exercised) `dotenv` + `tracing-subscriber`.
+tastytrade = { version = "0.4", optional = true }
 alpaca-http = { version = "0.21", optional = true }
 alpaca-websocket = { version = "0.6", optional = true }
-# The Alpaca `MarketDataStream` is consumed through the `futures_core::Stream`
-# trait it implements, so `StreamExt::next` is needed to drain it into the bounded
-# bridge (issue #41). OPTIONAL, behind the `alpaca` feature only. It already rides
-# the `alpaca-websocket` tree, so a feature-on build pulls no crate that was not
-# already present; `default-features = false` keeps only the async/stream adapters.
-# Explicit-approval addition (CLAUDE.md "Coding Rules") — audit note in CHANGELOG.
 futures-util = { version = "0.3", default-features = false, optional = true }
-# The standalone DXLink client (issue #42, the overlay-only quote/Greeks provider
-# — `docs/03-data-providers.md` §7.3). OPTIONAL and behind the DISABLED-by-default
-# `dxlink` feature: a normal build never pulls it, and the adapter is reachable
-# only via `with_gated_builtin` (which fails while the gate holds,
-# docs/SECURITY.md §2.4). Wraps the DXLink WebSocket protocol
-# (`DXLinkClient::new(url, token)`, no REST); ChainView never reimplements the
-# protocol (CLAUDE.md "Key Decisions"). Explicit-approval addition (CLAUDE.md
-# "Coding Rules") — ADR-0007 audit note in CHANGELOG (`cargo audit` +
-# `cargo deny check` (deny.toml pins `all-features = true`)).
-# Auth is injected programmatically: `DXLinkClient::new(url, token)` takes the URL
-# and token as plain arguments, so the adapter builds them from ChainView-
-# namespaced `CHAINVIEW_DXLINK_*` env vars. There is NO dotenv load, NO foreign
-# env namespace, and NO global tracing subscriber installed on construction; the
-# 0.2.0 client redacts the serialized `AuthMessage` token in its `debug!`
-# (`redact_sensitive`) and its `Debug` shows only `has_token` — verified against
-# the 0.2.0 checkout.
-# Supply-chain delta (feature-on only): pulls `tokio-tungstenite` (native-tls)
-# and `futures-util`, both already in the tree under the gated
-# tastytrade/deribit-websocket features. Under `--all-features` `dxlink` resolves
-# at both 0.2.0 (this direct dep) and 0.1.5 (transitive via the gated tastytrade
-# 0.3.0), a deny.toml `multiple-versions = "warn"` duplicate, never a failure.
-dxlink = { version = "0.2", optional = true }
-# The IG client (issue #39, the navigation-assembled poll->stream provider —
-# `docs/03-data-providers.md` §7.4). OPTIONAL and behind the DISABLED-by-default
-# `ig` feature: a normal build never pulls it. Consumed with its DEFAULT features
-# (`persistence` + `streaming`), so the adapter can drive BOTH the env-free REST
-# path (`Config::from_credentials` + `Client::with_config`, `MarketService`) and
-# the Lightstreamer streaming leg (`StreamerClient::with_client`); ChainView never
-# reimplements the JSON-RPC/Lightstreamer protocols (CLAUDE.md "Key Decisions").
-# Explicit-approval addition (CLAUDE.md "Coding Rules") — ADR-0007 audit note in
-# CHANGELOG (`cargo audit` + `cargo deny check` (deny.toml pins `all-features = true`)).
-# Auth is injected programmatically: the adapter builds `Credentials::new(..)` from
-# ChainView-namespaced `CHAINVIEW_IG_*` env vars, wraps it in
-# `Config::from_credentials(..)` + `Client::with_config(..)`, and NEVER calls
-# `Config::new()` / `Config::default()` / `Client::try_new()` (which would load a
-# `.env` via `dotenv` and read the foreign `IG_*` namespace). Session v2
-# (CST/X-SECURITY-TOKEN) or v3 (OAuth) auto-refresh is handled by the client. It
-# uses `StreamerClient::with_client(&injected_client)` — NOT `DynamicMarketStreamer`,
-# whose `start_internal` builds its own `StreamerClient::new()` via the `.env`/`IG_*`
-# path — so the env-only credential rule holds end to end. Verified against the
-# 0.12.3 checkout.
-# Supply-chain delta (feature-on only): pulls `sqlx 0.9` (MSRV 1.94 — the crate
-# floor, raised for this path; `persistence` is never exercised), `lightstreamer-rs
-# 0.3.3` (the streaming transport — `GPL-3.0-only`, ACCEPTED by owner decision for
-# this optional feature, scoped via a per-crate exception in deny.toml, issue #39),
-# `governor`, `nanoid`, `regex`, `lazy_static`, `prettytable-rs`, and (transitively,
-# never exercised on the injection path) `dotenv` — covered by the extended
-# RUSTSEC-2021-0141 ignore in deny.toml.
-ig-client = { version = "0.12", optional = true }
-# The Interactive Brokers client (issue #120, the TWS/Gateway socket adapter —
-# `docs/03-data-providers.md` §7.6). OPTIONAL and behind the DISABLED-by-default
-# `ibkr` feature: a normal build never pulls it. Consumed with its DEFAULT
-# features (`async`), so the adapter drives the async `ibapi::Client::connect` +
-# `option_chain` (`reqSecDefOptParams`) + `contract_details` REST path and the
-# `market_data` streaming leg (native `tickOptionComputation` Greeks/IV);
-# ChainView never reimplements the TWS socket protocol (CLAUDE.md "Key
-# Decisions"). Explicit-approval addition (CLAUDE.md "Coding Rules") — ADR-0007
-# audit note in CHANGELOG (`cargo audit` + `cargo deny check`, deny.toml pins
-# `all-features = true`).
-# Auth is injected programmatically at the socket seam: the adapter reads
-# `CHAINVIEW_IBKR_ENDPOINT` (`host:port` or `scheme://host:port`, normalized to the
-# socket address) + `CHAINVIEW_IBKR_CLIENT_ID` (i32) from
-# ChainView-namespaced env vars and calls `Client::connect(endpoint, client_id)`.
-# The TWS/Gateway holds the session, so ChainView carries NO credential (auth:
-# None at the seam) — there is no dotenv load, no foreign env namespace, and no
-# global tracing subscriber installed on construction (verified against the 3.3.0
-# checkout).
-# Supply-chain delta (feature-on only): MIT (no license exception), pulls `prost`
-# (protobuf), `time`/`time-tz`, `byteorder`, `serde`/`serde_json`, `thiserror`,
-# `log`, and (from `async`) `tokio`/`tokio-stream`/`futures`/`async-trait` — the
-# async runtime crates are already in the tree, so a feature-on build adds no new
-# runtime surface beyond the venue codecs. No new advisory (go/no-go GREEN, #120).
+dxlink = { version = "0.3", optional = true }
+ig-client = { version = "0.16", optional = true }
 ibapi = { version = "3.3", optional = true }
-# The Parquet reader for the IronCondor result bundle (issue #30, ADR-0010,
-# `docs/04-replay-mode.md` §2/§3). The bundle's four tables are Parquet; the
-# reader decodes them batch-by-batch under measured resource ceilings. ChainView
-# never reimplements the columnar format — a hand-rolled reader would violate the
-# no-reimplement rule (CLAUDE.md), and `arrow2` is unmaintained, so `parquet` (the
-# arrow-rs crate) is the choice. Explicit-approval addition (CLAUDE.md "Coding
-# Rules") — audit note in CHANGELOG + ADR-0010. MSRV: parquet 59 is 1.85, under
-# our 1.88 floor (verified with `cargo +1.88 check`).
-# Feature trim: `default-features = false` drops the `async` reader, `object_store`,
-# and the unused codecs; only `arrow` (the `RecordBatchReader` the ceiling decode
-# iterates) plus the three common compression codecs — `snap`, `zstd`, `lz4` —
-# are enabled. The bundle contract (`docs/04` §2) does not yet name a codec, so the
-# trio is enabled as a contract clarification to settle with IronCondor (ADR-0010).
-# The decode is synchronous, batched, and cancellation-polled on a blocking worker
-# — NO `async` feature, so `tokio` is not pulled into the domain reader.
-parquet = { version = "59.0", default-features = false, features = [
+parquet = { version = "59.2", default-features = false, features = [
     "arrow",
     "snap",
     "zstd",
     "lz4",
 ] }
-# The Arrow in-memory array types the typed table decoders read (issue #31,
-# `src/replay/tables.rs`, `docs/04-replay-mode.md` §2.2/§5). The #30 reader hands
-# each table's `RecordBatch` to the #31 decoders, which look up the documented
-# columns by name and downcast them to their concrete Arrow arrays
-# (`Int32Array`/`Int64Array`/`Float64Array`/`BooleanArray`/`StringArray`, plus
-# `DictionaryArray<Int32,Utf8>` handled defensively), then narrow each signed wire
-# integer into the typed row via checked `try_from` — never an `as` cast.
-# Promoted from a #30 DEV-dependency to a direct dependency: NO new crate enters
-# the graph — `arrow-array` is already compiled in the tree as `parquet`'s own
-# transitive dependency and was already a dev-dependency, so this only names it for
-# the production decode path (the same "no new surface" promotion pattern as #29's
-# `serde_json`; supply-chain audit note in CHANGELOG, ADR-0010). `arrow-schema`
-# (schema/`DataType` construction) is needed only by the `#[cfg(test)]` batch
-# writers, so it stays a dev-dependency. Version pinned to `parquet` 59's arrow
-# epoch.
-arrow-array = "59.0"
-# The structured logging facade the crate emits through (`CLAUDE.md` governance
-# deviation 3: `tracing` only, NEVER stdout/stderr while the TUI owns the terminal —
-# `println!`/`eprintln!`/`dbg!` are forbidden because stdout IS the UI). The first
-# production emitter is the contained-panic seam on the payoff-curve builds (issue
-# #131, `src/app/payoff_build.rs`): when the upstream `optionstratlib` pricing math
-# panics, the screen degrades to an honest "curve unavailable" state and ONE `WARN`
-# names the curve (never the dropped panic payload).
-# Promoted from a DEV-dependency to a direct dependency: NO new crate enters the
-# graph — `tracing` is already compiled in the tree as a transitive dependency of the
-# non-optional `optionstratlib` (and `deribit`/`tastytrade`) and was already a
-# dev-dependency — so `cargo audit`/`cargo deny` see NO new surface (the same "no new
-# surface" promotion pattern as #29's `serde_json` and #31's `arrow-array`).
-# `tracing-subscriber` stays a DEV-dependency: the binary's TUI-safe file sink is a
-# separate, still-deferred piece of work, and a library must never install a global
-# subscriber.
+arrow-array = "59.2"
 tracing = "0.1"
 
 [dev-dependencies]
-proptest = "1.0"
-# The bench harness (issue #21, `benches/*`, `docs/06-performance.md` §4,
-# `docs/TESTING.md` §11). DEV-ONLY — neither crate rides in the release binary,
-# and both are used exclusively by the `required-features = ["bench"]` targets.
-# `criterion` is the timing harness; `default-features = false` drops the
-# `plotters`/`rayon`/html-report tree we do not use, keeping only
-# `cargo_bench_support` (the `--bench` CLI + summary). `hdrhistogram` records the
-# p50/p99/p99.9 tail that headlines `BENCH.md` (a frame budget is a tail metric,
-# so criterion's mean is context only). Explicit-approval addition (CLAUDE.md
-# "Coding Rules") — supply-chain audit note in CHANGELOG. MSRV: both are well
-# under the crate's 1.88 floor.
-criterion = { version = "0.5", default-features = false, features = [
+proptest = "1.11"
+criterion = { version = "0.8", default-features = false, features = [
     "cargo_bench_support",
 ] }
-hdrhistogram = "7.0"
-# `test-util` enables the controllable virtual clock (`#[tokio::test(start_paused
-# = true)]`, `tokio::time::pause`/`advance`) so the supervisor's 2 s
-# bounded-join-then-abort is asserted with ZERO real wall-clock wait (issue #11).
-# `net` gives the `TcpListener` the Alpaca captured-log redaction proof's local mock
-# WebSocket server binds (issue #99, `src/providers/alpaca.rs`); it is already
-# feature-unified into the tree by `deribit-http`/`reqwest`, so this only names it
-# explicitly for the dev build. Dev-only, so none rides in the release binary; the
-# runtime/macros/time features are already in the main `tokio` dependency.
-tokio = { version = "1.0", default-features = false, features = [
+hdrhistogram = "7.6"
+tokio = { version = "1.53", default-features = false, features = [
     "test-util",
     "net",
 ] }
-# The Alpaca gate-lift captured-log proof (issue #99, `docs/SECURITY.md` §2.4). The
-# redaction test drives the REAL upstream `alpaca-websocket` connect/auth/subscribe
-# cycle over a LOCAL mock WebSocket server (via the published
-# `AlpacaWebSocketClient::with_url` seam) and asserts the captured `tracing` output
-# masks the API key/secret. DEV-ONLY — none rides in the release binary — and all
-# three are a "no new crate" promotion of crates already resolved in the graph, so
-# `cargo audit`/`cargo deny` see NO new surface (the same pattern as #29's
-# `serde_json`): `tokio-tungstenite 0.29` is already pulled by the non-optional
-# `deribit-websocket` (and `alpaca-websocket`); `tracing`/`tracing-subscriber` are
-# already pulled by the non-optional `optionstratlib` (and `deribit`/`tastytrade`).
-# Feature trim keeps only what the test needs: `handshake` for the server-side
-# `accept_async` on a `ws://` (no TLS) mock, and `fmt` for the in-memory capturing
-# subscriber. Explicit-approval addition (CLAUDE.md "Coding Rules") — audit note in
-# CHANGELOG (ADR-0007).
-tokio-tungstenite = { version = "0.29", default-features = false, features = [
+tokio-tungstenite = { version = "0.30", default-features = false, features = [
     "handshake",
 ] }
 tracing-subscriber = { version = "0.3", default-features = false, features = [
     "fmt",
 ] }
-# The Parquet test-writer support (issues #30/#31). DEV-ONLY — none rides in the
-# release binary. `arrow-schema` (matched to `parquet` 59's arrow epoch) builds the
-# `Schema`/`Field`/`DataType` values the `#[cfg(test)]` writers use to serialise
-# tiny real Parquet fixtures for the ceiling round-trips and the typed-decode
-# tests; it is already compiled in the tree as `parquet`'s own transitive dep, so
-# this only names it for the tests. `arrow-array` moved to `[dependencies]` at #31
-# because the production decoders read its array types. `tempfile` gives each test
-# an auto-cleaned bundle directory (RAII `TempDir`), so no test leaves artifacts
-# behind. All RUSTSEC-clean, well under the 1.88 floor.
-arrow-schema = "59.0"
-tempfile = "3.0"
-# The compile-fixture harness for the `capabilities_source_compat` source-compat
-# gate (issue #44, `docs/TESTING.md` §3, `docs/SEMVER.md` provider-port
-# versioning). DEV-ONLY — it never rides in the release binary; it compiles the
-# `tests/ui/*` fixtures as separate crates against the built `chainview` lib
-# (the exact external-adapter story) and asserts a downstream struct literal for
-# a `#[non_exhaustive]` capability type is rejected while the builder path
-# compiles. Explicit-approval addition (CLAUDE.md "Coding Rules") — supply-chain
-# audit note in CHANGELOG (`cargo audit` + `cargo deny check`). All-permissive
-# tree (`glob`/`termcolor`/`dissimilar`/`serde`/`serde_json`/`toml`, the last
-# three already in the graph); MIT/Apache-2.0, well under the 1.88 floor and
-# RUSTSEC-clean. The gate is EXECUTED only on the pinned 1.88 CI job (committed
-# `.stderr` is rustc-version-sensitive); it self-skips on any other toolchain.
+arrow-schema = "59.2"
+tempfile = "3.27"
 trybuild = "1.0"
 
-# The panic-injection restore harness is a bare subprocess (no libtest capture),
-# so the child panics on a normal process with the default hook as the chained
-# tail — see `tests/terminal_restore.rs` and `docs/TESTING.md` §7.
 [[test]]
 name = "terminal_restore"
 harness = false

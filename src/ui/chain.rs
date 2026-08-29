@@ -1068,7 +1068,7 @@ const EM_DASH: &str = "—";
 #[must_use]
 fn fmt_price(value: Option<Positive>) -> String {
     match value {
-        Some(price) if price != Positive::INFINITY => format!("{price:.2}"),
+        Some(price) if price != Positive::MAX => format!("{price:.2}"),
         _ => EM_DASH.to_owned(),
     }
 }
@@ -1084,7 +1084,7 @@ fn fmt_price(value: Option<Positive>) -> String {
 #[must_use]
 fn fmt_iv(value: Option<Positive>) -> String {
     match value {
-        Some(iv) if iv != Positive::INFINITY => iv
+        Some(iv) if iv != Positive::MAX => iv
             .to_dec()
             .checked_mul(Decimal::from(100))
             .map_or_else(|| EM_DASH.to_owned(), |pct| format!("{pct:.2}%")),
@@ -1145,7 +1145,7 @@ fn fmt_expiry_date(expiration: DateTime<Utc>) -> String {
 /// an integer strike reads `60000` and a fractional one keeps its places.
 #[must_use]
 fn fmt_strike(strike: Positive) -> String {
-    if strike == Positive::INFINITY {
+    if strike == Positive::MAX {
         return EM_DASH.to_owned();
     }
     format!("{}", strike.round_to(2))

@@ -313,10 +313,10 @@ fn vol_samples(chain: &OptionChain) -> Vec<Positive> {
 }
 
 /// Whether an implied volatility is usable: strictly positive and not the non-finite
-/// [`Positive::INFINITY`] sentinel (mirrors the payoff builder's gate, #27).
+/// [`Positive::MAX`] sentinel (mirrors the payoff builder's gate, #27).
 #[must_use]
 fn usable_iv(iv: Positive) -> bool {
-    iv > Positive::ZERO && iv != Positive::INFINITY
+    iv > Positive::ZERO && iv != Positive::MAX
 }
 
 /// Apply the #25 plausibility gate: a `Provider` (venue) IV is trusted as-is; a

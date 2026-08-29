@@ -90,7 +90,21 @@ const DEFAULT_PROVIDER: &str = "deribit";
 /// The credential field names a provider may declare (per its `AuthKind`).
 /// Used to reject a credential key that appears in a config file — the values
 /// themselves come from the environment only.
-const CREDENTIAL_KEYS: [&str; 5] = ["token", "username", "password", "api_key", "secret"];
+///
+/// `client_secret` / `refresh_token` are the tastytrade OAuth2 pair
+/// (`CHAINVIEW_TASTYTRADE_CLIENT_SECRET` / `CHAINVIEW_TASTYTRADE_REFRESH_TOKEN`,
+/// `src/providers/tastytrade.rs`). They are listed SEPARATELY from `secret` /
+/// `token` because the rejection matches a key exactly: without their own entries
+/// a config file carrying `client_secret = "…"` would sail past the guard.
+const CREDENTIAL_KEYS: [&str; 7] = [
+    "token",
+    "username",
+    "password",
+    "api_key",
+    "secret",
+    "client_secret",
+    "refresh_token",
+];
 
 // Environment-variable names for the global settings (§4). Per-provider keys
 // are built with [`provider_env_var`].

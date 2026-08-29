@@ -416,7 +416,7 @@ fn price_grid(positions: &[Position]) -> Option<Vec<Positive>> {
     // Snap every leg STRIKE in as an explicit sample so no payoff kink falls strictly
     // between two grid samples — the break-even reconstruction stays exact.
     for position in positions {
-        if position.option.strike_price != Positive::INFINITY {
+        if position.option.strike_price != Positive::MAX {
             grid.push(position.option.strike_price);
         }
     }

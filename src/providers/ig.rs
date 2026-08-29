@@ -1114,6 +1114,21 @@ fn median_strike(by_strike: &BTreeMap<Positive, StrikePair<'_>>) -> Positive {
 /// only** — the inner message (which may hold a URL, body, or a credential the
 /// upstream may interpolate) is never carried (`docs/03-data-providers.md` §6,
 /// `docs/SECURITY.md` §1). Only a non-secret HTTP status rides along.
+///
+/// # The three `ig-client 0.16` allowance variants
+///
+/// `0.16` split IG's single `RateLimitExceeded` into the venue's own three
+/// allowance rejections — `ApiKeyAllowanceExceeded`
+/// (`error.public-api.exceeded-api-key-allowance`), `AccountAllowanceExceeded`
+/// (`…exceeded-account-allowance`) and `TradingAllowanceExceeded`
+/// (`…exceeded-account-trading-allowance`). All three are "the venue refused
+/// because a budget ran out", so all three map onto the existing
+/// [`ProviderError::RateLimited`] case — with `None`, because unlike
+/// `HistoricalDataAllowanceExceeded` **none of them carries a reset instant**, and
+/// inventing a retry-after would be fabricated data. The distinction the upstream
+/// draws (which allowance, and whether rotating an API key of a pool could help)
+/// is a *credential-pool* concern: ChainView holds exactly one IG key, so it has
+/// no rotation to perform and the three collapse to one honest category here.
 fn ig_error(err: AppError) -> ProviderError {
     match err {
         AppError::Auth(_) | AppError::Unauthorized | AppError::OAuthTokenExpired => {
@@ -1127,7 +1142,10 @@ fn ig_error(err: AppError) -> ProviderError {
             TransportKind::Http,
             Some(404),
         ))),
-        AppError::RateLimitExceeded => ProviderError::RateLimited(None),
+        AppError::RateLimitExceeded
+        | AppError::ApiKeyAllowanceExceeded
+        | AppError::AccountAllowanceExceeded
+        | AppError::TradingAllowanceExceeded => ProviderError::RateLimited(None),
         AppError::HistoricalDataAllowanceExceeded { allowance_expiry } => {
             ProviderError::RateLimited(Some(Duration::from_secs(allowance_expiry)))
         }
@@ -1885,6 +1903,36 @@ mod tests {
             !format!("{err} {err:?}").contains("do-not-log-this-key"),
             "a ProviderError must never carry a credential"
         );
+    }
+
+    // === Upstream error mapping ==============================================
+
+    #[test]
+    fn test_ig_allowance_variants_map_to_rate_limited_without_a_retry_after() {
+        // `ig-client 0.16` split the single `RateLimitExceeded` into IG's own
+        // three allowance rejections. All three are "a budget ran out", so all
+        // three land on the EXISTING `RateLimited` case; none of them carries a
+        // reset instant, so the retry-after stays `None` rather than fabricated.
+        for err in [
+            AppError::RateLimitExceeded,
+            AppError::ApiKeyAllowanceExceeded,
+            AppError::AccountAllowanceExceeded,
+            AppError::TradingAllowanceExceeded,
+        ] {
+            match ig_error(err) {
+                ProviderError::RateLimited(None) => {}
+                other => panic!("expected RateLimited(None), got {other:?}"),
+            }
+        }
+        // The historical-data allowance is the one that DOES carry a reset.
+        match ig_error(AppError::HistoricalDataAllowanceExceeded {
+            allowance_expiry: 604_800,
+        }) {
+            ProviderError::RateLimited(Some(delay)) => {
+                assert_eq!(delay, Duration::from_secs(604_800));
+            }
+            other => panic!("expected RateLimited(Some(_)), got {other:?}"),
+        }
     }
 
     // === Expiry resolution ====================================================

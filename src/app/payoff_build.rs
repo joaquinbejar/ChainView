@@ -450,10 +450,10 @@ fn plausible_leg_iv(iv: Positive, origin: GreeksOrigin) -> Option<Positive> {
 }
 
 /// Whether an implied volatility is usable for pricing: strictly positive and not
-/// the non-finite [`Positive::INFINITY`] sentinel.
+/// the non-finite [`Positive::MAX`] sentinel.
 #[must_use]
 fn usable_iv(iv: Positive) -> bool {
-    iv > Positive::ZERO && iv != Positive::INFINITY
+    iv > Positive::ZERO && iv != Positive::MAX
 }
 
 /// The deterministic fractional-day span from `as_of` to `expiration_utc`, or
@@ -1192,7 +1192,7 @@ mod tests {
 
     /// An absurd but **finite** `Positive` mark — half of `Decimal::MAX`, so three
     /// contracts of it overflow the upstream cost basis. Deliberately NOT
-    /// `Positive::INFINITY` (which IS `Decimal::MAX`): the mark-honesty filter treats
+    /// `Positive::MAX` (which IS `Decimal::MAX`): the mark-honesty filter treats
     /// that sentinel as "no mark", which would test the unpriceable path instead.
     #[track_caller]
     fn huge_positive() -> Positive {

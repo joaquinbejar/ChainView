@@ -1266,7 +1266,7 @@ pub struct BuilderLeg {
 impl BuilderLeg {
     /// The leg's mark (mid) price in `chain`, or `None` when the strike is absent
     /// from the chain, the relevant side has no mid this frame, **or** the mid is the
-    /// non-finite `Positive::INFINITY` sentinel — the `—`-not-`0` honesty rule
+    /// non-finite `Positive::MAX` sentinel — the `—`-not-`0` honesty rule
     /// (`docs/01-domain-model.md` §8). A pure lookup: validation and the builder
     /// widget both read the mark through this one helper so they cannot disagree on
     /// what "known" means.
@@ -1280,10 +1280,10 @@ impl BuilderLeg {
             OptionStyle::Call => od.call_middle,
             OptionStyle::Put => od.put_middle,
         };
-        // Honesty symmetry with the display: `fmt_price` renders the `Positive::INFINITY`
+        // Honesty symmetry with the display: `fmt_price` renders the `Positive::MAX`
         // sentinel as `—` (unknown), so an infinite mid is "no mark" here too — it fails
         // validation with `NoMark`, never passing a value the widget would paint as `—`.
-        mid.filter(|m| *m != Positive::INFINITY)
+        mid.filter(|m| *m != Positive::MAX)
     }
 }
 
