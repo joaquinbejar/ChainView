@@ -80,8 +80,15 @@ jobs:
             os: ubuntu-latest
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
+          # `macos-13` was GitHub's last Intel image and is RETIRED: a job asking
+          # for that label is never assigned a runner, sits queued, and is
+          # auto-cancelled at the 24-hour limit — which is exactly how the v0.1.1
+          # cut died (build-assets never completed, so `publish` and `release`
+          # were skipped and the tag produced no Release). `macos-15-intel` is the
+          # served Intel image; it keeps the smoke step NATIVE, which is the whole
+          # value of building per target rather than cross-compiling.
           - target: x86_64-apple-darwin
-            os: macos-13
+            os: macos-15-intel
           - target: aarch64-apple-darwin
             os: macos-14
     steps:
