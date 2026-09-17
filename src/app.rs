@@ -1777,6 +1777,34 @@ impl PayoffBuilder {
         }
     }
 
+    /// Stage the committed strategy into the contained-pricing-panic state (#131):
+    /// the empty geometry plus the compute-failed flag, exactly as
+    /// [`CommittedStrategy::populate_geometry`] records a
+    /// [`GeometryBuild::ComputeFailed`](payoff_build::GeometryBuild::ComputeFailed).
+    /// The legs stay as committed, because a panicking build never touches them. A
+    /// no-op with nothing committed.
+    ///
+    /// `#[cfg(test)]`, the live twin of [`LoadedReplay::force_payoff_compute_failed`]:
+    /// since `optionstratlib 0.21` reports the cost-basis overflow as a typed error
+    /// instead of panicking, no chain input can drive the upstream panic through
+    /// `commit`, so the payoff screen's render of this state cannot otherwise be
+    /// pinned by a `TestBackend` test. The builder's own boundary test drives a real
+    /// panic through the production `build_geometry_with` seam; this only stages the
+    /// resulting state for the render assertion.
+    #[cfg(test)]
+    pub(crate) fn force_curve_compute_failed(&mut self) {
+        let Some(committed) = self.committed.as_mut() else {
+            return;
+        };
+        committed.grid = Vec::new();
+        committed.entry_positions = Vec::new();
+        committed.expiration = payoff_build::empty_series();
+        committed.tplus0 = payoff_build::empty_series();
+        committed.break_evens = Vec::new();
+        committed.compute_failed = true;
+        self.bump_graph();
+    }
+
     /// Discard the uncommitted strategy and return to the empty state (`Esc`): clear
     /// the legs, cursor, errors, and any commit. The [`CurveMode`] is a view
     /// preference and is **kept**. A no-op (no redraw) when already empty.

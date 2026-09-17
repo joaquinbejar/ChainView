@@ -1060,9 +1060,12 @@ impl LiveChainSource {
 impl IbkrChainSource for LiveChainSource {
     async fn option_params(&self, underlying: &str) -> Result<Vec<RawOptionParams>, ProviderError> {
         let security_type = security_type_for(underlying);
+        // ibapi 4.x: `option_chain` is a builder; the exchange stays unset (the
+        // old `""` = every listing exchange) and `subscribe()` submits the request.
         let mut subscription = self
             .client
-            .option_chain(underlying, "", security_type, 0)
+            .option_chain(underlying, security_type, 0)
+            .subscribe()
             .await
             .map_err(ibkr_error)?;
         let chains = subscription

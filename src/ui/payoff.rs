@@ -1098,70 +1098,25 @@ mod tests {
         )
     }
 
-    /// An absurd but **finite** `Positive` provider mark — half of `Decimal::MAX`, so
-    /// three contracts of it overflow the upstream cost basis. Deliberately NOT
-    /// `Positive::MAX` (which IS `Decimal::MAX`): the mark-honesty filter treats
-    /// that sentinel as "no mark", which would exercise the unpriceable path instead.
-    #[track_caller]
-    fn huge_positive() -> Positive {
-        let max = optionstratlib::prelude::Decimal::MAX;
-        let half = match max.checked_div(optionstratlib::prelude::Decimal::from(2)) {
-            Some(d) => d,
-            None => panic!("Decimal::MAX / 2 is representable"),
-        };
-        match Positive::new_decimal(half) {
-            Ok(p) => p,
-            Err(e) => panic!("half of Decimal::MAX is a valid Positive: {e}"),
-        }
-    }
-
-    /// A live state whose FULL_A row carries an absurd [`huge_positive`] mark, so a
-    /// three-contract leg makes `optionstratlib`'s cost basis (`premium * quantity`)
-    /// overflow and **panic** inside the off-draw geometry build (#131). The panic is
-    /// contained there, so the committed strategy carries the compute-failed state and
-    /// the screen renders its own message. The mid is set directly — `set_mid_prices`
-    /// would overflow on `bid + ask` in the fixture instead of in the code under test.
-    fn overflow_mark_live_state() -> LiveState {
-        let mut chain = OptionChain::new("BTC", pos(FULL_A), "2025-06-27".to_owned(), None, None);
-        let _ = chain.options.insert(OptionData {
-            strike_price: pos(FULL_A),
-            call_middle: Some(huge_positive()),
-            put_middle: Some(huge_positive()),
-            implied_volatility: pos(0.5),
-            ..Default::default()
-        });
-        let store = ChainStore::seed(
-            ChainFetch::new(
-                chain,
-                ExpirySource::new("BTC", utc(EXP), pid("deribit")),
-                AliasCatalog::new(),
-            ),
-            ChainSource::Merged,
-            Duration::from_secs(2),
-            utc(EXP),
-        );
-        LiveState::new(
-            SourceBinding::new(pid("deribit"), caps(), StreamHealth::Live),
-            store,
-        )
-    }
-
-    /// A COMMITTED live state in the contained-pricing-panic state (#131): one
-    /// two-contract leg on the absurd-mark chain, committed through the real
-    /// `commit` -> `build_geometry` path.
+    /// A COMMITTED live state in the contained-pricing-panic state (#131): one leg on
+    /// the FULL_A row committed through the real `commit` -> `build_geometry` path,
+    /// then staged into the compute-failed state through the builder's
+    /// `#[cfg(test)]` seam. Up to `optionstratlib 0.20` a half-`Decimal::MAX` mark at
+    /// three contracts drove a REAL upstream panic through `commit`; `0.21` reports
+    /// that overflow as a typed error, so no chain input panics any more and the
+    /// state is staged instead (the builder's own boundary test drives a real panic
+    /// through the production `build_geometry_with` seam).
     #[track_caller]
     fn compute_failed_live_state() -> LiveState {
-        let mut state = overflow_mark_live_state();
+        let mut state = live_state();
         focus(&mut state, 0);
         press(&mut state, KeyCode::Char('a'));
-        // A quantity of 3 is what tips `premium * quantity` past `Decimal::MAX`.
-        press(&mut state, KeyCode::Char('+'));
-        press(&mut state, KeyCode::Char('+'));
         press(&mut state, KeyCode::Enter);
         assert!(
             state.payoff_builder.committed().is_some(),
-            "the leg validates (its mark is present), even though pricing panics",
+            "the leg validates (its mark is present)",
         );
+        state.payoff_builder.force_curve_compute_failed();
         assert!(
             state.payoff_builder.curve_compute_failed(),
             "the contained upstream panic is recorded on the committed strategy",
