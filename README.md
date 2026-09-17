@@ -113,3 +113,22 @@ MIT — see [LICENSE](./LICENSE).
 ## Contact
 
 Joaquin Bejar — jb@taunais.com
+
+<!-- related-projects:start -->
+## Related projects
+
+Repositories by the same author that this project depends on, and repositories that depend on it.
+
+### Depends on
+
+| Repository | Description |
+|------------|-------------|
+| [alpaca-rs](https://github.com/joaquinbejar/alpaca-rs) · [crates.io](https://crates.io/crates/alpaca-http) | Rust clients for the Alpaca trading platform (HTTP, WebSocket and FIX). |
+| [deribit-http](https://github.com/joaquinbejar/deribit-http) · [crates.io](https://crates.io/crates/deribit-http) | HTTP REST API client for the Deribit trading platform. |
+| [deribit-websocket](https://github.com/joaquinbejar/deribit-websocket) · [crates.io](https://crates.io/crates/deribit-websocket) | WebSocket client for Deribit real-time market data and trading. |
+| [DXlink](https://github.com/joaquinbejar/DXlink) · [crates.io](https://crates.io/crates/dxlink) | Rust client for the DXLink WebSocket protocol used by tastytrade for real-time market data. |
+| [ig-client](https://github.com/joaquinbejar/ig-client) · [crates.io](https://crates.io/crates/ig-client) | Rust framework for the IG broker API (REST and Lightstreamer streaming). |
+| [OptionStratLib](https://github.com/joaquinbejar/OptionStratLib) · [crates.io](https://crates.io/crates/optionstratlib) | Options pricing, Greeks, strategies and simulation library. |
+| [tastytrade](https://github.com/joaquinbejar/tastytrade) · [crates.io](https://crates.io/crates/tastytrade) | Rust library for trading through the tastytrade API. |
+
+<!-- related-projects:end -->
