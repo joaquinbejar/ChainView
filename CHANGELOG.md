@@ -18,8 +18,6 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Changed
 
-- Dependencies updated to latest stable versions (optionstratlib 0.20 -> 0.21, ig-client 0.16 -> 0.18, tastytrade 0.4 -> 0.5, ibapi 3.3 -> 4.1, parquet/arrow 59 -> 60).
-
 ### Deprecated
 
 ### Removed
@@ -27,6 +25,13 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 ### Fixed
 
 ### Security
+
+## [0.1.2] - 2026-09-18
+
+### Changed
+
+- Dependencies updated to latest stable versions (optionstratlib 0.20 -> 0.21, ig-client 0.16 -> 0.18, tastytrade 0.4 -> 0.5, ibapi 3.3 -> 4.1, parquet/arrow 59 -> 60).
+- Lockfile refreshed to the 2026-09-18 patch releases (optionstratlib 0.21.1, ig-client 0.18.2, tastytrade 0.5.1, dxlink 0.3.3, alpaca-http 0.21.3, deribit-http 0.7.3, deribit-websocket 0.3.4).
 
 ## [0.1.1] - 2026-08-29
 
@@ -3091,5 +3096,8 @@ for why it was built that way.
 - Design documentation under `docs/` (PRD, roadmap, architecture, data
   providers, replay mode, views/UX, ADRs, and specs).
 
-[Unreleased]: https://github.com/joaquinbejar/ChainView/compare/v0.0.1...HEAD
+[Unreleased]: https://github.com/joaquinbejar/ChainView/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/joaquinbejar/ChainView/compare/v0.1.1...v0.1.2
+[0.1.1]: https://github.com/joaquinbejar/ChainView/compare/v0.1.0...v0.1.1
+[0.1.0]: https://github.com/joaquinbejar/ChainView/compare/v0.0.1...v0.1.0
 [0.0.1]: https://github.com/joaquinbejar/ChainView/releases/tag/v0.0.1
