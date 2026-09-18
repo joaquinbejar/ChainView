@@ -18,6 +18,8 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Changed
 
+- Dependencies updated to latest stable versions (optionstratlib 0.20 -> 0.21, ig-client 0.16 -> 0.18, tastytrade 0.4 -> 0.5, ibapi 3.3 -> 4.1, parquet/arrow 59 -> 60).
+
 ### Deprecated
 
 ### Removed

@@ -3195,6 +3195,48 @@ mod tests {
         assert!(rendered.starts_with("unsupported schema: "));
     }
 
+    // --- #53: the decoder-panic boundary, pinned independently of the upstream ---
+    //
+    // `arrow 60` reports the fuzz-found malformed embedded `ARROW:schema` as a typed
+    // parser error instead of panicking (the integration fixture accepts either), so
+    // the boundary itself is driven here with a panicking closure.
+
+    #[test]
+    fn test_catch_decode_panic_maps_an_upstream_panic_to_a_typed_parquet_error() {
+        // The libtest default hook prints the caught panic to the captured stderr —
+        // expected noise, never a failure.
+        match catch_decode_panic::<()>("greeks_attribution.parquet", || {
+            panic!("arrow-ipc get_data_type")
+        }) {
+            Err(BundleError::Parquet(detail)) => {
+                assert!(
+                    detail.starts_with("greeks_attribution.parquet"),
+                    "the typed error names the table: {detail}"
+                );
+                assert!(
+                    detail.contains("panicked") && !detail.contains("get_data_type"),
+                    "the payload is dropped, never interpolated: {detail}"
+                );
+            }
+            other => {
+                panic!("a contained decoder panic must be a typed Parquet error, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn test_catch_decode_panic_passes_a_normal_result_through_unchanged() {
+        // A value `op` produces normally — including a typed reject — is untouched.
+        assert!(matches!(
+            catch_decode_panic("fills.parquet", || Ok::<u8, BundleError>(7)),
+            Ok(7)
+        ));
+        match catch_decode_panic::<()>("fills.parquet", || Err(BundleError::Cancelled)) {
+            Err(BundleError::Cancelled) => {}
+            other => panic!("a normal `Err` must pass through, got {other:?}"),
+        }
+    }
+
     #[test]
     fn test_clamp_schema_tag_never_panics_on_multibyte_utf8() {
         // Multi-byte chars: clamping on char boundaries must never split a byte

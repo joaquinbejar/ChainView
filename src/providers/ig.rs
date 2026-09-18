@@ -1158,6 +1158,13 @@ fn ig_error(err: AppError) -> ProviderError {
         AppError::Db(_) | AppError::InvalidInput(_) | AppError::Generic(_) => {
             transport(TransportKind::Http)
         }
+        // `0.18` added the market-catalog enumeration errors. ChainView never
+        // walks the catalog, so a failed/incomplete traversal is a plain HTTP-side
+        // failure; the inner `source` is deliberately not unwrapped (it would carry
+        // upstream text).
+        AppError::CatalogRequest { .. } | AppError::CatalogPagination { .. } => {
+            transport(TransportKind::Http)
+        }
     }
 }
 

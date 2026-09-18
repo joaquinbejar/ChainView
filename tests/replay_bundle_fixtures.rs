@@ -349,14 +349,18 @@ fn test_truncated_is_typed_decode_error_not_panic() {
 #[test]
 fn test_malformed_arrow_schema_is_typed_parquet_error_not_panic() {
     // The #53 fuzz-found crash: `greeks_attribution.parquet` carries a malformed
-    // embedded `ARROW:schema` flatbuffer that panics the upstream `arrow-ipc`
-    // decoder in `get_data_type`, reached through `ParquetRecordBatchReaderBuilder::
-    // try_new` while `load` reads the footer. Before the `catch_unwind` boundary in
-    // `src/replay/mod.rs`, that panic ESCAPED the reader (a `.map_err` cannot catch a
-    // `panic!`); this asserts it is now a typed `BundleError::Parquet` — never a
-    // panic — closing the crash->regression loop (`docs/TESTING.md` §13.3,
-    // `docs/SECURITY.md` §6.2). The three sibling tables and the manifest are valid,
-    // so the reject is the greeks decode specifically, not an earlier stage.
+    // embedded `ARROW:schema` flatbuffer that panicked the upstream `arrow-ipc`
+    // decoder in `get_data_type` (up to `arrow 59`), reached through
+    // `ParquetRecordBatchReaderBuilder::try_new` while `load` reads the footer.
+    // Before the `catch_unwind` boundary in `src/replay/mod.rs`, that panic ESCAPED
+    // the reader (a `.map_err` cannot catch a `panic!`); this asserts it is a typed
+    // `BundleError::Parquet` — never a panic — closing the crash->regression loop
+    // (`docs/TESTING.md` §13.3, `docs/SECURITY.md` §6.2). `arrow 60` reports the
+    // same input as a typed parser error before any panic, so EITHER the upstream's
+    // own error or the boundary's contained-panic message is accepted here; the
+    // boundary itself is pinned by its unit test in `src/replay/mod.rs`. The three
+    // sibling tables and the manifest are valid, so the reject is the greeks decode
+    // specifically, not an earlier stage.
     match load_with("malformed_arrow_schema", ResourceCeilings::default()) {
         Err(BundleError::Parquet(detail)) => {
             assert!(
@@ -364,8 +368,9 @@ fn test_malformed_arrow_schema_is_typed_parquet_error_not_panic() {
                 "the reject must name the malformed greeks table: {detail}"
             );
             assert!(
-                detail.contains("panicked"),
-                "the decoder-panic boundary produced this typed error: {detail}"
+                detail.contains("panicked") || detail.contains("Parser error"),
+                "the reject is the decoder-panic boundary or the upstream's own \
+                 typed schema error: {detail}"
             );
         }
         other => panic!(

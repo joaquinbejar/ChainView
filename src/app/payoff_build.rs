@@ -203,7 +203,23 @@ pub(crate) fn warn_curve_compute_failed(curve: &'static str) {
 /// untouched (the hook stays silent only for this contained call, on this thread).
 #[must_use]
 pub(crate) fn build_geometry(legs: &[BuilderLeg], store: &ChainStore) -> GeometryBuild {
-    match crate::terminal::contained(|| build_geometry_inner(legs, store)) {
+    build_geometry_with(legs, store, build_geometry_inner)
+}
+
+/// [`build_geometry`] over an injectable geometry build — the contained-panic
+/// boundary itself, factored so a test can drive a **panicking** `inner` through the
+/// production mapping (the shipped [`build_geometry`] passes
+/// [`build_geometry_inner`]). Mirrors `replay_payoff_build::build_with`: since
+/// `optionstratlib 0.21` the cost-basis overflow that used to `panic!` surfaces as a
+/// typed error, so no reachable chain input drives the upstream panic any more and
+/// the boundary is pinned through this seam instead.
+#[must_use]
+fn build_geometry_with(
+    legs: &[BuilderLeg],
+    store: &ChainStore,
+    inner: impl FnOnce(&[BuilderLeg], &ChainStore) -> Option<PayoffGeometry>,
+) -> GeometryBuild {
+    match crate::terminal::contained(|| inner(legs, store)) {
         Some(Some(geometry)) => GeometryBuild::Priced(Box::new(geometry)),
         Some(None) => GeometryBuild::NotPriceable,
         None => {
@@ -258,7 +274,22 @@ pub(crate) fn rebuild_tplus0(
     grid: &[Positive],
     entry_positions: &[Position],
 ) -> TPlus0Build {
-    match crate::terminal::contained(|| tplus0_curve(entry_positions, legs, store, grid)) {
+    rebuild_tplus0_with(legs, store, grid, entry_positions, tplus0_curve)
+}
+
+/// [`rebuild_tplus0`] over an injectable reprice — the contained-panic boundary
+/// itself, factored so a test can drive a **panicking** `inner` through the
+/// production mapping (the shipped [`rebuild_tplus0`] passes [`tplus0_curve`]). See
+/// [`build_geometry_with`] for why the seam exists.
+#[must_use]
+fn rebuild_tplus0_with(
+    legs: &[BuilderLeg],
+    store: &ChainStore,
+    grid: &[Positive],
+    entry_positions: &[Position],
+    inner: impl FnOnce(&[Position], &[BuilderLeg], &ChainStore, &[Positive]) -> GraphData,
+) -> TPlus0Build {
+    match crate::terminal::contained(|| inner(entry_positions, legs, store, grid)) {
         Some(series) => TPlus0Build::Series(series),
         None => {
             warn_curve_compute_failed(TPLUS0_CURVE);
@@ -669,8 +700,8 @@ mod tests {
 
     use super::{
         BuilderLeg, GeometryBuild, GreeksOrigin, MIN_PLAUSIBLE_LOCAL_IV, PayoffGeometry, Side,
-        TPlus0Build, break_even_points, build_geometry, expiration_series, plausible_leg_iv,
-        rebuild_tplus0, tplus0_series,
+        TPlus0Build, break_even_points, build_geometry, build_geometry_with, expiration_series,
+        plausible_leg_iv, rebuild_tplus0, rebuild_tplus0_with, tplus0_series,
     };
     use crate::chain::{
         AliasCatalog, ChainFetch, ChainSource, ChainStore, ContractSpecFingerprint, ExerciseStyle,
@@ -1180,15 +1211,18 @@ mod tests {
 
     // --- #131: a contained upstream pricing panic, not a dead terminal ---------
     //
-    // The injection is a REAL upstream panic reached through the production call
-    // chain, not a test hook: a mark at `Decimal::MAX` with a quantity of 2 makes
-    // `Position::total_cost` (inside `optionstratlib`'s `pnl_at_expiration`) evaluate
-    // `Positive * Positive` past the `Decimal` range, and `positive`'s `Mul` panics
-    // (`Positive arithmetic overflow in mul`) where no `Result` exists. That is an
-    // absurd-but-reachable provider mark, and exactly the class of upstream panic the
-    // boundary exists for. The process panic hook is not installed in a unit test, so
-    // the libtest default hook prints the caught panic to the captured stderr —
-    // expected noise, never a failure.
+    // Up to `optionstratlib 0.20` the injection was a REAL upstream panic reached
+    // through the production call chain: a half-`Decimal::MAX` mark at a quantity of
+    // 3 made `Position::total_cost` (inside `pnl_at_expiration`) evaluate
+    // `Positive * Positive` past the `Decimal` range, and `positive`'s `Mul` panicked
+    // where no `Result` existed. `0.21` takes every step of that cost basis through
+    // checked arithmetic and reports the overflow as a typed `PositionError`, so no
+    // reachable chain input panics any more. The boundary is therefore pinned through
+    // the `*_with` seams with a panicking closure (as `replay_payoff_build::build_with`
+    // always was), and the overflow fixture now pins the OTHER fact: a typed upstream
+    // error is skipped per sample, never a contained panic. The process panic hook is
+    // not installed in a unit test, so the libtest default hook prints the caught panic
+    // to the captured stderr — expected noise, never a failure.
 
     /// An absurd but **finite** `Positive` mark — half of `Decimal::MAX`, so three
     /// contracts of it overflow the upstream cost basis. Deliberately NOT
@@ -1207,7 +1241,8 @@ mod tests {
     }
 
     /// The leg quantity that tips `premium * quantity` past `Decimal::MAX` for a
-    /// [`huge_positive`] premium — the overflow the upstream `Positive` `Mul` panics on.
+    /// [`huge_positive`] premium — the overflow the upstream checked cost basis
+    /// reports as a typed error (and `0.20` panicked on).
     const OVERFLOW_QTY: u32 = 3;
 
     /// A one-strike chain at `spot` whose CALL mark is [`max_positive`] — the mid is
@@ -1274,20 +1309,50 @@ mod tests {
     #[test]
     fn test_build_geometry_contains_an_upstream_pricing_panic() {
         // The upstream math panics mid-build; the boundary maps it to the DISTINCT
-        // ComputeFailed outcome instead of unwinding into the render loop.
+        // ComputeFailed outcome instead of unwinding into the render loop. Driven
+        // through the production `build_geometry_with` seam (the shipped
+        // `build_geometry` is the same boundary over the real geometry build).
+        let spot = 100.0;
+        let legs = atm_call_leg(spot);
+        let store = overflow_store(spot);
+        match build_geometry_with(&legs, &store, |_, _| panic!("upstream pricing math")) {
+            GeometryBuild::ComputeFailed => {}
+            GeometryBuild::Priced(_) => panic!("a panicking build cannot yield a geometry"),
+            GeometryBuild::NotPriceable => {
+                panic!("a PANIC must not be reported as unpriceable legs (#131)")
+            }
+        }
+    }
+
+    #[test]
+    fn test_build_geometry_overflow_basis_is_a_typed_error_not_a_panic() {
+        // Since `optionstratlib 0.21` the cost basis that used to panic
+        // (`premium * quantity` past `Decimal::MAX`) surfaces as a typed error: every
+        // grid sample is skipped (never fabricated) and NO panic is contained, so the
+        // outcome is a priced-but-empty expiration series — never `ComputeFailed`,
+        // which is reserved for a real contained panic.
         let spot = 100.0;
         let legs = vec![BuilderLeg {
             strike: pos(spot),
             style: OptionStyle::Call,
             side: Side::Buy,
-            // The quantity that tips `premium * quantity` past `Decimal::MAX`.
             qty: OVERFLOW_QTY,
         }];
         match build_geometry(&legs, &overflow_store(spot)) {
-            GeometryBuild::ComputeFailed => {}
-            GeometryBuild::Priced(_) => panic!("the absurd mark cannot price"),
-            GeometryBuild::NotPriceable => {
-                panic!("a PANIC must not be reported as unpriceable legs (#131)")
+            GeometryBuild::Priced(geometry) => {
+                let (series,) = xy(&geometry.expiration);
+                assert!(
+                    series.x.is_empty(),
+                    "an overflowing basis prices no sample: {series:?}"
+                );
+                assert!(
+                    geometry.break_evens.is_empty(),
+                    "no break-even without a curve"
+                );
+            }
+            GeometryBuild::NotPriceable => panic!("the marks are present; the legs validate"),
+            GeometryBuild::ComputeFailed => {
+                panic!("a typed upstream error is not a contained panic (#131)")
             }
         }
     }
@@ -1326,10 +1391,36 @@ mod tests {
         let store = overflow_store(spot);
         let grid = vec![pos(80.0), pos(100.0), pos(120.0)];
         let entry_positions = vec![overflow_entry_position(spot)];
-        match rebuild_tplus0(&legs, &store, &grid, &entry_positions) {
+        match rebuild_tplus0_with(&legs, &store, &grid, &entry_positions, |_, _, _, _| {
+            panic!("upstream pricing math")
+        }) {
             TPlus0Build::ComputeFailed => {}
             TPlus0Build::Series(series) => {
-                panic!("the absurd basis cannot reprice, got {series:?}")
+                panic!("a panicking reprice cannot yield a series, got {series:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn test_rebuild_tplus0_overflow_basis_is_a_typed_error_not_a_panic() {
+        // The frozen absurd basis reprices through `optionstratlib 0.21`'s checked
+        // cost basis: every sample errors and is skipped, so the outcome is the empty
+        // series — NOT `ComputeFailed`, because nothing panicked.
+        let spot = 100.0;
+        let legs = atm_call_leg(spot);
+        let store = overflow_store(spot);
+        let grid = vec![pos(80.0), pos(100.0), pos(120.0)];
+        let entry_positions = vec![overflow_entry_position(spot)];
+        match rebuild_tplus0(&legs, &store, &grid, &entry_positions) {
+            TPlus0Build::Series(series) => {
+                let (series,) = xy(&series);
+                assert!(
+                    series.x.is_empty(),
+                    "an overflowing basis reprices no sample: {series:?}"
+                );
+            }
+            TPlus0Build::ComputeFailed => {
+                panic!("a typed upstream error is not a contained panic (#131)")
             }
         }
     }
