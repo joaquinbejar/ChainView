@@ -47,6 +47,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   chain escape-hygiene golden moves by 0.01 vol point and about 0.001 theta).
   A premium no volatility can reproduce now reports `SolverError` instead
   of a bracket value.
+- Lockfile: `yoke-derive` 0.8.3 (yanked) -> 0.8.4, so `cargo audit` passes.
 - No change to the IronCondor result bundle: replay reads ChainView's own
   serde types and maps option styles itself, so bundles written against
   `optionstratlib` 0.21 still load.
