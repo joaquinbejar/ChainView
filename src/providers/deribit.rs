@@ -4715,8 +4715,9 @@ mod tests {
         use deribit_websocket::prelude::Value;
         use optionstratlib::chains::OptionData;
         use optionstratlib::chains::chain::OptionChain;
-        use optionstratlib::prelude::{Positive, ToPrimitive};
+        use optionstratlib::prelude::Positive;
         use optionstratlib::{ExpirationDate, OptionStyle};
+        use rust_decimal::prelude::ToPrimitive;
 
         use crate::chain::{
             ContractSpecFingerprint, ExerciseStyle, GreeksOrigin, GreeksRow, GreeksSidecar,

@@ -26,6 +26,32 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Security
 
+## [0.2.0] - 2026-10-10
+
+### Changed
+
+- **Breaking:** `optionstratlib` 0.21 -> 0.22 (0.22.1: `positive` 0.8,
+  `expiration_date` 0.5, `option_type` 0.5). Its types appear in ChainView's
+  public library API (`OptionChain`, `Positive`, `ExpirationDate`,
+  `GraphData`), so library consumers move to the same versions in the same
+  step. The 0.22 facade is split into feature-gated component crates;
+  ChainView enables only `visualization` (which brings pricing, market,
+  analytics, strategies, simulation and backtest), with no I/O, async or
+  Plotly packages.
+- Imports follow the 0.22 paths: `BasicAxisTypes` from
+  `optionstratlib::model`, the pricing methods through the `OptionPricing`
+  trait, and `ToPrimitive` from `rust_decimal` (now a direct dependency),
+  since the 0.22 prelude no longer re-exports it.
+- Locally computed IV and Greeks move in the last digits: 0.22 inverts IV
+  with one Newton solver to `1e-12` instead of a bisection to `1e-5` (the
+  chain escape-hygiene golden moves by 0.01 vol point and about 0.001 theta).
+  A premium no volatility can reproduce now reports `SolverError` instead
+  of a bracket value.
+- Lockfile: `yoke-derive` 0.8.3 (yanked) -> 0.8.4, so `cargo audit` passes.
+- No change to the IronCondor result bundle: replay reads ChainView's own
+  serde types and maps option styles itself, so bundles written against
+  `optionstratlib` 0.21 still load.
+
 ## [0.1.2] - 2026-09-18
 
 ### Changed
@@ -3096,7 +3122,8 @@ for why it was built that way.
 - Design documentation under `docs/` (PRD, roadmap, architecture, data
   providers, replay mode, views/UX, ADRs, and specs).
 
-[Unreleased]: https://github.com/joaquinbejar/ChainView/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/joaquinbejar/ChainView/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/joaquinbejar/ChainView/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/joaquinbejar/ChainView/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/joaquinbejar/ChainView/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/joaquinbejar/ChainView/compare/v0.0.1...v0.1.0
