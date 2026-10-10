@@ -66,6 +66,7 @@ use chrono::{DateTime, Utc};
 use optionstratlib::chains::chain::OptionChain;
 use optionstratlib::model::Position;
 use optionstratlib::prelude::{Decimal, Positive};
+use optionstratlib::pricing::OptionPricing;
 use optionstratlib::visualization::{GraphData, Series2D, TraceMode};
 use optionstratlib::{ExpirationDate, OptionType, Options, Side as OptionSide};
 

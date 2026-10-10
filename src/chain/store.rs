@@ -1932,7 +1932,14 @@ mod tests {
         );
 
         assert_ne!(leg_of(&store, 61_000.0, OptionStyle::Call), k2_call_before);
-        assert_ne!(leg_of(&store, 61_000.0, OptionStyle::Put), k2_put_before);
+        // The 61000 put's quote (2.5-2.9 BTC, converted to USD) is above the
+        // strike, so no volatility reproduces it. Since `optionstratlib` 0.22
+        // (one Newton solver, #859) the inversion reports that instead of
+        // returning a bracket value, so the leg is recomputed at both instants
+        // to the same `SolverError` rather than to two different numbers.
+        let k2_put_after = leg_of(&store, 61_000.0, OptionStyle::Put);
+        assert_eq!(k2_put_before.status, LegStatus::SolverError);
+        assert_eq!(k2_put_after.status, LegStatus::SolverError);
     }
 
     #[test]

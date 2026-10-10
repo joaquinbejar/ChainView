@@ -68,8 +68,9 @@
 //! [ADR-0001]: https://github.com/joaquinbejar/ChainView/blob/main/docs/adr/0001-ratatui-crossterm.md
 //! [`Chart`]: ratatui::widgets::Chart
 
-use optionstratlib::prelude::{Decimal, ToPrimitive};
+use optionstratlib::prelude::Decimal;
 use optionstratlib::visualization::{GraphData, Series2D, Surface3D};
+use rust_decimal::prelude::ToPrimitive;
 
 use crate::ui::theme::sanitize;
 

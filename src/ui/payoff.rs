@@ -928,12 +928,13 @@ mod tests {
     use optionstratlib::OptionStyle;
     use optionstratlib::chains::OptionData;
     use optionstratlib::chains::chain::OptionChain;
-    use optionstratlib::prelude::{Positive, ToPrimitive};
+    use optionstratlib::prelude::Positive;
     use optionstratlib::visualization::GraphData;
     use proptest::prelude::*;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::layout::Rect;
+    use rust_decimal::prelude::ToPrimitive;
 
     use super::{draw, handle_key, payoff_y_labels, y_bounds_including_zero};
     use crate::app::{BuilderLeg, CurveMode, LegError, LegFocus, LiveState, Side, SourceBinding};

@@ -1,6 +1,6 @@
 [package]
 name = "chainview"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.94"
 authors = ["Joaquin Bejar <jb@taunais.com>"]
@@ -163,7 +163,8 @@ toml = "1.1"
 humantime = "2.4"
 clap = { version = "4.6", features = ["derive"] }
 dotenvy = "0.15"
-optionstratlib = { version = "0.21", default-features = false }
+optionstratlib = { version = "0.22", default-features = false, features = ["visualization"] }
+rust_decimal = "1.43"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 async-trait = "0.1"
 tokio = { version = "1.53", default-features = false, features = [

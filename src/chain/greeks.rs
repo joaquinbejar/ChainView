@@ -78,6 +78,7 @@ use optionstratlib::chains::OptionData;
 use optionstratlib::chains::chain::OptionChain;
 use optionstratlib::greeks::{delta, gamma, rho, theta, vega};
 use optionstratlib::prelude::{Decimal, Positive};
+use optionstratlib::pricing::OptionPricing;
 use optionstratlib::{ExpirationDate, OptionStyle, OptionType, Options, Side};
 
 use super::events::{GreeksOrigin, GreeksRow, QUOTE_STALE_AFTER};
