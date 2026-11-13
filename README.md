@@ -106,13 +106,18 @@ bundles replay mode reads) ·
 [OrderBook-rs](https://github.com/joaquinbejar/OrderBook-rs) ·
 [Option-Chain-OrderBook](https://github.com/joaquinbejar/Option-Chain-OrderBook)
 
+## Contribution and Contact
+
+### **Contact Information**
+- **Author**: Joaquín Béjar García
+- **Email**: jb@taunais.com
+- **Telegram**: [@joaquin_bejar](https://t.me/joaquin_bejar)
+- **Repository**: <https://github.com/joaquinbejar/ChainView>
+- **Documentation**: <https://docs.rs/chainview>
+
 ## License
 
-MIT — see [LICENSE](./LICENSE).
-
-## Contact
-
-Joaquin Bejar — jb@taunais.com
+MIT: see [LICENSE](./LICENSE).
 
 <!-- related-projects:start -->
 ## Related projects
@@ -123,12 +128,12 @@ Repositories by the same author that this project depends on, and repositories t
 
 | Repository | Description |
 |------------|-------------|
-| [alpaca-rs](https://github.com/joaquinbejar/alpaca-rs) · [crates.io](https://crates.io/crates/alpaca-http) | Rust clients for the Alpaca trading platform (HTTP, WebSocket and FIX). |
-| [deribit-http](https://github.com/joaquinbejar/deribit-http) · [crates.io](https://crates.io/crates/deribit-http) | HTTP REST API client for the Deribit trading platform. |
-| [deribit-websocket](https://github.com/joaquinbejar/deribit-websocket) · [crates.io](https://crates.io/crates/deribit-websocket) | WebSocket client for Deribit real-time market data and trading. |
-| [DXlink](https://github.com/joaquinbejar/DXlink) · [crates.io](https://crates.io/crates/dxlink) | Rust client for the DXLink WebSocket protocol used by tastytrade for real-time market data. |
-| [ig-client](https://github.com/joaquinbejar/ig-client) · [crates.io](https://crates.io/crates/ig-client) | Rust framework for the IG broker API (REST and Lightstreamer streaming). |
-| [OptionStratLib](https://github.com/joaquinbejar/OptionStratLib) · [crates.io](https://crates.io/crates/optionstratlib) | Options pricing, Greeks, strategies and simulation library. |
-| [tastytrade](https://github.com/joaquinbejar/tastytrade) · [crates.io](https://crates.io/crates/tastytrade) | Rust library for trading through the tastytrade API. |
+| [DXlink](https://github.com/joaquinbejar/DXlink) | DXLink WebSocket client that streams tastytrade real-time quotes and Greeks into the chain view. |
+| [OptionStratLib](https://github.com/joaquinbejar/OptionStratLib) | Options pricing, Greeks and volatility models used to build and enrich the option chains shown on screen. |
+| [alpaca-rs](https://github.com/joaquinbejar/alpaca-rs) | Alpaca Markets client used by the Alpaca provider for option chain snapshots and streaming market data. |
+| [deribit-http](https://github.com/joaquinbejar/deribit-http) | Deribit REST client used by the Deribit provider to load instruments and option chain snapshots. |
+| [deribit-websocket](https://github.com/joaquinbejar/deribit-websocket) | Deribit WebSocket client used by the Deribit provider for real-time ticker updates. |
+| [ig-client](https://github.com/joaquinbejar/ig-client) | IG broker client used by the IG provider for market data over REST and Lightstreamer streaming. |
+| [tastytrade](https://github.com/joaquinbejar/tastytrade) | tastytrade API client used by the tastytrade provider to fetch option chains and authenticate streaming. |
 
 <!-- related-projects:end -->
