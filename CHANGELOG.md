@@ -24,6 +24,19 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- Live mode no longer stays on "connecting to <provider>… / waiting for the
+  first chain" forever: the chain screen now leaves its loading state once the
+  startup fetch succeeds or a full poll snapshot lands (affected every provider).
+- `ibkr`: the option chain now loads. `reqSecDefOptParams` was sent with an
+  underlying conId of `0`, which TWS rejects (`[321] Invalid contract id`); the
+  adapter now resolves the underlying's conId via `contract_details` first.
+- `ibkr`: bid/ask quotes are now read from the combined price+size ticks ibapi
+  delivers them in (they were previously ignored), and Greeks are taken only from
+  the model computation, so the `-2` "not computed" sentinels on the bid/ask/last
+  computations no longer overwrite them.
+- `ibkr`: the stream's backfill re-poll reuses the connected stream client
+  instead of opening a second socket under the same client id (which TWS rejects).
+
 ### Security
 
 ## [0.2.0] - 2026-10-10

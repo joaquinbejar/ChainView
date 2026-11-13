@@ -1085,6 +1085,9 @@ impl LiveState {
                 // A poll can move spot or the strike ladder, so refresh the cached
                 // ATM index off-draw here — draw never rescans the ladder.
                 self.atm_index = atm_index_of(self.store.chain());
+                // A full poll landed: the screen leaves its connecting state and
+                // renders from the store (the `Loading -> Ready` transition).
+                self.load = ScreenLoad::Ready;
                 true
             }
             None => false,
@@ -2289,9 +2292,8 @@ pub enum ScreenLoad {
     /// The screen renders its body from the store (which may itself be empty).
     ///
     /// Producer note: the `Loading → Ready` transition is driven when the first
-    /// chain lands — wired by the chain-matrix screen work (#18) off the store's
-    /// populated state; this skeleton folds the store but does not yet flip
-    /// `load`.
+    /// chain lands — on a successful startup seed (`main.rs`) or when a full poll
+    /// [`ChainSnapshot`] is folded.
     Ready,
     /// A provider/fetch error — the screen renders the actionable message plus
     /// the mode's retry-key affordance (#13/#14).
@@ -3778,8 +3780,14 @@ mod tests {
             health: StreamHealth::Live,
             last_full_poll: Some(utc(EXP + 200)),
         };
+        assert_eq!(live(&app).load, ScreenLoad::Loading);
         app.on_event(AppEvent::Market(MarketUpdate::Chain(snapshot)));
         assert!(app.dirty);
+        assert_eq!(
+            live(&app).load,
+            ScreenLoad::Ready,
+            "a landed poll must leave the connecting state"
+        );
         assert!(live(&app).store.contains_strike(pos(61_000.0)));
         assert!(!live(&app).store.contains_strike(pos(60_000.0)));
     }
@@ -3797,6 +3805,7 @@ mod tests {
         };
         app.on_event(AppEvent::Market(MarketUpdate::Chain(snapshot)));
         assert!(!app.dirty);
+        assert_eq!(live(&app).load, ScreenLoad::Loading);
         // Structure unchanged: the original strike remains, the new one absent.
         assert!(live(&app).store.contains_strike(pos(60_000.0)));
         assert!(!live(&app).store.contains_strike(pos(61_000.0)));

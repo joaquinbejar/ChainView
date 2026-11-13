@@ -46,9 +46,10 @@ use chainview::config::{CliOverrides, Config, ModeSelect};
 use chainview::{
     AliasCatalog, App, BundleError, ChainFetch, ChainSource, ChainStore, ChainViewApp,
     ChainViewError, Command as DataCommand, EventBridge, ExitCause, ExpirySource, GuardTeardown,
-    Instrument, LiveState, Mode, ReplayState, Resolved, ResourceCeilings, SourceBinding,
-    Supervisor, TerminalGuard, TokioTask, event_channel, install_panic_hook, run_render_loop,
-    spawn_bundle_load, spawn_input_reader, spawn_supervised_subscription, spawn_tick_task,
+    Instrument, LiveState, Mode, ReplayState, Resolved, ResourceCeilings, ScreenLoad,
+    SourceBinding, Supervisor, TerminalGuard, TokioTask, event_channel, install_panic_hook,
+    run_render_loop, spawn_bundle_load, spawn_input_reader, spawn_supervised_subscription,
+    spawn_tick_task,
 };
 use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand};
@@ -220,18 +221,28 @@ async fn compose_and_run_live(
     // is seeded EMPTY so the loop still runs and renders the honest connecting
     // state while the supervised reconnect loop retries.
     let expiration = ExpirationDate::Days(positive_or_one(7.0));
-    let (fetch, instruments) = match provider.fetch_chain(&config.underlying, &expiration).await {
-        Ok(fetch) => {
-            let instruments: Vec<Instrument> = fetch.aliases.instruments().cloned().collect();
-            (fetch, instruments)
-        }
-        Err(_) => (empty_seed(&config.underlying, &source, now), Vec::new()),
-    };
+    let (fetch, instruments, seeded) =
+        match provider.fetch_chain(&config.underlying, &expiration).await {
+            Ok(fetch) => {
+                let instruments: Vec<Instrument> = fetch.aliases.instruments().cloned().collect();
+                (fetch, instruments, true)
+            }
+            Err(_) => (
+                empty_seed(&config.underlying, &source, now),
+                Vec::new(),
+                false,
+            ),
+        };
     // The absolute-UTC expiry the subscription is scoped to — resolved by the poll
     // leg (or the empty-seed placeholder), never a relative offset.
     let expiration_utc = fetch.expiry_source.expiration_utc;
     let store = ChainStore::seed(fetch, ChainSource::Merged, config.refresh_interval, now);
-    let live = LiveState::new(source, store);
+    let mut live = LiveState::new(source, store);
+    // The first chain landed: leave the connecting state so the screen renders its
+    // body from the store. A failed seed stays `Loading` until a poll snapshot lands.
+    if seeded {
+        live.load = ScreenLoad::Ready;
+    }
 
     // (3) The bounded, coalescing bridge + the App (holding the render -> data
     // command sender).
