@@ -92,7 +92,7 @@ use ibapi::contracts::{
     Contract, ContractDetails, OptionChain as IbOptionChain, OptionComputation, OptionRight,
     SecurityType,
 };
-use ibapi::market_data::realtime::{TickPrice, TickSize, TickTypes};
+use ibapi::market_data::realtime::{TickPrice, TickPriceSize, TickSize, TickTypes};
 use ibapi::prelude::StreamExt;
 use ibapi::subscriptions::SubscriptionItem;
 
@@ -287,7 +287,8 @@ impl Provider for IbkrAdapter {
         expiration: &ExpirationDate,
     ) -> Result<ChainFetch, ProviderError> {
         let source = LiveChainSource::connect(self).await?;
-        let assembled = compose_chain(&source, underlying, expiration, &self.id, now_utc()).await?;
+        let assembled =
+            compose_chain(&source.client, underlying, expiration, &self.id, now_utc()).await?;
         Ok(assembled.fetch)
     }
 
@@ -433,6 +434,19 @@ fn security_type_for(underlying: &str) -> SecurityType {
         SecurityType::Index
     } else {
         SecurityType::Stock
+    }
+}
+
+/// The underlying contract whose `contract_details` resolve the conId that
+/// `reqSecDefOptParams` requires: a CBOE-listed index for the
+/// [`INDEX_UNDERLYINGS`], otherwise a SMART-routed USD stock.
+fn underlying_contract(underlying: &str) -> Contract {
+    if is_index_underlying(underlying) {
+        let mut contract = Contract::index(underlying);
+        contract.exchange = "CBOE".into();
+        contract
+    } else {
+        Contract::stock(underlying).build()
     }
 }
 
@@ -1056,15 +1070,33 @@ impl LiveChainSource {
     }
 }
 
+/// The production chain source is a connected upstream `ibapi::Client` — either
+/// the one-shot poll client a [`LiveChainSource`] owns, or the stream transport's
+/// already-connected client (so a backfill re-poll never opens a SECOND socket
+/// under the same client id, which TWS rejects).
 #[async_trait]
-impl IbkrChainSource for LiveChainSource {
+impl IbkrChainSource for ibapi::Client {
     async fn option_params(&self, underlying: &str) -> Result<Vec<RawOptionParams>, ProviderError> {
         let security_type = security_type_for(underlying);
+        // `reqSecDefOptParams` REQUIRES the underlying's conId — TWS rejects `0`
+        // with `[321] ... Invalid contract id` and the subscription yields nothing.
+        // Resolve it via `contract_details` first; an unknown symbol yields no
+        // params, which the caller surfaces as `NoChain`.
+        let details = self
+            .contract_details(&underlying_contract(underlying))
+            .await
+            .map_err(ibkr_error)?;
+        let Some(contract_id) = details
+            .first()
+            .map(|d| d.contract.contract_id)
+            .filter(|id| *id > 0)
+        else {
+            return Ok(Vec::new());
+        };
         // ibapi 4.x: `option_chain` is a builder; the exchange stays unset (the
         // old `""` = every listing exchange) and `subscribe()` submits the request.
         let mut subscription = self
-            .client
-            .option_chain(underlying, security_type, 0)
+            .option_chain(underlying, security_type, contract_id)
             .subscribe()
             .await
             .map_err(ibkr_error)?;
@@ -1086,7 +1118,7 @@ impl IbkrChainSource for LiveChainSource {
             OptionStyle::Put => OptionRight::Put,
         };
         let contract = Contract::option(underlying, expiration_ymd, strike, right);
-        let details = self.client.contract_details(&contract).await.ok()?;
+        let details = self.contract_details(&contract).await.ok()?;
         details.first().map(map_contract_details)
     }
 }
@@ -1465,7 +1497,32 @@ async fn drive_subscription(
                     Ok(())
                 }
             }
-            TickTypes::OptionComputation(oc) => {
+            // ibapi delivers bid/ask (with their sizes) as a combined price+size
+            // tick, so without this arm the quote would never carry a bid or ask.
+            TickTypes::PriceSize(TickPriceSize {
+                price_tick_type,
+                price,
+                size_tick_type,
+                size,
+                ..
+            }) => {
+                let price_changed = quote.apply_price(price_tick_type, price);
+                let size_changed = quote.apply_size(size_tick_type, size);
+                if price_changed || size_changed {
+                    tx.send(RawTick::Quote(quote.snapshot(&symbol)))
+                } else {
+                    Ok(())
+                }
+            }
+            // Only the MODEL computation carries the venue's Greeks; the bid/ask/
+            // last computations ship `-2` "not computed" sentinels for the Greeks
+            // and would overwrite the model values with bogus ones.
+            TickTypes::OptionComputation(oc)
+                if matches!(
+                    oc.field,
+                    TickType::ModelOption | TickType::DelayedModelOption
+                ) =>
+            {
                 tx.send(RawTick::Greeks(map_option_computation(&symbol, &oc)))
             }
             _ => Ok(()),
@@ -1529,10 +1586,24 @@ impl IbkrStreamTransport for LiveStreamTransport {
         expiration: &ExpirationDate,
         received: DateTime<Utc>,
     ) -> Option<AssembledChain> {
+        // Reuse the connected stream client when there is one: a second connection
+        // under the same client id is rejected by TWS, so the backfill would
+        // silently fail.
+        if let Some(client) = self.client.as_ref() {
+            return compose_chain(client, underlying, expiration, &self.adapter.id, received)
+                .await
+                .ok();
+        }
         let source = LiveChainSource::connect(&self.adapter).await.ok()?;
-        compose_chain(&source, underlying, expiration, &self.adapter.id, received)
-            .await
-            .ok()
+        compose_chain(
+            &source.client,
+            underlying,
+            expiration,
+            &self.adapter.id,
+            received,
+        )
+        .await
+        .ok()
     }
 }
 
@@ -2675,6 +2746,16 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_underlying_contract_resolves_stock_and_index() {
+        // `reqSecDefOptParams` needs the underlying conId, resolved from these.
+        let stock = underlying_contract("AAPL");
+        assert_eq!(stock.security_type, SecurityType::Stock);
+        assert_eq!(stock.symbol.to_string(), "AAPL");
+        let index = underlying_contract("SPX");
+        assert_eq!(index.security_type, SecurityType::Index);
+        assert_eq!(index.exchange.to_string(), "CBOE");
+    }
     #[tokio::test]
     async fn test_discover_returns_candidate_underlyings() {
         let adapter = sample_adapter();
