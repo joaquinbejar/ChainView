@@ -29,7 +29,9 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   startup fetch succeeds or a full poll snapshot lands (affected every provider).
 - `ibkr`: the option chain now loads. `reqSecDefOptParams` was sent with an
   underlying conId of `0`, which TWS rejects (`[321] Invalid contract id`); the
-  adapter now resolves the underlying's conId via `contract_details` first.
+  adapter now resolves the underlying's conId via `contract_details` first
+  (stocks, and every supported index on its own listing exchange — NDX and RUT
+  are not CBOE-listed). An unknown symbol surfaces as "no chain".
 - `ibkr`: bid/ask quotes are now read from the combined price+size ticks ibapi
   delivers them in (they were previously ignored), and Greeks are taken only from
   the model computation, so the `-2` "not computed" sentinels on the bid/ask/last
