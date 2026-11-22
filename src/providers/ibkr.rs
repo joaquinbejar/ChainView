@@ -1131,22 +1131,54 @@ fn target_expiry(
     }
 }
 
-/// Select the `reqSecDefOptParams` result + `YYYYMMDD` string whose expiry date
-/// (in the session zone) matches the target expiry instant.
+/// How a requested expiry is matched against the listed `YYYYMMDD` expirations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExpiryMatch {
+    /// An absolute expiry: only a listing on exactly that date matches.
+    Exact,
+    /// A relative offset (`ExpirationDate::Days`): the first listing on or after
+    /// the target date matches. The offset rarely lands on a listed date — a
+    /// weekend, a holiday, or a weekday the underlying does not list — so an
+    /// exact match would leave the chain empty for no good reason.
+    OnOrAfter,
+}
+
+impl ExpiryMatch {
+    fn for_request(expiration: &ExpirationDate) -> Self {
+        match expiration {
+            ExpirationDate::DateTime(_) => Self::Exact,
+            ExpirationDate::Days(_) => Self::OnOrAfter,
+        }
+    }
+}
+
+/// Select the `reqSecDefOptParams` result + `YYYYMMDD` string for the target
+/// expiry instant (compared as a date in the session zone), per `mode`. For
+/// [`ExpiryMatch::OnOrAfter`] the earliest qualifying date across ALL results wins;
+/// ties go to the first result listing it.
 fn select_expiration<'a>(
     params_list: &'a [RawOptionParams],
     target: DateTime<Utc>,
     session: &SessionClose,
+    mode: ExpiryMatch,
 ) -> Option<(&'a RawOptionParams, String)> {
     let target_date = utc_to_zone_date(target, session.zone);
+    let mut best: Option<(NaiveDate, &'a RawOptionParams, &'a String)> = None;
     for params in params_list {
         for ymd in &params.expirations {
-            if parse_ymd(ymd) == Some(target_date) {
-                return Some((params, ymd.clone()));
+            let Some(date) = parse_ymd(ymd) else {
+                continue;
+            };
+            let qualifies = match mode {
+                ExpiryMatch::Exact => date == target_date,
+                ExpiryMatch::OnOrAfter => date >= target_date,
+            };
+            if qualifies && best.is_none_or(|(best_date, _, _)| date < best_date) {
+                best = Some((date, params, ymd));
             }
         }
     }
-    None
+    best.map(|(_, params, ymd)| (params, ymd.clone()))
 }
 
 /// Assemble the chain for `(underlying, expiration)` from the underlying's
@@ -1171,7 +1203,8 @@ async fn compose_chain<S: IbkrChainSource + ?Sized>(
     let params_list = source.option_params(&symbol).await?;
     let session = default_session();
     // Own the selected params + ymd BEFORE the detail await (no borrow across it).
-    let (params, ymd) = match select_expiration(&params_list, target, &session) {
+    let mode = ExpiryMatch::for_request(expiration);
+    let (params, ymd) = match select_expiration(&params_list, target, &session, mode) {
         Some((params, ymd)) => (params.clone(), ymd),
         None => return Err(no_chain(&symbol, target)),
     };
@@ -2723,6 +2756,84 @@ mod tests {
             Err(ProviderError::NoChain { underlying, .. }) => assert_eq!(underlying, "SPX"),
             other => panic!("expected NoChain for a mismatched expiry, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_compose_chain_relative_expiry_takes_next_listing() {
+        let (detail, _) = fixture_detail();
+        let source = MockChainSource {
+            params: vec![fixture_params()],
+            detail: Some(detail),
+        };
+        // Sat 2026-07-11 + 7 days = Sat 2026-07-18, which nothing lists. The
+        // fixture lists 2026-07-17 (before the target) and 2026-08-21, so the
+        // relative request must resolve to 2026-08-21 rather than NoChain.
+        let received = utc_rfc3339("2026-07-11T14:00:00+00:00");
+        match compose_chain(
+            &source,
+            "spx",
+            &ExpirationDate::Days(pos(7.0)),
+            &pid("ibkr"),
+            received,
+        )
+        .await
+        {
+            Ok(assembled) => assert_eq!(
+                utc_to_zone_date(
+                    assembled.fetch.expiry_source.expiration_utc,
+                    default_session().zone
+                ),
+                NaiveDate::from_ymd_opt(2026, 8, 21).unwrap_or_default(),
+                "a relative target on an unlisted day takes the next listing"
+            ),
+            Err(e) => panic!("a relative request must resolve to the next listing, got: {e}"),
+        }
+    }
+
+    #[test]
+    fn test_select_expiration_on_or_after_picks_earliest_qualifying() {
+        let session = default_session();
+        let mut weekly = fixture_params();
+        weekly.trading_class = "SPXW".to_owned();
+        weekly.expirations = vec!["20260722".to_owned(), "20260729".to_owned()];
+        let monthly = fixture_params(); // 20260717, 20260821
+        let list = vec![monthly, weekly];
+        let at = |date: &str| utc_rfc3339(&format!("{date}T20:00:00+00:00"));
+        let pick = |target, mode| {
+            select_expiration(&list, target, &session, mode)
+                .map(|(params, ymd)| (params.trading_class.clone(), ymd))
+        };
+        // On a listed date both modes agree.
+        assert_eq!(
+            pick(at("2026-07-17"), ExpiryMatch::OnOrAfter),
+            Some(("SPX".to_owned(), "20260717".to_owned()))
+        );
+        assert_eq!(
+            pick(at("2026-07-17"), ExpiryMatch::Exact),
+            Some(("SPX".to_owned(), "20260717".to_owned()))
+        );
+        // Between listings: the earliest later date wins, across results.
+        assert_eq!(
+            pick(at("2026-07-18"), ExpiryMatch::OnOrAfter),
+            Some(("SPXW".to_owned(), "20260722".to_owned()))
+        );
+        assert_eq!(pick(at("2026-07-18"), ExpiryMatch::Exact), None);
+        // Past the last listing: nothing.
+        assert_eq!(pick(at("2026-08-22"), ExpiryMatch::OnOrAfter), None);
+    }
+
+    #[test]
+    fn test_expiry_match_for_request() {
+        assert_eq!(
+            ExpiryMatch::for_request(&ExpirationDate::Days(pos(7.0))),
+            ExpiryMatch::OnOrAfter
+        );
+        assert_eq!(
+            ExpiryMatch::for_request(&ExpirationDate::DateTime(utc_rfc3339(
+                "2026-07-17T20:15:00+00:00"
+            ))),
+            ExpiryMatch::Exact
+        );
     }
 
     // === Streaming lifecycle over a mock transport (no socket, no wall clock) ==

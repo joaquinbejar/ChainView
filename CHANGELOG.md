@@ -24,6 +24,12 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- `ibkr`: a relative expiry request (the live startup's "7 days out") now
+  resolves to the first listed expiry on or after the target date instead of
+  requiring an exact match. Previously, whenever the target fell on a weekend,
+  holiday, or unlisted weekday, the chain came back empty and the screen stayed
+  on "waiting for the first chain". An absolute expiry still matches exactly.
+
 ### Security
 
 ## [0.2.0] - 2026-10-10
