@@ -876,15 +876,28 @@ fn map_contract_details(details: &ContractDetails) -> RawContractDetail {
 /// Map one upstream [`OptionComputation`] onto the neutral [`RawGreeksTick`]. The
 /// `underlying_price` is deliberately NOT surfaced (no underlying stream — the
 /// #40/#41 honesty rule).
+///
+/// TWS marks a value it could not compute with a sentinel on EVERY computation
+/// tick (the model one included), and ibapi only strips `f64::MAX`, so the
+/// sentinels are dropped here: a Greek of `-2` and a negative IV (`-1`) become
+/// `None` rather than a fake value on the matrix.
 fn map_option_computation(symbol: &str, oc: &OptionComputation) -> RawGreeksTick {
     RawGreeksTick {
         symbol: symbol.to_owned(),
-        iv: oc.implied_volatility,
-        delta: oc.delta,
-        gamma: oc.gamma,
-        theta: oc.theta,
-        vega: oc.vega,
+        iv: oc.implied_volatility.filter(|iv| *iv >= 0.0),
+        delta: computed(oc.delta),
+        gamma: computed(oc.gamma),
+        theta: computed(oc.theta),
+        vega: computed(oc.vega),
     }
+}
+
+/// TWS marks a Greek it could not compute with `-2`.
+const GREEK_NOT_COMPUTED: f64 = -2.0;
+
+/// A Greek with the TWS "not computed" sentinel dropped.
+fn computed(value: Option<f64>) -> Option<f64> {
+    value.filter(|v| *v != GREEK_NOT_COMPUTED)
 }
 
 /// A per-contract accumulator that folds individual `TickPrice`/`TickSize` ticks
@@ -1036,9 +1049,9 @@ fn instruments_of(aliases: &AliasCatalog, provider: &ProviderId) -> Vec<Instrume
 // ---------------------------------------------------------------------------
 
 /// The REST/socket chain seam the poll path drives, so assembly runs
-/// deterministically against a **mock** with no network. The production
-/// [`LiveChainSource`] wraps the upstream `ibapi::Client`; a raw DTO is mapped to a
-/// neutral view inside it and never crosses this seam.
+/// deterministically against a **mock** with no network. The production source
+/// is the upstream `ibapi::Client` itself (see its impl below); a raw DTO is
+/// mapped to a neutral view inside it and never crosses this seam.
 #[async_trait]
 trait IbkrChainSource: Send + Sync {
     /// The `reqSecDefOptParams` results for the underlying (one per trading
@@ -1056,8 +1069,8 @@ trait IbkrChainSource: Send + Sync {
     ) -> Option<RawContractDetail>;
 }
 
-/// The production [`IbkrChainSource`]: a connected upstream `ibapi::Client`. Raw
-/// upstream types stay inside it.
+/// The one-shot poll connection: owns a freshly connected upstream
+/// `ibapi::Client`, which is the [`IbkrChainSource`] the poll path drives.
 struct LiveChainSource {
     client: ibapi::Client,
 }
@@ -1089,22 +1102,10 @@ impl IbkrChainSource for ibapi::Client {
         // with `[321] ... Invalid contract id` and the subscription yields nothing.
         // Resolve it via `contract_details` first; an unknown symbol yields no
         // params, which the caller surfaces as `NoChain`.
-        let details = match self
+        let details = self
             .contract_details(&underlying_contract(underlying))
-            .await
-        {
-            Ok(details) => details,
-            // `[200] No security definition`: the symbol is unknown to IBKR.
-            Err(ibapi::Error::Notice(notice)) if notice.code == NO_SECURITY_DEFINITION => {
-                return Ok(Vec::new());
-            }
-            Err(err) => return Err(ibkr_error(err)),
-        };
-        let Some(contract_id) = details
-            .first()
-            .map(|d| d.contract.contract_id)
-            .filter(|id| *id > 0)
-        else {
+            .await;
+        let Some(contract_id) = underlying_con_id(details)? else {
             return Ok(Vec::new());
         };
         // ibapi 4.x: `option_chain` is a builder; the exchange stays unset (the
@@ -1384,6 +1385,29 @@ fn transport(kind: TransportKind) -> ProviderError {
     ProviderError::Transport(Box::new(TransportDetail::new(kind, None)))
 }
 
+/// Decide the underlying conId from its `contract_details` lookup.
+///
+/// `Ok(None)` means the symbol has no usable listing (the caller surfaces it as
+/// `NoChain`): `[200] No security definition`, no details at all, or a first
+/// detail carrying a non-positive conId. Any other upstream failure is a
+/// transport error.
+///
+/// # Errors
+///
+/// A redaction-safe [`ProviderError`] for any lookup failure other than `[200]`.
+fn underlying_con_id(
+    result: Result<Vec<ContractDetails>, ibapi::Error>,
+) -> Result<Option<i32>, ProviderError> {
+    match result {
+        Ok(details) => Ok(details
+            .first()
+            .map(|d| d.contract.contract_id)
+            .filter(|id| *id > 0)),
+        Err(ibapi::Error::Notice(notice)) if notice.code == NO_SECURITY_DEFINITION => Ok(None),
+        Err(err) => Err(ibkr_error(err)),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The stream transport seam: the venue I/O the reconnect loop drives (mockable).
 // ---------------------------------------------------------------------------
@@ -1529,12 +1553,10 @@ fn fold_tick(quote: &mut QuoteAccumulator, symbol: &str, tick: TickTypes) -> Opt
             let size_changed = quote.apply_size(size_tick_type, size);
             price_changed || size_changed
         }
-        TickTypes::OptionComputation(oc)
-            if matches!(
-                oc.field,
-                TickType::ModelOption | TickType::DelayedModelOption
-            ) =>
-        {
+        // Only the model computation carries real Greeks (the bid/ask/last ones
+        // are sentinel-filled). Delayed data is never requested, so the delayed
+        // model tick is not accepted either.
+        TickTypes::OptionComputation(oc) if oc.field == TickType::ModelOption => {
             return Some(RawTick::Greeks(map_option_computation(symbol, &oc)));
         }
         _ => false,
@@ -2738,7 +2760,40 @@ mod tests {
     }
 
     #[test]
-    fn test_fold_tick_delayed_model_computation_is_forwarded() {
+    fn test_fold_tick_model_computation_drops_not_computed_sentinels() {
+        let (aliases, symbol) = one_leg_aliases();
+        let mut acc = QuoteAccumulator::default();
+        // A model tick TWS could not compute: IV `-1`, every Greek `-2`.
+        let tick = match sentinel_computation(TickType::ModelOption) {
+            TickTypes::OptionComputation(mut oc) => {
+                oc.implied_volatility = Some(-1.0);
+                TickTypes::OptionComputation(oc)
+            }
+            _ => unreachable!(),
+        };
+        let greeks = match fold_tick(&mut acc, &symbol, tick) {
+            Some(RawTick::Greeks(greeks)) => greeks,
+            other => panic!("the model computation must reach the Greeks path, got {other:?}"),
+        };
+        assert_eq!(greeks.iv, None);
+        assert_eq!(greeks.delta, None);
+        assert_eq!(greeks.gamma, None);
+        assert_eq!(greeks.theta, None);
+        assert_eq!(greeks.vega, None);
+        // Whatever the row policy, no sentinel may land in a GreeksRow.
+        if let Some(row) = greeks_row(&greeks, &aliases, &pid("ibkr"), now_utc()) {
+            let sentinel = Decimal::new(-2, 0);
+            assert_ne!(row.delta, Some(sentinel));
+            assert_ne!(row.gamma, Some(sentinel));
+            assert_ne!(row.theta, Some(sentinel));
+            assert_ne!(row.vega, Some(sentinel));
+        }
+    }
+
+    #[test]
+    fn test_fold_tick_ignores_delayed_model_computation() {
+        // Delayed data is never requested and the quote side ignores delayed
+        // ticks, so delayed Greeks must not surface on their own.
         let mut acc = QuoteAccumulator::default();
         let tick = match model_computation() {
             TickTypes::OptionComputation(mut oc) => {
@@ -2747,10 +2802,61 @@ mod tests {
             }
             _ => unreachable!(),
         };
-        assert!(matches!(
-            fold_tick(&mut acc, "SPX-20260717-7500-C", tick),
-            Some(RawTick::Greeks(_))
-        ));
+        assert!(fold_tick(&mut acc, "SPX-20260717-7500-C", tick).is_none());
+    }
+
+    // === Underlying conId resolution ==========================================
+
+    fn details_with_con_id(contract_id: i32) -> ContractDetails {
+        let mut details = ContractDetails::default();
+        details.contract.contract_id = contract_id;
+        details
+    }
+
+    fn notice(code: i32) -> ibapi::Error {
+        ibapi::Error::Notice(ibapi::Notice {
+            request_id: Some(9000),
+            code,
+            message: "synthetic".to_owned(),
+            error_time: None,
+            advanced_order_reject_json: String::new(),
+        })
+    }
+
+    #[test]
+    fn test_underlying_con_id_takes_first_listing() {
+        let result = underlying_con_id(Ok(vec![
+            details_with_con_id(416904),
+            details_with_con_id(7),
+        ]));
+        assert!(matches!(result, Ok(Some(416904))), "{result:?}");
+    }
+
+    #[test]
+    fn test_underlying_con_id_no_security_definition_is_no_chain() {
+        let result = underlying_con_id(Err(notice(NO_SECURITY_DEFINITION)));
+        assert!(matches!(result, Ok(None)), "{result:?}");
+    }
+
+    #[test]
+    fn test_underlying_con_id_other_notice_is_transport_error() {
+        let result = underlying_con_id(Err(notice(162)));
+        assert!(
+            matches!(result, Err(ProviderError::Transport(_))),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn test_underlying_con_id_empty_details_is_no_chain() {
+        let result = underlying_con_id(Ok(Vec::new()));
+        assert!(matches!(result, Ok(None)), "{result:?}");
+    }
+
+    #[test]
+    fn test_underlying_con_id_zero_con_id_is_no_chain() {
+        let result = underlying_con_id(Ok(vec![details_with_con_id(0)]));
+        assert!(matches!(result, Ok(None)), "{result:?}");
     }
 
     // === Chain assembly from the recorded shape ===============================

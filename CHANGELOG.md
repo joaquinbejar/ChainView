@@ -35,7 +35,8 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 - `ibkr`: bid/ask quotes are now read from the combined price+size ticks ibapi
   delivers them in (they were previously ignored), and Greeks are taken only from
   the model computation, so the `-2` "not computed" sentinels on the bid/ask/last
-  computations no longer overwrite them.
+  computations no longer overwrite them. A Greek TWS could not compute (`-2`)
+  or an uncomputed IV (`-1`) on the model tick is dropped instead of shown.
 - `ibkr`: the stream's backfill re-poll reuses the connected stream client
   instead of opening a second socket under the same client id (which TWS rejects).
 
